@@ -2,8 +2,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { HardwareTypeProvider } from "@cloudx/plugin-api";
-import type { HardwareItemDraft, HardwareMutationResult, HardwareOwner, OperationReceipt, StatusDefinition, StatusValue } from "@cloudx/shared";
+import type { HardwareConnection, HardwareTypeProvider } from "@cloudx/plugin-api";
+import type { HardwareItemDraft, HardwareMutationResult, HardwareOwner, JsonObject, OperationReceipt, StatusDefinition, StatusValue } from "@cloudx/shared";
 import { HardwareService, type HardwareServiceOptions } from "./HardwareService.js";
 import { HardwareStore } from "./HardwareStore.js";
 import { HardwareScriptRunner, type HardwareScriptResult } from "./HardwareScriptRunner.js";
@@ -17,6 +17,7 @@ const roots: string[] = [];
 let sequence = 0;
 const requestId = () => `request-${++sequence}`;
 afterEach(async () => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   for (const service of services.splice(0)) await service.dispose();
   for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
@@ -62,6 +63,106 @@ async function settled(service: HardwareService, receipt: OperationReceipt, owne
   }
   throw new Error("Hardware operation did not settle.");
 }
+
+describe("provider operation diagnostics", () => {
+  function useInvocation(provider: Awaited<ReturnType<typeof fixture>>["provider"], invoke: HardwareConnection["invoke"]) {
+    provider.connect = async (_config, context) => {
+      const close = async () => ({ state: "completed" as const, value: null });
+      context.registerCleanup(close);
+      return { state: "completed", value: { close, invoke } };
+    };
+  }
+
+  async function openDevice(service: HardwareService) {
+    const item = await addItem(service);
+    const claim = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Inspect operation diagnostics" }, alice)).reservation!;
+    const ref = { reservationId: claim.reservationId, generation: claim.generation };
+    await settled(service, (await mutate(service, "hardware.access.open", ref, alice)).receipt, alice);
+    return ref;
+  }
+
+  it("preserves unknown diagnostics through close, retention, and restart without clearing the recovery hold", async () => {
+    const retention = { outputMaxBytes: 1, completedMaxEntries: 1, snapshotMaxCompletedReceipts: 1 };
+    const { service, provider, registry, root } = await fixture(retention);
+    const diagnostics = { state: "exited", exitCode: 255, signal: null, stdout: "bounded output", stderr: "connection lost", durationMs: 42, truncated: true, interrupted: false };
+    useInvocation(provider, async () => ({ state: "unknown", error: { code: "LOST_TRANSPORT", message: "Remote completion cannot be confirmed." }, diagnostics }));
+    const ref = await openDevice(service);
+    const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice);
+    expect(await settled(service, operation.receipt, alice)).toMatchObject({ state: "unknown", result: { diagnostics } });
+    expect((await settled(service, (await mutate(service, "hardware.access.close", ref, alice)).receipt, alice)).state).toBe("succeeded");
+    expect(service.ownerClaims()[0]).toMatchObject({ state: "recovery_required", accessState: "closed" });
+    await mutate(service, "hardware.tags.create", { label: "Apply retention" });
+    expect((await service.snapshot(alice)).receipts).toContainEqual(expect.objectContaining({ runId: operation.receipt.runId, result: { diagnostics } }));
+    await service.dispose();
+    const restored = new HardwareService({ dataDir: root, registry, pathPolicy: new PathPolicy([root]), ownerState: () => "active", retention });
+    services.push(restored); await restored.init();
+    const receipt = (await restored.execute("hardware.receipt.get", { requestId: operation.receipt.requestId }, alice) as { receipt: OperationReceipt }).receipt;
+    expect(receipt).toMatchObject({ state: "unknown", result: { diagnostics } });
+    expect(receipt.outputPruned).toBeUndefined();
+    expect(restored.ownerClaims()[0].state).toBe("recovery_required");
+  });
+
+  it("waits for bounded diagnostics after the operation deadline and keeps the outcome unknown", async () => {
+    const { service, provider } = await fixture();
+    provider.descriptor.operations[0].inputSchema = { type: "object", properties: { timeoutMs: { type: "integer" } }, additionalProperties: false };
+    const diagnostics = { state: "exited", exitCode: null, signal: "SIGTERM", stdout: "before timeout", stderr: "[redacted]", durationMs: 35, truncated: false, interrupted: true };
+    useInvocation(provider, async (_id, _input, signal) => new Promise(resolve => {
+      signal.addEventListener("abort", () => setTimeout(() => resolve({ state: "unknown", error: { code: "TRANSPORT_INTERRUPTED", message: "Transport exited after interruption." }, diagnostics }), 10), { once: true });
+    }));
+    const ref = await openDevice(service);
+    const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: { timeoutMs: 25 } }, alice);
+    expect(await settled(service, operation.receipt, alice)).toMatchObject({ state: "unknown", error: { code: "OUTCOME_UNKNOWN" }, result: { diagnostics } });
+    expect(service.ownerClaims()[0].state).toBe("recovery_required");
+  });
+
+  it("bounds diagnostic settlement when the provider ignores the deadline", async () => {
+    const { service, provider } = await fixture();
+    provider.descriptor.operations[0].inputSchema = { type: "object", properties: { timeoutMs: { type: "integer" } }, additionalProperties: false };
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    useInvocation(provider, async () => { entered(); return new Promise(() => {}); });
+    const ref = await openDevice(service);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: { timeoutMs: 25 } }, alice);
+    await started;
+    await vi.advanceTimersByTimeAsync(2524);
+    const pending = await service.execute("hardware.receipt.get", { requestId: operation.receipt.requestId }, alice) as { receipt: OperationReceipt };
+    expect(pending.receipt.state).toBe("running");
+    await vi.advanceTimersByTimeAsync(1);
+    vi.useRealTimers();
+    expect(await settled(service, operation.receipt, alice)).toMatchObject({ state: "unknown", error: { code: "OUTCOME_UNKNOWN" } });
+    expect(service.ownerClaims()[0].state).toBe("recovery_required");
+  });
+
+  it.each(["completed", "failed"] as const)("does not trust a late %s outcome after the deadline", async state => {
+    const { service, provider } = await fixture();
+    provider.descriptor.operations[0].inputSchema = { type: "object", properties: { timeoutMs: { type: "integer" } }, additionalProperties: false };
+    useInvocation(provider, async (_id, _input, signal) => new Promise(resolve => {
+      signal.addEventListener("abort", () => resolve(state === "completed" ? { state, value: { value: 42 } } : { state, effects: "settled", error: { code: "SETTLED", message: "The provider reported late settlement." } }), { once: true });
+    }));
+    const ref = await openDevice(service);
+    const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: { timeoutMs: 25 } }, alice);
+    const receipt = await settled(service, operation.receipt, alice);
+    expect(receipt).toMatchObject({ state: "unknown", error: { code: "OUTCOME_UNKNOWN" } });
+    expect(receipt.result).toBeUndefined();
+    expect(service.ownerClaims()[0].state).toBe("recovery_required");
+  });
+
+  it.each([
+    ["an array", []],
+    ["a non-finite value", { durationMs: Number.POSITIVE_INFINITY }],
+    ["an oversized object", { stdout: "x".repeat(1024 * 1024), stderr: "x".repeat(1024 * 1024) }],
+  ])("rejects provider diagnostics containing %s while preserving uncertainty", async (_label, diagnostics) => {
+    const { service, provider } = await fixture();
+    useInvocation(provider, async () => ({ state: "unknown", error: { code: "LOST_TRANSPORT", message: "Remote completion cannot be confirmed." }, diagnostics: diagnostics as JsonObject }));
+    const ref = await openDevice(service);
+    const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice);
+    const receipt = await settled(service, operation.receipt, alice);
+    expect(receipt).toMatchObject({ state: "unknown", error: { code: "OUTCOME_UNKNOWN" } });
+    expect(receipt.result).toBeUndefined();
+    expect(service.ownerClaims()[0].state).toBe("recovery_required");
+  });
+});
 
 describe("hardware ownership and catalogs", () => {
   it("exposes an immutable claim-only owner query without acquisition configuration or hooks", async () => {
@@ -379,7 +480,8 @@ describe("hardware admission and operation races", () => {
   it("keeps a cancelled in-flight effect held until the operator accepts its uncertainty", async () => {
     const { service, provider } = await fixture();
     let entered!: () => void; const started = new Promise<void>(resolve => { entered = resolve; });
-    provider.connect = async (_config, context) => { const close = async () => ({ state: "completed" as const, value: null }); context.registerCleanup(close); return { state: "completed", value: { close, invoke: async (_id, _input, signal) => { entered(); return new Promise(resolve => signal.addEventListener("abort", () => resolve({ state: "unknown", error: { code: "INTERRUPTED", message: "Remote completion unknown" } }), { once: true })); } } }; };
+    const diagnostics = { state: "exited", exitCode: null, signal: "SIGTERM", stdout: "before cancellation", stderr: "[redacted]", durationMs: 25, truncated: false, interrupted: true };
+    provider.connect = async (_config, context) => { const close = async () => ({ state: "completed" as const, value: null }); context.registerCleanup(close); return { state: "completed", value: { close, invoke: async (_id, _input, signal) => { entered(); return new Promise(resolve => signal.addEventListener("abort", () => setTimeout(() => resolve({ state: "unknown", error: { code: "INTERRUPTED", message: "Remote completion unknown" }, diagnostics }), 10), { once: true })); } } }; };
     const item = await addItem(service);
     const claim = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Measure" }, alice)).reservation!;
     const ref = { reservationId: claim.reservationId, generation: claim.generation };
@@ -387,7 +489,7 @@ describe("hardware admission and operation races", () => {
     const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice); await started;
     const held = (await service.snapshot(user)).reservations[0];
     const override = await mutate(service, "hardware.forceRelease", { target: { kind: "reservation", ...ref }, expectedHoldRevision: held.revision, reason: "Inspect remote activity", acceptUnresolvedExternalActivity: false });
-    expect((await settled(service, operation.receipt, alice)).state).toBe("unknown");
+    expect(await settled(service, operation.receipt, alice)).toMatchObject({ state: "unknown", result: { diagnostics } });
     expect((await settled(service, override.receipt)).state).toBe("unknown");
     const recovery = (await service.snapshot(user)).reservations[0];
     expect(recovery).toMatchObject({ state: "recovery_required", generation: ref.generation + 1 });
@@ -547,7 +649,7 @@ describe("intentional native-tab lease revocation", () => {
     await settled(service, (await mutate(service, "hardware.access.open", ref, alice)).receipt, alice);
     const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice); await started;
     await service.nativeTabClosed("alice");
-    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]));
+    await vi.waitFor(() => expect(service.ownerClaims()).toEqual([]), { timeout: 4000 });
     const replacement = (await mutate(service, "hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Next owner" }, bob)).reservation!;
     complete(); await delayed; await new Promise(resolve => setImmediate(resolve));
     await expect(mutate(service, "hardware.release", ref, alice)).rejects.toMatchObject({ code: "STALE_RESERVATION" });

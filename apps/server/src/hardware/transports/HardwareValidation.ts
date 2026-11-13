@@ -62,7 +62,9 @@ export function completed<T>(value: T): ProviderOutcome<T> { return { state: "co
 export function failed<T>(code: string, message: string, effects: "none" | "settled" = "none"): ProviderOutcome<T> {
   return { state: "failed", effects, error: { code, message } };
 }
-export function unknown<T>(code: string, message: string): ProviderOutcome<T> { return { state: "unknown", error: { code, message } }; }
+export function unknown<T>(code: string, message: string, diagnostics?: JsonObject): ProviderOutcome<T> {
+  return { state: "unknown", error: { code, message }, ...(diagnostics ? { diagnostics } : {}) };
+}
 
 export const deadlineSchema = { type: "integer", minimum: 1, maximum: MAX_HARDWARE_TIMEOUT_MS } as const;
 export const byteLimitSchema = { type: "integer", minimum: 1, maximum: MAX_HARDWARE_BYTES } as const;

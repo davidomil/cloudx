@@ -30,7 +30,7 @@ export const sshHardwareDescriptor: HardwareTypeDescriptor = {
   operations: [
     { id: "ssh.exec", description: "Execute an explicit remote Bash script supplied through stdin.",
       inputSchema: objectSchema({ script: { type: "string", maxLength: MAX_HARDWARE_BYTES }, timeoutMs: deadlineSchema, maxOutputBytes: byteLimitSchema }),
-      outputSchema: objectSchema({ exitCode: { type: "integer", minimum: 0, maximum: 254 }, stdout: { type: "string" }, stderr: { type: "string" }, truncated: { type: "boolean" }, durationMs: { type: "integer", minimum: 0 } }) },
+      outputSchema: objectSchema({ exitCode: { type: "integer", minimum: 0, maximum: 255 }, stdout: { type: "string" }, stderr: { type: "string" }, truncated: { type: "boolean" }, durationMs: { type: "integer", minimum: 0 } }) },
     { id: "ssh.upload", description: "Upload one regular file using OpenSSH SFTP; publish the destination only after transfer completes.", inputSchema: transferInput, outputSchema: transferOutput },
     { id: "ssh.download", description: "Download one regular file using OpenSSH SFTP; publish the local destination only after transfer completes.", inputSchema: transferInput, outputSchema: transferOutput }
   ]
@@ -100,7 +100,7 @@ export class SshHardwareProvider implements HardwareTypeProvider<SshConfig> {
       if (!inspection.ready) return failed("ENDPOINT_UNAVAILABLE", inspection.blockers.join("; "));
       const result = await processes.run({ executable: this.options.sshExecutable ?? "/usr/bin/ssh", args: [...sshArguments(config), "--", config.host, "/bin/bash --noprofile --norc -s --"], stdin: "exit 0\n", timeoutMs: config.connectTimeoutMs + 1000, maxOutputBytes: 64 * 1024, signal: context.signal }, passwordReference(config));
       if (result.state === "not_started") return failed("SSH_NOT_STARTED", "The OpenSSH client could not start.");
-      if (result.interrupted || result.state !== "exited" || result.exitCode === 255 || result.exitCode === null) return unknown("SSH_CONNECT_UNKNOWN", "SSH connection completion could not be confirmed.");
+      if (result.interrupted || result.state !== "exited" || result.exitCode === 255 || result.exitCode === null) return unknown("SSH_CONNECT_UNKNOWN", "SSH connection completion could not be confirmed.", processDiagnostics(result));
       if (result.exitCode !== 0) return failed("SSH_CONNECT_FAILED", "The configured remote Bash entrypoint failed.", "settled");
       return completed(connection);
     } catch (error) { return error instanceof HardwareProviderError ? failed(error.code, error.message) : unknown("SSH_CONNECT_UNKNOWN", "SSH connection completion could not be confirmed."); }
@@ -193,10 +193,14 @@ class SshConnection implements HardwareConnection {
 
   private async exec(input: JsonObject, signal: AbortSignal): Promise<ProviderOutcome<JsonObject>> {
     if (Buffer.byteLength(input.script as string) > MAX_HARDWARE_BYTES) return failed("INVALID_INPUT", "SSH script exceeds the byte limit.");
-    const result = await this.processes.run({ executable: this.options.sshExecutable ?? "/usr/bin/ssh", args: [...sshArguments(this.config), "--", this.config.host, "/bin/bash --noprofile --norc -s --"], stdin: input.script as string, timeoutMs: input.timeoutMs as number, maxOutputBytes: input.maxOutputBytes as number, signal }, passwordReference(this.config));
+    const marker = `\ncloudx-ssh-exit-255:${randomUUID()}\n`;
+    // Keep the supplied script in its own Bash. Its exit, traps and redirections
+    // must not bypass the parent's confirmation or change the script's stdin.
+    const wrapper = `/bin/bash --noprofile --norc -s --; status=$?; if [ "$status" -eq 255 ]; then printf "${marker}" >&2 || exit 255; exit 0; fi; exit "$status"`;
+    const result = await this.processes.run({ executable: this.options.sshExecutable ?? "/usr/bin/ssh", args: [...sshArguments(this.config), "--", this.config.host, `/bin/bash --noprofile --norc -c '${wrapper}'`], stdin: input.script as string, timeoutMs: input.timeoutMs as number, maxOutputBytes: input.maxOutputBytes as number, stderrMarker: marker, signal }, passwordReference(this.config));
     const failure = processFailure(result, "SSH command");
     if (failure) return failure;
-    return completed({ exitCode: result.exitCode!, stdout: result.stdout, stderr: result.stderr, truncated: result.truncated, durationMs: result.durationMs });
+    return completed({ exitCode: result.exitCode === 0 && result.stderrMarkerSeen ? 255 : result.exitCode!, stdout: result.stdout, stderr: result.stderr, truncated: result.truncated, durationMs: result.durationMs });
   }
 
   private async transfer(operationId: string, input: JsonObject, signal: AbortSignal): Promise<ProviderOutcome<JsonObject>> {
@@ -263,8 +267,21 @@ class SshConnection implements HardwareConnection {
 
 function processFailure(result: ProcessResult, label: string): ProviderOutcome<JsonObject> | null {
   if (result.state === "not_started") return failed("TRANSPORT_NOT_STARTED", `${label} could not start.`);
-  if (result.interrupted || result.state !== "exited" || result.exitCode === null || result.exitCode === 255) return unknown("OUTCOME_UNKNOWN", `${label} may still have remote effects; completion could not be confirmed.`);
+  if (result.interrupted || result.state !== "exited" || result.exitCode === null || result.exitCode === 255) return unknown("OUTCOME_UNKNOWN", `${label} may still have remote effects; completion could not be confirmed.`, processDiagnostics(result));
   return null;
+}
+
+function processDiagnostics(result: ProcessResult): JsonObject {
+  // Leave room for JSON escaping and receipt metadata within the persisted JSON limit.
+  const limit = 64 * 1024;
+  const stdout = diagnosticText(result.stdout, limit);
+  const stderr = diagnosticText(result.stderr, limit - Buffer.byteLength(stdout));
+  return { state: result.state, exitCode: result.exitCode, signal: result.signal, stdout, stderr, truncated: result.truncated || stdout !== result.stdout || stderr !== result.stderr, durationMs: result.durationMs, interrupted: result.interrupted };
+}
+
+function diagnosticText(value: string, maxBytes: number): string {
+  const text = Buffer.from(value).subarray(0, maxBytes).toString("utf8");
+  return Buffer.byteLength(text) > maxBytes ? text.slice(0, -1) : text;
 }
 
 function validSshHost(host: string): boolean {

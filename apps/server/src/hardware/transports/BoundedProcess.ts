@@ -11,6 +11,7 @@ export interface ProcessResult {
   truncated: boolean;
   durationMs: number;
   interrupted: boolean;
+  stderrMarkerSeen?: boolean;
 }
 
 export interface ProcessCommand {
@@ -23,6 +24,7 @@ export interface ProcessCommand {
   inheritedFd?: number;
   environment?: Record<string, string>;
   secrets?: string[];
+  stderrMarker?: string;
 }
 
 export class BoundedProcessSet {
@@ -44,6 +46,9 @@ export class BoundedProcessSet {
       let truncated = false;
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
+      const stderrMarker = command.stderrMarker === undefined ? undefined : Buffer.from(command.stderrMarker);
+      let stderrTail = Buffer.alloc(0);
+      let stderrMarkerSeen = false;
       let escalate: NodeJS.Timeout | undefined;
       let expiry: NodeJS.Timeout | undefined;
       const child = spawn(command.executable, command.args, {
@@ -59,8 +64,9 @@ export class BoundedProcessSet {
         clearTimeout(escalate);
         clearTimeout(expiry);
         signal.removeEventListener("abort", stop);
+        collect(stderr, stderrTail);
         const output = decodeOutput(stdout, stderr, command.maxOutputBytes, command.secrets ?? [], truncated);
-        resolve({ state, exitCode, signal: exitSignal, ...output, truncated: truncated || output.truncated, durationMs: Date.now() - startedAt, interrupted });
+        resolve({ state, exitCode, signal: exitSignal, ...output, truncated: truncated || output.truncated, durationMs: Date.now() - startedAt, interrupted, ...(stderrMarker ? { stderrMarkerSeen } : {}) });
       };
       const kill = (killSignal: NodeJS.Signals) => {
         if (!child.pid) return;
@@ -88,7 +94,20 @@ export class BoundedProcessSet {
         bytes += Math.min(remaining, chunk.length);
       };
       child.stdout?.on("data", (chunk: Buffer) => collect(stdout, chunk));
-      child.stderr?.on("data", (chunk: Buffer) => collect(stderr, chunk));
+      child.stderr?.on("data", (chunk: Buffer) => {
+        if (!stderrMarker) { collect(stderr, chunk); return; }
+        const pending = Buffer.concat([stderrTail, chunk]);
+        let start = 0;
+        let markerAt: number;
+        while ((markerAt = pending.indexOf(stderrMarker, start)) !== -1) {
+          collect(stderr, pending.subarray(start, markerAt));
+          stderrMarkerSeen = true;
+          start = markerAt + stderrMarker.length;
+        }
+        const split = Math.max(start, pending.length - stderrMarker.length + 1);
+        collect(stderr, pending.subarray(start, split));
+        stderrTail = pending.subarray(split);
+      });
       child.stdin?.on("error", () => {});
       child.once("spawn", () => {
         spawned = true;

@@ -6,10 +6,11 @@ import net from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { HardwareConnection } from "@cloudx/plugin-api";
-import type { SshConfig } from "@cloudx/shared";
+import type { HardwareMutationResult, JsonObject, OperationReceipt, SshConfig } from "@cloudx/shared";
 import { PathPolicy } from "../../pathPolicy.js";
+import { HardwareService } from "../HardwareService.js";
 import { SshHardwareProvider, serializeSftpPath, sshArguments } from "./SshHardwareProvider.js";
 import { transportTestContext } from "./TransportTestContext.js";
 
@@ -148,6 +149,46 @@ describe("SSH password process ownership", () => {
     await expect(fs.stat(capture)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("keeps client exit 255 unknown even with a confirmation and preserves bounded redacted diagnostics", async () => {
+    const executable = path.join(directory, "lost-ssh");
+    await fs.writeFile(executable, `#!${process.execPath}\n` + String.raw`
+const {execFileSync}=require('node:child_process');
+let input='';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data',chunk=>input+=chunk);
+process.stdin.on('end',()=>{
+  if(input==='exit 0\n') return;
+  if(input==='control-output') { process.stdout.write(Buffer.alloc(1024*1024)); process.exitCode=255; return; }
+  if(input==='unicode-output') { process.stdout.write('x'.repeat(64*1024-1)); process.stderr.write('€'); process.exitCode=255; return; }
+  const password=execFileSync(process.env.SSH_ASKPASS,["tester@example.test's password: "],{env:process.env}).toString().trim();
+  process.stdout.write(password);
+  process.stderr.write(password);
+  const marker=process.argv.at(-1).match(/\ncloudx-ssh-exit-255:[a-f0-9-]+\n/)[0];
+  process.stderr.write(marker);
+  process.exitCode=255;
+});
+`, { mode: 0o700 });
+    const type = new SshHardwareProvider({ pathPolicy: new PathPolicy([directory]), sshExecutable: executable, environment: {} });
+    const context = { ...transportTestContext(), resolveCredential: async () => "private-password" };
+    const opened = await type.connect(config, context);
+    if (opened.state !== "completed") throw new Error(JSON.stringify(opened));
+    try {
+      const result = await opened.value.invoke("ssh.exec", { script: "exit 255", timeoutMs: 1000, maxOutputBytes: 100 }, signal());
+      expect(result).toMatchObject({ state: "unknown", diagnostics: { state: "exited", exitCode: 255, signal: null, stdout: "[redacted]", stderr: "[redacted]", durationMs: expect.any(Number), truncated: false, interrupted: false } });
+      expect(JSON.stringify(result)).not.toContain("private-password");
+      const truncated = await opened.value.invoke("ssh.exec", { script: "exit 255", timeoutMs: 1000, maxOutputBytes: 4 }, signal());
+      expect(truncated).toMatchObject({ state: "unknown", diagnostics: { exitCode: 255, truncated: true } });
+      if (truncated.state !== "unknown") throw new Error(JSON.stringify(truncated));
+      expect(JSON.stringify(truncated)).not.toContain("priv");
+      expect(Buffer.byteLength(truncated.diagnostics!.stdout as string) + Buffer.byteLength(truncated.diagnostics!.stderr as string)).toBeLessThanOrEqual(4);
+      const controls = await opened.value.invoke("ssh.exec", { script: "control-output", timeoutMs: 1000, maxOutputBytes: 1024 * 1024 }, signal());
+      expect(controls).toMatchObject({ state: "unknown", diagnostics: { stdout: "\0".repeat(64 * 1024), stderr: "", truncated: true } });
+      expect(Buffer.byteLength(JSON.stringify(controls))).toBeLessThan(2 * 1024 * 1024);
+      const unicode = await opened.value.invoke("ssh.exec", { script: "unicode-output", timeoutMs: 1000, maxOutputBytes: 1024 * 1024 }, signal());
+      expect(unicode).toMatchObject({ state: "unknown", diagnostics: { stdout: "x".repeat(64 * 1024 - 1), stderr: "", truncated: true } });
+    } finally { await context.cleanups[0]!(signal()); }
+  });
+
   it("fails credential validation before any native process starts and hides resolver errors", async () => {
     await fs.rm(capture, { force: true });
     for (const resolveCredential of [async () => "a\nb", async () => "a".repeat(1024), async () => { throw new Error("private-password"); }]) {
@@ -274,18 +315,108 @@ describe.skipIf(!existsSync("/usr/sbin/sshd") || !existsSync("/usr/lib/openssh/s
     expect(existsSync(path.join(directory, "no-directory-copy"))).toBe(false);
   });
 
-  it("reports remote exit 255 and cancellation as unknown and does not infer remote termination from cleanup", async () => {
-    await expect(connection.invoke("ssh.exec", { script: "exit 255", timeoutMs: 3000, maxOutputBytes: 100 }, signal())).resolves.toMatchObject({ state: "unknown", error: { code: "OUTCOME_UNKNOWN" } });
+  it.each([0, 7, 254, 255])("returns confirmed remote exit %i with exact diagnostics", async (exitCode) => {
+    await expect(connection.invoke("ssh.exec", { script: `printf output; printf error >&2; exit ${exitCode}`, timeoutMs: 3000, maxOutputBytes: 100 }, signal())).resolves.toMatchObject({ state: "completed", value: { exitCode, stdout: "output", stderr: "error", truncated: false } });
+  });
+
+  it("persists confirmed exit 255 and interrupted diagnostics through managed access without clearing recovery", async () => {
+    const owner = { kind: "user" as const, userId: "local" };
+    const service = new HardwareService({ dataDir: path.join(directory, "managed-state"), pathPolicy: new PathPolicy([directory]), registry: { values: () => [provider], get: () => provider } });
+    let sequence = 0;
+    const mutate = (action: string, input: JsonObject) => service.execute(action, { requestId: `ssh-managed-${++sequence}`, ...input }, owner) as Promise<HardwareMutationResult>;
+    const receipt = (result: HardwareMutationResult) => vi.waitFor(async () => {
+      const saved = await service.execute("hardware.receipt.get", { requestId: result.receipt.requestId }, owner) as { receipt: OperationReceipt };
+      expect(saved.receipt.state).not.toBe("running");
+      return saved.receipt;
+    }, { timeout: 4000 });
+    try {
+      await service.init();
+      await mutate("hardware.groups.create", { name: "Loopback" });
+      const group = (await service.snapshot(owner)).groups[0];
+      await mutate("hardware.items.create", { item: { name: "Loopback SSH", description: "", enabled: true, physicalResourceId: group.id, typeId: "hardware.ssh", configVersion: 1, config: JSON.parse(JSON.stringify(config)), tagIds: [], notes: "", statuses: [], hooks: {} } });
+      const item = (await service.snapshot(owner)).items[0].item;
+      const claim = (await mutate("hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Verify SSH receipts" })).reservation!;
+      const ref = { reservationId: claim.reservationId, generation: claim.generation };
+      expect((await receipt(await mutate("hardware.access.open", ref))).state).toBe("succeeded");
+      expect(await receipt(await mutate("hardware.access.invoke", { ...ref, operationId: "ssh.exec", input: { script: "exit 255", timeoutMs: 3000, maxOutputBytes: 100 } }))).toMatchObject({ state: "succeeded", result: { exitCode: 255, truncated: false } });
+      expect(service.ownerClaims()[0].state).toBe("active");
+      expect(await receipt(await mutate("hardware.access.invoke", { ...ref, operationId: "ssh.exec", input: { script: "printf diagnostic; sleep 20", timeoutMs: 1000, maxOutputBytes: 100 } }))).toMatchObject({ state: "unknown", result: { diagnostics: { stdout: "diagnostic", exitCode: 255, signal: null, interrupted: true } } });
+      expect((await receipt(await mutate("hardware.access.close", ref))).state).toBe("succeeded");
+      expect(service.ownerClaims()[0]).toMatchObject({ state: "recovery_required", accessState: "closed" });
+    } finally { await service.dispose(); }
+  });
+
+  it("confirms exit 255 after full output and preserves Bash errexit, exit traps and exec", async () => {
+    await expect(connection.invoke("ssh.exec", { script: "head -c 200000 /dev/zero; exit 255", timeoutMs: 3000, maxOutputBytes: 10 }, signal())).resolves.toMatchObject({ state: "completed", value: { exitCode: 255, stdout: "\0".repeat(10), stderr: "", truncated: true } });
+    for (const script of ["set -e; /bin/bash -c 'exit 255'; printf unreachable", "trap 'printf trapped >&2' EXIT; exit 255", "exec /bin/bash -c 'exit 255'"]) {
+      await expect(connection.invoke("ssh.exec", { script, timeoutMs: 3000, maxOutputBytes: 100 }, signal())).resolves.toMatchObject({ state: "completed", value: { exitCode: 255, stdout: "" } });
+    }
+    await expect(connection.invoke("ssh.exec", { script: "trap 'printf trapped >&2' EXIT; exit 255", timeoutMs: 3000, maxOutputBytes: 100 }, signal())).resolves.toMatchObject({ state: "completed", value: { exitCode: 255, stderr: "trapped", truncated: false } });
+  });
+
+  it("preserves exit 255 and later stderr from background descendants", async () => {
+    await expect(connection.invoke("ssh.exec", { script: "(sleep 0.1; printf late >&2) & exit 255", timeoutMs: 3000, maxOutputBytes: 100 }, signal())).resolves.toMatchObject({ state: "completed", value: { exitCode: 255, stdout: "", stderr: "late", truncated: false } });
+  });
+
+  it("returns a nested SSH changed-host-key rejection as a confirmed command failure without modifying trust", async () => {
+    const changedKey = path.join(directory, "changed-host-key");
+    await exec("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", changedKey]);
+    const wrongKey = (await fs.readFile(`${changedKey}.pub`, "utf8")).trim().split(" ").slice(0, 2).join(" ");
+    const nestedHosts = path.join(directory, "nested-known-hosts");
+    const trust = `[127.0.0.1]:${config.port} ${wrongKey}\n`;
+    await fs.writeFile(nestedHosts, trust);
+    const script = `set -euo pipefail\n/usr/bin/ssh -F /dev/null -T -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile='${nestedHosts}' -o GlobalKnownHostsFile=/dev/null -p ${config.port} ${config.username}@127.0.0.1 'printf MUST_NOT_RUN'`;
+    const result = await connection.invoke("ssh.exec", { script, timeoutMs: 3000, maxOutputBytes: 4096 }, signal());
+    expect(result).toMatchObject({ state: "completed", value: { exitCode: 255, stdout: "", truncated: false } });
+    if (result.state !== "completed") throw new Error(JSON.stringify(result));
+    expect(result.value.stderr).toContain("REMOTE HOST IDENTIFICATION HAS CHANGED!");
+    expect(await fs.readFile(nestedHosts, "utf8")).toBe(trust);
+  });
+
+  it("retains cancellation diagnostics and does not infer remote termination from cleanup", async () => {
     const context = transportTestContext();
     const opened = await provider.connect(config, context);
     if (opened.state !== "completed") throw new Error(JSON.stringify(opened));
     const controller = new AbortController();
-    const running = opened.value.invoke("ssh.exec", { script: "sleep 20", timeoutMs: 5000, maxOutputBytes: 100 }, controller.signal);
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    const ready = path.join(directory, "cancel-ready");
+    const running = opened.value.invoke("ssh.exec", { script: `printf output; printf error >&2; touch '${ready}'; sleep 20`, timeoutMs: 5000, maxOutputBytes: 100 }, controller.signal);
+    await waitForFile(ready);
     controller.abort();
-    await expect(running).resolves.toMatchObject({ state: "unknown" });
+    await expect(running).resolves.toMatchObject({ state: "unknown", diagnostics: { stdout: "output", stderr: "error", exitCode: 255, signal: null, durationMs: expect.any(Number), truncated: false, interrupted: true } });
     await expect(context.cleanups[0]!(signal())).resolves.toEqual({ state: "completed", value: null });
     await expect(opened.value.invoke("ssh.exec", { script: "true", timeoutMs: 1000, maxOutputBytes: 100 }, signal())).resolves.toMatchObject({ state: "failed", error: { code: "ACCESS_CLOSED" } });
+  });
+
+  it("retains bounded diagnostics when the remote command exceeds its deadline", async () => {
+    await expect(connection.invoke("ssh.exec", { script: "printf output; printf error >&2; sleep 20", timeoutMs: 1000, maxOutputBytes: 100 }, signal())).resolves.toMatchObject({ state: "unknown", diagnostics: { stdout: "output", stderr: "error", exitCode: 255, signal: null, durationMs: expect.any(Number), truncated: false, interrupted: true } });
+  });
+
+  it("keeps outer transport loss unknown with captured diagnostics", async () => {
+    const sockets = new Set<net.Socket>();
+    const proxy = net.createServer(client => {
+      const upstream = net.connect(config.port, "127.0.0.1");
+      for (const socket of [client, upstream]) { sockets.add(socket); socket.on("error", () => {}); socket.on("close", () => sockets.delete(socket)); }
+      client.pipe(upstream); upstream.pipe(client);
+    });
+    const context = transportTestContext();
+    try {
+      await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+      const port = (proxy.address() as net.AddressInfo).port;
+      const knownHostsFile = path.join(directory, "proxy-known-hosts");
+      await fs.writeFile(knownHostsFile, (await fs.readFile(config.knownHostsFile!, "utf8")).replace(`]:${config.port}`, `]:${port}`));
+      const opened = await provider.connect({ ...config, port, knownHostsFile }, context);
+      if (opened.state !== "completed") throw new Error(JSON.stringify(opened));
+      const ready = path.join(directory, "transport-ready");
+      const running = opened.value.invoke("ssh.exec", { script: `printf output; printf error >&2; touch '${ready}'; sleep 20`, timeoutMs: 3000, maxOutputBytes: 1024 }, signal());
+      await waitForFile(ready);
+      for (const socket of sockets) socket.destroy();
+      const result = await running;
+      expect(result).toMatchObject({ state: "unknown", diagnostics: { exitCode: 255, stdout: "output", stderr: expect.stringContaining("error"), interrupted: false, truncated: false, durationMs: expect.any(Number) } });
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>(resolve => proxy.close(() => resolve()));
+      for (const cleanup of context.cleanups) await cleanup(signal());
+    }
   });
 
   it("does not accept an unknown host key or use another authentication method", async () => {
@@ -384,4 +515,12 @@ async function waitForPort(port: number, ended: () => boolean, errors: () => str
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(`Emulated sshd did not listen: ${errors()}`);
+}
+
+async function waitForFile(file: string): Promise<void> {
+  const deadline = Date.now() + 3000;
+  while (!existsSync(file)) {
+    if (Date.now() >= deadline) throw new Error("Remote command did not signal readiness.");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
 }

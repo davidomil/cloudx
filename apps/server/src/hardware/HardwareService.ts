@@ -566,7 +566,7 @@ export class HardwareService {
         requireHardware(access?.generation === claim.generation && access.connection, "INVALID_PHASE", "The managed connection is no longer open.");
         const values = hardwareInput(() => hardwareRecord(input.input));
         const timeoutMs = hardwareInput(() => hardwareInteger(values.timeoutMs ?? (typeof values.durationMs === "number" ? values.durationMs + 1000 : 60_000), "Operation deadline", 1, 3_600_000));
-        outcome = await bounded(signal, timeoutMs, childSignal => access.connection!.invoke(String(input.operationId), values as JsonObject, childSignal));
+        outcome = await bounded(signal, timeoutMs, childSignal => access.connection!.invoke(String(input.operationId), values as JsonObject, childSignal), 2500);
         if (outcome.state === "completed") { const operation = provider!.descriptor.operations.find(operation => operation.id === input.operationId)!; try { validateSchema(operation.outputSchema, outcome.value); } catch { outcome = { state: "unknown", error: { code: "INVALID_PROVIDER_OUTPUT", message: "The provider returned invalid output after dispatch." } }; } }
       }
       await this.finish(work.runId, work.ref, outcome, (_next, held) => {
@@ -1087,7 +1087,11 @@ export class HardwareService {
       for (const record of records) {
         const receipt = record.receipt;
         receipt.state = outcome.state === "completed" ? "succeeded" : outcome.state; receipt.finishedAt = now();
-        if (outcome.state === "completed") receipt.result = clone(outcome.value); else receipt.error = clone(outcome.error);
+        if (outcome.state === "completed") receipt.result = clone(outcome.value);
+        else {
+          receipt.error = clone(outcome.error);
+          if (outcome.state === "unknown" && outcome.diagnostics !== undefined) receipt.result = { diagnostics: clone(outcome.diagnostics) };
+        }
       }
       if (claim) {
         claim.activeOperationIds = claim.activeOperationIds.filter(id => id !== runId); claim.revision++; claim.updatedAt = now();
@@ -1168,20 +1172,34 @@ function scriptDiagnostics(result: HardwareScriptResult, limit = 64 * 1024): Jso
   const stderr = Buffer.from(result.stderr).subarray(0, Math.max(0, limit - Buffer.byteLength(stdout))).toString("utf8");
   return json({ ...result, stdout, stderr, diagnosticsTruncated: stdout !== result.stdout || stderr !== result.stderr });
 }
-async function bounded<T>(parent: AbortSignal, timeoutMs: number, work: (signal: AbortSignal) => Promise<ProviderOutcome<T>>): Promise<ProviderOutcome<T>> {
+async function bounded<T>(parent: AbortSignal, timeoutMs: number, work: (signal: AbortSignal) => Promise<ProviderOutcome<T>>, diagnosticSettlementMs = 0): Promise<ProviderOutcome<T>> {
   if (parent.aborted) return { state: "failed", effects: "none", error: { code: "CANCELLED", message: "Operation cancelled before dispatch." } };
   const controller = new AbortController();
-  let stop!: (value: ProviderOutcome<T>) => void;
-  const interrupted = new Promise<ProviderOutcome<T>>(resolve => { stop = resolve; });
-  const abort = () => { controller.abort(parent.reason); stop({ state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "The dispatched operation was cancelled or exceeded its deadline." } }); };
+  const interruptedOutcome = { state: "unknown" as const, error: { code: "OUTCOME_UNKNOWN", message: "The dispatched operation was cancelled or exceeded its deadline." } };
+  let stop!: () => void;
+  const interrupted = new Promise<undefined>(resolve => { stop = () => resolve(undefined); });
+  const abort = () => { if (!controller.signal.aborted) { controller.abort(parent.reason); stop(); } };
   const timer = setTimeout(abort, timeoutMs); timer.unref();
+  let settlementTimer: NodeJS.Timeout | undefined;
   parent.addEventListener("abort", abort, { once: true });
   try {
-    const result = await Promise.race([Promise.resolve().then(() => { controller.signal.throwIfAborted(); return work(controller.signal); }), interrupted]);
-    requireHardware(result && ["completed", "failed", "unknown"].includes(result.state), "INVALID_PROVIDER_OUTPUT", "Provider returned an invalid execution envelope.");
-    if (result.state === "failed") requireHardware(["none", "settled"].includes(result.effects), "INVALID_PROVIDER_OUTPUT", "Provider omitted its effect disposition.");
-    if (result.state !== "completed") requireHardware(result.error && typeof result.error.code === "string" && result.error.code.length > 0 && result.error.code.length <= 128 && !result.error.code.includes("\0") && typeof result.error.message === "string" && result.error.message.length > 0 && result.error.message.length <= 4096 && !result.error.message.includes("\0"), "INVALID_PROVIDER_OUTPUT", "Provider returned an invalid error envelope.");
-    return result;
+    const operation = Promise.resolve().then(() => { controller.signal.throwIfAborted(); return work(controller.signal); }).then(result => {
+      requireHardware(result && ["completed", "failed", "unknown"].includes(result.state), "INVALID_PROVIDER_OUTPUT", "Provider returned an invalid execution envelope.");
+      if (result.state === "failed") requireHardware(["none", "settled"].includes(result.effects), "INVALID_PROVIDER_OUTPUT", "Provider omitted its effect disposition.");
+      if (result.state !== "completed") requireHardware(result.error && typeof result.error.code === "string" && result.error.code.length > 0 && result.error.code.length <= 128 && !result.error.code.includes("\0") && typeof result.error.message === "string" && result.error.message.length > 0 && result.error.message.length <= 4096 && !result.error.message.includes("\0"), "INVALID_PROVIDER_OUTPUT", "Provider returned an invalid error envelope.");
+      if (result.state === "unknown" && result.diagnostics !== undefined) {
+        hardwareRecord(result.diagnostics, "Provider diagnostics");
+        validateHardwareJson({ diagnostics: result.diagnostics });
+      }
+      return result;
+    });
+    const result = await Promise.race([operation, interrupted]);
+    if (!controller.signal.aborted) return result!;
+    if (!diagnosticSettlementMs) return interruptedOutcome;
+    const settled = await Promise.race([operation, new Promise<undefined>(resolve => {
+      settlementTimer = setTimeout(() => resolve(undefined), diagnosticSettlementMs); settlementTimer.unref();
+    })]);
+    return settled?.state === "unknown" && settled.diagnostics !== undefined ? { ...interruptedOutcome, diagnostics: settled.diagnostics } : interruptedOutcome;
   } catch { return { state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "The provider stopped without confirming its dispatched operation outcome." } }; }
-  finally { clearTimeout(timer); parent.removeEventListener("abort", abort); }
+  finally { clearTimeout(timer); clearTimeout(settlementTimer); parent.removeEventListener("abort", abort); }
 }

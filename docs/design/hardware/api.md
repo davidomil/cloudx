@@ -96,6 +96,10 @@ SSH operation payloads.
 
 SSH exec permits arbitrary script content from the reserved owner, within bounded execution. It does not add a command allowlist. Pass script content separately from local SSH argv. Never treat user names, hostnames, or file paths as shell source. Return command exit failure as a known result when it was observed; distinguish transport error and uncertain remote outcome. Unknown remote effects put the reservation into recovery until reconciled.
 
+The remote Bash wrapper confirms command exit 255 with an invocation-specific stderr marker and exits zero after that confirmation. The provider removes the marker before returning command output, including output from background descendants after the marker. Marker detection is independent of the command-output byte limit. A local OpenSSH exit 255 remains unknown, even if the marker arrived before transport loss. Host-key verification is unchanged.
+
+Unknown SSH process outcomes retain bounded, credential-redacted diagnostics in `receipt.result.diagnostics`: `state`, `exitCode`, `signal`, `stdout`, `stderr`, `durationMs`, `truncated`, and `interrupted`. Combined diagnostic output is limited to 64 KiB or the requested output limit, whichever is smaller. Process status describes the local OpenSSH client; it does not prove that remote effects ended. On invocation cancellation or deadline, the service allows up to 2500 ms for the provider to settle and return diagnostics. The receipt remains unknown after interruption, even if the provider later reports completion. Successful managed close does not clear the recovery hold.
+
 Validate SSH host strings as DNS names or IP literals and ports in 1–65535. Reject option-like values and NUL/newline input. Use explicit user, port, host-key, authentication, connection-timeout, and no-control-master settings; verify their effective OpenSSH configuration at implementation time. Do not inherit implicit remote commands or alternate authentication paths from a user’s unrelated SSH config. Require documented remote Bash and SFTP support; fail clearly if absent.
 
 ## UART operation payloads
