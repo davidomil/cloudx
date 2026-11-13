@@ -7,6 +7,31 @@ import { BoundedProcessSet } from "./BoundedProcess.js";
 const signal = () => new AbortController().signal;
 
 describe("bounded hardware transport processes", () => {
+  it("recognizes a split stderr confirmation after output truncation without exposing its bytes", async () => {
+    const processes = new BoundedProcessSet();
+    try {
+      const marker = "\ncompletion-marker\n";
+      const result = await processes.run({ executable: process.execPath, args: ["-e", "process.stdout.write('x'.repeat(1000));process.stderr.write('diagnostic'+process.argv[1].slice(0,5));setTimeout(()=>process.stderr.write(process.argv[1].slice(5)),30)", marker], stderrMarker: marker, timeoutMs: 1000, maxOutputBytes: 10, signal: signal() });
+      expect(result).toMatchObject({ state: "exited", exitCode: 0, stdout: "x".repeat(10), stderr: "", truncated: true, stderrMarkerSeen: true });
+      const exact = await processes.run({ executable: process.execPath, args: ["-e", "process.stderr.write('1234567890'+process.argv[1])", marker], stderrMarker: marker, timeoutMs: 1000, maxOutputBytes: 10, signal: signal() });
+      expect(exact).toMatchObject({ stderr: "1234567890", truncated: false, stderrMarkerSeen: true });
+      const followed = await processes.run({ executable: process.execPath, args: ["-e", "process.stderr.write('before'+process.argv[1].slice(0,5));setTimeout(()=>process.stderr.write(process.argv[1].slice(5)+'after'+process.argv[1].slice(0,5)),30)", marker], stderrMarker: marker, timeoutMs: 1000, maxOutputBytes: 100, signal: signal() });
+      expect(followed).toMatchObject({ stderr: "beforeafter" + marker.slice(0, 5), truncated: false, stderrMarkerSeen: true });
+    } finally { await processes.close(signal()); }
+  });
+
+  it("preserves unmatched stderr tails and redacts a truncated credential before returning diagnostics", async () => {
+    const processes = new BoundedProcessSet();
+    try {
+      const result = await processes.run({ executable: process.execPath, args: ["-e", "process.stderr.write('private-password')"], stderrMarker: "absent-marker", secrets: ["private-password"], timeoutMs: 1000, maxOutputBytes: 7, signal: signal() });
+      expect(result).toMatchObject({ stderrMarkerSeen: false, truncated: true });
+      expect(result.stderr).not.toContain("private");
+      expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(7);
+      const tail = await processes.run({ executable: process.execPath, args: ["-e", "process.stderr.write('short')"], stderrMarker: "absent-marker", timeoutMs: 1000, maxOutputBytes: 100, signal: signal() });
+      expect(tail).toMatchObject({ stderr: "short", truncated: false, stderrMarkerSeen: false });
+    } finally { await processes.close(signal()); }
+  });
+
   it("passes only the selected transport environment and redacts secret output before enforcing its byte bound", async () => {
     const processes = new BoundedProcessSet();
     const result = await processes.run({ executable: process.execPath, args: ["-e", "process.stdout.write(process.env.SSH_AUTH_SOCK+':'+(process.env.HOME??'missing'));process.stderr.write('private-password')"], environment: { SSH_AUTH_SOCK: "/tmp/selected-agent" }, secrets: ["private-password"], timeoutMs: 1000, maxOutputBytes: 100, signal: signal() });

@@ -206,7 +206,7 @@ export interface HardwareEndpointInspection {
 export type ProviderOutcome<T> =
   | { state: "completed"; value: T }
   | { state: "failed"; effects: "none" | "settled"; error: { code: string; message: string } }
-  | { state: "unknown"; error: { code: string; message: string } };
+  | { state: "unknown"; error: { code: string; message: string }; diagnostics?: JsonObject };
 
 export interface HardwareAccessContext {
   reservation: HardwareReservation;
