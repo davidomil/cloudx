@@ -60,6 +60,7 @@ export class GitHubCiDiagnostics {
           throw new ForgeProviderError("The failed check does not match a terminal workflow job.");
         if (job.name !== failure.name) throw new ForgeProviderError("The required check and workflow job names differ.");
         const identities = new Map<number, string>();
+        const dependencyIdentities = new Map<number, string>();
         const active = new Set<number>();
         const completed = new Set<number>();
         const resolvedGates = new Set<number>();
@@ -149,7 +150,12 @@ export class GitHubCiDiagnostics {
               return true;
             }
             if (!await loadWorkflow(testedSha)) return false;
-            const dependencies = workflow!.failedDependencies(producer, jobs);
+            const dependencies = workflow!.failedDependencies(producer, jobs, dependency => {
+              if (ciId(dependency.run_id) !== failure.runId || ciSha(dependency.head_sha) !== change.headSha ||
+                  dependency.run_attempt !== undefined && ciId(dependency.run_attempt) !== failure.runAttempt)
+                throw new ForgeProviderError("An aggregate dependency does not match this run attempt and source.");
+              dependencyIdentities.set(ciId(dependency.id), this.jobIdentity(dependency));
+            });
             resolvedGates.add(jobId);
             if (!dependencies.length) {
               evidence.testedSha ??= workflowSha;
@@ -175,7 +181,7 @@ export class GitHubCiDiagnostics {
         const currentJobs = await this.jobs(failure);
         if (!this.currentRun(current, failure, change) || current.status !== "completed" || current.conclusion !== run.conclusion ||
             workflow && (current.path !== run.path || current.workflow_id !== run.workflow_id) ||
-            [...identities].some(([id, identity]) => {
+            [...identities, ...dependencyIdentities].some(([id, identity]) => {
               const matches = currentJobs.filter(job => ciId(job.id) === id);
               return matches.length !== 1 || this.jobIdentity(matches[0]) !== identity;
             })) {

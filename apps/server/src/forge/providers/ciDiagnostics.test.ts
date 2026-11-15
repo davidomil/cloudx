@@ -746,6 +746,87 @@ function productionAggregateFixture(options: Parameters<typeof githubFixture>[0]
       ? `${checkout}${codeFailure}` : "Process completed with exit code 1.\n"])), ...options });
 }
 
+const skippedCoverageJobs = productionJobs.map(job => ({ ...job,
+  conclusion: job.name === "Merged isolated coverage" ? "skipped" : job.name === "Isolated verifier (browser-2)" ? "success" :
+    job.name === "Isolated verifier (coverage-3)" ? "failure" : job.conclusion,
+}));
+function skippedCoverageFixture(options: Parameters<typeof githubFixture>[0] = {}) {
+  return productionAggregateFixture({ jobs: skippedCoverageJobs,
+    logs: Object.fromEntries(skippedCoverageJobs.map(job => [job.id, job.name === "Isolated verifier (coverage-3)"
+      ? `${checkout}AssertionError: SshKeyRegistrationPhases.test.ts:90 expected 'inspecting key', received ''\n`
+      : "Process completed with exit code 1.\n"])), ...options });
+}
+
+describe("GitHub failed coverage producers behind default skipped jobs", () => {
+  it.each(["CI aggregate", "Isolated full verifier"])("resolves coverage-3 once through the required %s", async requiredName => {
+    const gate = skippedCoverageJobs.find(job => job.name === requiredName)!;
+    const fixture = skippedCoverageFixture({ checks: [{ ...check, databaseId: Number(gate.check_run_url.split("/").at(-1)), name: requiredName }] });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "actionable", sourceHeadSha: source,
+      targetHeadSha: target, testedSha: tested, jobs: [{ jobId: "516", name: "Isolated verifier (coverage-3)",
+        classification: "code", log: expect.stringContaining("SshKeyRegistrationPhases.test.ts:90"), testedSha: tested,
+        requiredGate: { jobId: String(gate.id), name: requiredName } }] });
+    expect(fixture.fetcher.mock.calls.filter(([url]) => String(url).endsWith("/jobs/516/logs"))).toHaveLength(1);
+    expect(fixture.fetcher.mock.calls.some(([url]) => String(url).endsWith("/jobs/523/logs"))).toBe(false);
+  });
+
+  it("follows nested default skips without downloading their nonexistent logs", async () => {
+    const workflow = pinnedWorkflow.replace("      - coverage-merge\n", "      - coverage-final\n") +
+      "\n  coverage-final:\n    name: Coverage final\n    needs: coverage-merge\n";
+    const jobs = [...skippedCoverageJobs, { ...skippedCoverageJobs[22], id: 999, name: "Coverage final",
+      check_run_url: "https://api.github.com/repos/owner/repo/check-runs/999" }];
+    const fixture = skippedCoverageFixture({ workflow, jobs });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "actionable", jobs: [{ jobId: "516" }] });
+    expect(fixture.fetcher.mock.calls.some(([url]) => /\/jobs\/(523|999)\/logs$/.test(String(url)))).toBe(false);
+  });
+
+  it.each([
+    { name: "explicit condition", workflow: pinnedWorkflow.replace("name: Merged isolated coverage", "name: Merged isolated coverage\n    if: false") },
+    { name: "unexplained skip", jobs: skippedCoverageJobs.map(job => job.name === "Isolated verifier (coverage-3)" ? { ...job, conclusion: "success" } : job) },
+    { name: "missing ancestor", jobs: skippedCoverageJobs.filter(job => job.name !== "Isolated verifier (coverage-1)") },
+    { name: "duplicate ancestor", jobs: [...skippedCoverageJobs, { ...skippedCoverageJobs[13], id: 999 }] },
+    ...[
+      { status: "in_progress", conclusion: null }, { status: "queued", conclusion: null },
+      { conclusion: "cancelled" }, { conclusion: "action_required" }, { conclusion: "startup_failure" },
+      { conclusion: "neutral" }, { conclusion: "skipped" },
+      { run_id: 101 }, { run_attempt: 1 }, { head_sha: stale },
+    ].map(patch => ({ name: `unsafe ancestor ${JSON.stringify(patch)}`, jobs: skippedCoverageJobs.map(job =>
+      job.name === "Isolated verifier (coverage-1)" ? { ...job, ...patch } : job) })),
+    ...[{ run_id: 101 }, { run_attempt: 1 }, { head_sha: stale }].map(patch => ({
+      name: `unbound skipped job ${JSON.stringify(patch)}`, jobs: skippedCoverageJobs.map(job =>
+        job.name === "Merged isolated coverage" ? { ...job, ...patch } : job),
+    })),
+  ])("blocks $name even when coverage-3 failed", async ({ name: _name, ...options }) => {
+    expect(await skippedCoverageFixture(options).provider.getCiFailure(change)).toMatchObject({ state: "blocked", reason: expect.any(String) });
+  });
+
+  it.each(["Merged isolated coverage", "Isolated verifier (coverage-1)"])("rechecks every proof identity of %s after reading logs", async name => {
+    for (const patch of [
+      { id: 999 }, { check_run_url: "https://api.github.com/repos/owner/repo/check-runs/999" },
+      { run_id: 101 }, { run_attempt: 1 }, { head_sha: stale }, { status: "in_progress" }, { conclusion: "cancelled" },
+      { html_url: "https://github.com/owner/repo/actions/runs/100/job/999" },
+    ]) {
+      let jobsRead = 0;
+      const original = skippedCoverageFixture();
+      const fixture = skippedCoverageFixture({ intercept: (url, init) => {
+        if (url.pathname.endsWith("/attempts/2/jobs") && ++jobsRead === 2)
+          return Response.json({ jobs: skippedCoverageJobs.map(job => job.name === name ? { ...job, ...patch } : job) });
+        return original.fetcher(url, init);
+      } });
+      expect(await fixture.provider.getCiFailure(change), JSON.stringify(patch)).toMatchObject({ state: "obsolete" });
+    }
+  });
+
+  it.each([
+    ["credentials", "remote: Authentication failed: invalid access token"],
+    ["policy", "Approval required by policy"],
+    ["infrastructure", "No space left on device"],
+  ])("preserves %s intervention at the failed producer", async (classification, failure) => {
+    const fixture = skippedCoverageFixture({ logs: { "501": "Process completed with exit code 1.\n",
+      "510": "Process completed with exit code 1.\n", "516": `${checkout}${failure}\n` } });
+    expect(await fixture.provider.getCiFailure(change)).toMatchObject({ state: "blocked", jobs: [{ jobId: "516", classification }] });
+  });
+});
+
 describe("GitHub shared failed producers in the pinned CloudX workflow", () => {
   it.each([false, true])("retains one producer shared by required gates, including a checked-out full verifier: %s", async checkedOut => {
     const fixture = productionAggregateFixture();
