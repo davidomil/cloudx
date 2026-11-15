@@ -379,6 +379,10 @@ export function HardwarePanel({
                   run={run}
                   onClose={() => setView("inventory")}
                   onSaved={() => setView("inventory")}
+                  onInspectHold={(id) => {
+                    setInspectedHoldId(id);
+                    setView("reservations");
+                  }}
                 />
               )
             ) : null}

@@ -18,6 +18,7 @@ Type extensions.
 | `inspectEndpoint(config)` | Return configured/canonical endpoint conflict keys, local readiness, and blockers without opening a connection. May inspect admitted local files/device metadata. No network probe. |
 | `describeAccess(config)` | Return readable non-secret connection metadata. No network connection, serial open, or probe. |
 | `connect(config, context)` | Open a managed connection only after the service validates an active reservation. Bind all handles to that reservation generation. |
+| `checkConnection?(config, context)` | Perform a bounded login check with a signal, private credential resolver, and registered cleanup. Return `HardwareConnectionResult` with `online`, an optional error, and bounded diagnostics. Ordinary login failures are completed measurements after cleanup; unconfirmed cleanup is unknown. No arbitrary operation or reservation hook runs. |
 | `registerKey?(config, input, context)` | Register SSH keys before opening access, under a user-owned active reservation and the same bounded cleanup and outcome contract. |
 | `connection.invoke(operationId, input, signal)` | Run one advertised operation with validated input. Return schema-valid JSON or a typed error. The service checks current ownership before each call. |
 | `connection.close(signal)` | Close every owned handle. Return only after known cleanup; otherwise report uncertainty. |
@@ -41,6 +42,7 @@ Catalogs and mutations.
 | `hardware.items.get` | `hardwareId`. | Full current item, notes/revisions, access description, observations, group aliases, current hold, and store revision. |
 | `hardware.reservations.list` | State filter and `ownedByMe`, cursor, limit. | Claims and system-check holds with owner observations and reasons. |
 | `hardware.statuses.refresh` | `requestId`, `hardwareId`, status IDs; claim reference when owned. | Persisted check receipt. No implicit reserve. |
+| `hardware.connection.check` | User only: `requestId`, `hardwareId`, `expectedItemRevision`, optional SSH `config` draft. | Persisted receipt with `{ hardwareId, connectionCheck, draft }`. Tests a saved or draft connection without changing the item. |
 | `hardware.reserve` | ReserveHardware. Owner is resolved by the server. | Receipt and claim reference; access requires active state. |
 | `hardware.access.open` | `requestId`, reservation ID, generation. | Managed connection receipt and supported operations. Repeated open returns the same connection identity. |
 | `hardware.access.invoke` | InvokeHardware. | Persisted running receipt followed by the schema-defined result. |
@@ -81,6 +83,10 @@ Explicit closure of an ordinary AI tab is a separate server lifecycle action. It
 ## SSH operation payloads
 
 SSH configuration uses `auth: { kind: "agent" }` by default. `socketPath` is optional for an explicit agent override. Other modes are `{ kind: "identity_file", path }` and `{ kind: "password", credentialRefId }`. `knownHostsFile` is optional; omitting it uses normal OpenSSH host files with `StrictHostKeyChecking=accept-new`. An explicit override uses strict checking.
+
+`onlineCheckIntervalMs` defaults to 60,000 when omitted. Set an integer from 1,000 to 86,400,000 to change the interval, or `null` to disable periodic login checks. The server skips disabled, held, locally unready, and conflicting endpoints. Recurring checks do not append permanent request receipts or history entries. They acquire a durable system-check hold with `connectionCheck: { itemRevision }` and an empty `bindingRevisions` list; status checks still require their binding revisions. An uncertain background check retains up to 64 KiB of serialized, credential-redacted `diagnostics` on that hold for recovery, including across restart.
+
+The optional `HardwareSummary.connectionCheck` contains `online`, an optional error, `itemRevision`, `checkedAt`, and `expiresAt`. It describes the tested saved revision and is runtime state, cleared on restart. Inventory does not carry raw process diagnostics. Manual test receipts retain bounded diagnostics. A draft test locks the union of the saved physical group's keys and its prospective keys, rejects cross-group endpoint conflicts, and never changes saved configuration or endpoint identities. A draft result does not replace the saved machine's login observation.
 
 The user-only management route `PUT /api/hardware/ssh-passwords/:credentialRefId` accepts `{ password }` and returns only `{ credentialRefId }`. A reference has the form `ssh-password-<UUID>` for a saved login, or `ssh-registration-<UUID>` for a temporary registration password. Repeating the same reference and value is idempotent; a different value for an existing reference is rejected. Passwords are single-line values of 1–1023 UTF-8 bytes. They are stored through the existing private config secret store, outside Hardware inventory and receipts; there is no password read endpoint.
 

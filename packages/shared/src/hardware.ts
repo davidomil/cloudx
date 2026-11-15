@@ -125,6 +125,7 @@ export interface HardwareCheckHold {
   resourceKeys: string[];
   state: "checking" | "recovery_required";
   bindingRevisions: { definitionId: string; revision: number }[];
+  connectionCheck?: { itemRevision: number; diagnostics?: JsonObject };
   startedAt: string;
   recoveryReason?: string;
 }
@@ -148,7 +149,22 @@ export interface HardwareSummary {
   availability: "available" | "held" | "ineligible";
   blockers: string[];
   checkHold?: HardwareCheckHold;
+  connectionCheck?: HardwareConnectionObservation;
 }
+
+export interface HardwareConnectionResult {
+  online: boolean;
+  error?: { code: string; message: string };
+  diagnostics?: JsonObject;
+}
+
+export interface HardwareConnectionObservation extends HardwareConnectionResult {
+  itemRevision: number;
+  checkedAt: string;
+  expiresAt: string;
+}
+
+export const DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS = 60_000;
 
 export interface ReserveHardware {
   requestId: string;
@@ -222,6 +238,7 @@ export interface SshConfig {
   auth: { kind: "agent"; socketPath?: string } | { kind: "identity_file"; path: string } | { kind: "password"; credentialRefId: string };
   knownHostsFile?: string;
   connectTimeoutMs: number;
+  onlineCheckIntervalMs?: number | null;
 }
 
 export interface UartConfig {
@@ -324,6 +341,13 @@ export interface RefreshHardwareStatuses extends Partial<ReservationRef> {
   statusIds?: string[];
 }
 
+export interface CheckHardwareConnection {
+  requestId: string;
+  hardwareId: string;
+  expectedItemRevision: number;
+  config?: JsonObject;
+}
+
 export interface HardwareMutationResult {
   receipt: OperationReceipt;
   reservation?: HardwareReservation;
@@ -349,6 +373,27 @@ export function hardwareId(value: unknown, label = "Hardware ID"): string {
 export function hardwareInteger(value: unknown, label: string, minimum = 1, maximum = Number.MAX_SAFE_INTEGER): number {
   if (!Number.isSafeInteger(value) || Number(value) < minimum || Number(value) > maximum) throw new Error(`${label} must be an integer from ${minimum} to ${maximum}.`);
   return Number(value);
+}
+
+export function parseHardwareConnectionObservation(value: unknown): HardwareConnectionObservation {
+  const record = hardwareRecord(value, "Connection observation");
+  if (typeof record.online !== "boolean" || Object.keys(record).some(key => !["online", "error", "diagnostics", "itemRevision", "checkedAt", "expiresAt"].includes(key))) throw new Error("Connection observation contains invalid fields.");
+  const itemRevision = hardwareInteger(record.itemRevision, "Checked item revision");
+  const checkedAt = hardwareText(record.checkedAt, "Connection check time", 64);
+  const expiresAt = hardwareText(record.expiresAt, "Connection expiry time", 64);
+  if (!Number.isFinite(Date.parse(checkedAt)) || !Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) < Date.parse(checkedAt)) throw new Error("Connection observation has invalid timestamps.");
+  let error: HardwareConnectionResult["error"];
+  if (record.error !== undefined) {
+    const detail = hardwareRecord(record.error, "Connection error");
+    if (Object.keys(detail).some(key => !["code", "message"].includes(key))) throw new Error("Connection error contains unknown fields.");
+    error = { code: hardwareText(detail.code, "Connection error code", 128), message: hardwareText(detail.message, "Connection error message", 4096) };
+  }
+  let diagnostics: JsonObject | undefined;
+  if (record.diagnostics !== undefined) {
+    diagnostics = hardwareRecord(record.diagnostics, "Connection diagnostics") as JsonObject;
+    validateHardwareJson(diagnostics);
+  }
+  return { online: record.online, itemRevision, checkedAt, expiresAt, ...(error ? { error } : {}), ...(diagnostics ? { diagnostics } : {}) };
 }
 
 export function parseHardwareOwner(value: unknown): HardwareOwner {

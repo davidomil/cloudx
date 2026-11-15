@@ -1,6 +1,7 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import { X } from "lucide-react";
 import { ControlButton } from "../Control.js";
+import { DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS } from "@cloudx/shared";
 import type {
   BashScript,
   HardwareHistoryEntry,
@@ -279,6 +280,75 @@ export function ReceiptView({ receipt }: { receipt: OperationReceipt }) {
         <pre>{JSON.stringify(receipt.result, null, 2)}</pre>
       ) : null}
     </article>
+  );
+}
+
+export function SshConnectionStatus({
+  summary,
+  detailed = false,
+}: {
+  summary: HardwareSummary;
+  detailed?: boolean;
+}) {
+  if (summary.item.typeId !== "hardware.ssh") return null;
+  const check =
+    summary.connectionCheck?.itemRevision === summary.item.revision
+      ? summary.connectionCheck
+      : undefined;
+  const ownCheck =
+    summary.checkHold?.hardwareId === summary.item.id &&
+    summary.checkHold.connectionCheck;
+  const checking = Boolean(ownCheck && summary.checkHold?.state === "checking");
+  const recovery = Boolean(
+    ownCheck && summary.checkHold?.state === "recovery_required",
+  );
+  const stale = Boolean(check && Date.parse(check.expiresAt) <= Date.now());
+  const interval =
+    summary.item.config.onlineCheckIntervalMs === null
+      ? null
+      : Number(
+          summary.item.config.onlineCheckIntervalMs ??
+            DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS,
+        );
+  const held = Boolean(summary.reservation || summary.checkHold);
+  const next = held
+    ? "paused while group is held"
+    : check && interval !== null
+      ? new Date(Date.parse(check.checkedAt) + interval).toLocaleString()
+      : "due";
+  return (
+    <span
+      className="hardware-observation-container hardware-ssh-status"
+      aria-label="SSH login status"
+      role="status"
+      aria-busy={checking}
+    >
+      <span
+        className={`hardware-observation ${check?.online && !stale && !checking && !recovery ? "positive" : "warning"}`}
+        title={check?.error?.message}
+      >
+        {checking
+          ? "Checking SSH login…"
+          : `SSH login: ${!check || recovery ? "Unknown" : check.online ? "Online" : "Failed"}`}
+        {stale && !checking ? " · stale" : ""}
+      </span>
+      {detailed ? (
+        <small className="hardware-observation-details">
+          Checked:{" "}
+          {check ? new Date(check.checkedAt).toLocaleString() : "never"}
+          {check
+            ? ` · Expires: ${new Date(check.expiresAt).toLocaleString()}`
+            : ""}
+          {check?.error ? ` · ${check.error.code}: ${check.error.message}` : ""}
+          {recovery
+            ? ` · ${summary.checkHold?.recoveryReason ?? "Inspect the connection check hold before trying again."}`
+            : ""}
+          {interval === null
+            ? " · Automatic checks disabled"
+            : ` · Automatic checks every ${interval / 1000} seconds · Next check: ${next}`}
+        </small>
+      ) : null}
+    </span>
   );
 }
 

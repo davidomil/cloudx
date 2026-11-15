@@ -2,7 +2,11 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { HardwareSummary, OperationReceipt } from "@cloudx/shared";
-import { Observation, ReceiptView } from "./HardwareControls.js";
+import {
+  Observation,
+  ReceiptView,
+  SshConnectionStatus,
+} from "./HardwareControls.js";
 import { HardwareReadiness } from "./HardwareReadiness.js";
 
 const summary: HardwareSummary = {
@@ -54,6 +58,105 @@ const summary: HardwareSummary = {
 afterEach(() => vi.useRealTimers());
 
 describe("Hardware operation and observation views", () => {
+  it("keeps SSH login state separate from reservation availability and rejects old item measurements", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-15T00:00:15Z"));
+    const connectionCheck = {
+      online: true,
+      itemRevision: 1,
+      checkedAt: "2026-11-15T00:00:00Z",
+      expiresAt: "2026-11-15T00:01:00Z",
+    };
+    const render = (value: HardwareSummary) =>
+      renderToStaticMarkup(
+        createElement(SshConnectionStatus, { summary: value, detailed: true }),
+      );
+    expect(render({ ...summary, connectionCheck })).toContain(
+      "SSH login: Online",
+    );
+    expect(render({ ...summary, connectionCheck })).toContain("60 seconds");
+    expect(
+      render({
+        ...summary,
+        item: { ...summary.item, revision: 2 },
+        connectionCheck,
+      }),
+    ).toContain("Unknown");
+    expect(
+      render({
+        ...summary,
+        item: { ...summary.item, revision: 2 },
+        connectionCheck,
+      }),
+    ).not.toContain("SSH login: Online");
+    vi.setSystemTime(new Date("2026-11-15T00:02:00Z"));
+    expect(render({ ...summary, connectionCheck })).toContain("stale");
+    expect(
+      render({
+        ...summary,
+        connectionCheck: {
+          ...connectionCheck,
+          online: false,
+          error: {
+            code: "SSH_AUTH_FAILED",
+            message: "Password authentication was rejected.",
+          },
+        },
+      }),
+    ).toContain("SSH login: Failed");
+    expect(
+      render({
+        ...summary,
+        connectionCheck: {
+          ...connectionCheck,
+          online: false,
+          error: {
+            code: "SSH_AUTH_FAILED",
+            message: "Password authentication was rejected.",
+          },
+        },
+      }),
+    ).toContain("Password authentication was rejected.");
+    expect(
+      render({
+        ...summary,
+        item: { ...summary.item, typeId: "hardware.uart" },
+      }),
+    ).toBe("");
+  });
+
+  it("shows SSH login check progress, held pause and explicit automatic opt-out", () => {
+    const checkHold = {
+      kind: "system_check" as const,
+      runId: "probe",
+      revision: 1,
+      generation: 1,
+      hardwareId: summary.item.id,
+      resourceKeys: [],
+      state: "checking" as const,
+      bindingRevisions: [],
+      connectionCheck: { itemRevision: 1 },
+      startedAt: "2026-11-15T00:00:00Z",
+    };
+    const render = (value: HardwareSummary) =>
+      renderToStaticMarkup(
+        createElement(SshConnectionStatus, { summary: value, detailed: true }),
+      );
+    expect(render({ ...summary, checkHold })).toContain("Checking SSH login");
+    expect(
+      render({
+        ...summary,
+        checkHold: { ...checkHold, connectionCheck: undefined },
+      }),
+    ).toContain("paused while group is held");
+    expect(
+      render({
+        ...summary,
+        item: { ...summary.item, config: { onlineCheckIntervalMs: null } },
+      }),
+    ).toContain("Automatic checks disabled");
+  });
+
   it("preserves a succeeded outcome when retained output has been pruned", () => {
     const receipt: OperationReceipt = {
       requestId: "original",

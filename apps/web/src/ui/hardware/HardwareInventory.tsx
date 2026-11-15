@@ -19,6 +19,7 @@ import { ControlButton } from "../Control.js";
 import {
   HardwareHistory,
   Observation,
+  SshConnectionStatus,
   StatusInput,
   type HardwareRun,
 } from "./HardwareControls.js";
@@ -329,6 +330,7 @@ export function HardwareInventory({
                       {state.types.find(
                         (type) => type.id === summary.item.typeId,
                       )?.displayName ?? summary.item.typeId}
+                      <SshConnectionStatus summary={summary} />
                     </td>
                     <td>
                       <div className="hardware-tags">
@@ -514,6 +516,7 @@ function HardwareInspector({
           {tab === "overview" ? (
             <>
               <div className="hardware-card">
+                <SshConnectionStatus summary={summary} detailed />
                 <dl>
                   <dt>Physical group</dt>
                   <dd>

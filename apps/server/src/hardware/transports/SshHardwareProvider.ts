@@ -4,8 +4,8 @@ import { isIP } from "node:net";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
-import type { HardwareAccessContext, HardwareConnection, HardwareTypeProvider } from "@cloudx/plugin-api";
-import type { HardwareAccessDescription, HardwareEndpointInspection, HardwareTypeDescriptor, JsonObject, ProviderOutcome, SshConfig } from "@cloudx/shared";
+import type { HardwareAccessContext, HardwareConnection, HardwareConnectionCheckContext, HardwareTypeProvider } from "@cloudx/plugin-api";
+import { DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS, type HardwareAccessDescription, type HardwareConnectionResult, type HardwareEndpointInspection, type HardwareTypeDescriptor, type JsonObject, type ProviderOutcome, type SshConfig } from "@cloudx/shared";
 import type { PathPolicy } from "../../pathPolicy.js";
 import { BoundedProcessSet, type ProcessCommand, type ProcessResult } from "./BoundedProcess.js";
 import { SshAskpass } from "./SshAskpass.js";
@@ -26,7 +26,8 @@ export const sshHardwareDescriptor: HardwareTypeDescriptor = {
     host: { type: "string", minLength: 1, maxLength: 253 }, port: { type: "integer", minimum: 1, maximum: 65535 },
     username: { type: "string", minLength: 1, maxLength: 64, pattern: "^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$" },
     auth: { oneOf: [objectSchema({ kind: { const: "agent" }, socketPath: absolutePathSchema }, ["kind"]), objectSchema({ kind: { const: "identity_file" }, path: absolutePathSchema }), objectSchema({ kind: { const: "password" }, credentialRefId: credentialRefSchema })] },
-    knownHostsFile: absolutePathSchema, connectTimeoutMs: { type: "integer", minimum: 1, maximum: 120000 }
+    knownHostsFile: absolutePathSchema, connectTimeoutMs: { type: "integer", minimum: 1, maximum: 120000 },
+    onlineCheckIntervalMs: { anyOf: [{ type: "integer", minimum: 1000, maximum: 86_400_000 }, { type: "null" }] }
   }, ["host", "port", "username", "auth", "connectTimeoutMs"]),
   operations: [
     { id: "ssh.exec", description: "Execute an explicit remote Bash script supplied through stdin.",
@@ -88,7 +89,30 @@ export class SshHardwareProvider implements HardwareTypeProvider<SshConfig> {
   }
 
   describeAccess(config: SshConfig): HardwareAccessDescription {
-    return { summary: `${config.username}@${config.host}:${config.port}`, details: { host: config.host, port: config.port, username: config.username, authentication: config.auth.kind, hostTrust: config.knownHostsFile ? "Strict verification against the selected file" : "OpenSSH default known_hosts; accept new hosts and reject changed keys", remoteShell: "/bin/bash", fileTransfer: "OpenSSH SFTP, regular files only", noOverwriteUploadRequirement: "The server and destination filesystem must support the hardlink@openssh.com SFTP extension." } };
+    return { summary: `${config.username}@${config.host}:${config.port}`, details: { host: config.host, port: config.port, username: config.username, authentication: config.auth.kind, hostTrust: config.knownHostsFile ? "Strict verification against the selected file" : "OpenSSH default known_hosts; accept new hosts and reject changed keys", remoteShell: "/bin/bash", fileTransfer: "OpenSSH SFTP, regular files only", onlineCheckIntervalMs: config.onlineCheckIntervalMs === undefined ? DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS : config.onlineCheckIntervalMs, noOverwriteUploadRequirement: "The server and destination filesystem must support the hardlink@openssh.com SFTP extension." } };
+  }
+
+  async checkConnection(config: SshConfig, context: HardwareConnectionCheckContext): Promise<ProviderOutcome<HardwareConnectionResult>> {
+    const processes = new SshProcesses(config, this.options, context.resolveCredential);
+    context.registerCleanup(signal => processes.close(signal));
+    let result: HardwareConnectionResult;
+    try {
+      if (context.signal.aborted) result = { online: false, error: { code: "CANCELLED", message: "SSH connection check was cancelled before dispatch." } };
+      else {
+        const inspection = await this.inspectEndpoint(config);
+        if (!inspection.ready) result = { online: false, error: { code: "ENDPOINT_UNAVAILABLE", message: diagnosticText(inspection.blockers.join("; "), 4096) } };
+        else {
+          const checked = await processes.run({ executable: this.options.sshExecutable ?? "/usr/bin/ssh", args: [...sshArguments(config), "--", config.host, "exit 0"], timeoutMs: config.connectTimeoutMs + 1000, maxOutputBytes: 64 * 1024, signal: context.signal }, passwordReference(config));
+          result = connectionCheckResult(checked, context.signal.aborted || processes.cancelled);
+        }
+      }
+    } catch (error) {
+      result = { online: false, error: error instanceof HardwareProviderError ? { code: error.code, message: error.message } : { code: "SSH_CHECK_FAILED", message: "The SSH connection check could not complete." } };
+    }
+    try {
+      if ((await processes.close(context.signal)).state === "completed") return completed(result);
+    } catch { /* An unconfirmed local process cannot complete the check. */ }
+    return unknown("SSH_CHECK_CLEANUP_UNKNOWN", "SSH connection check could not confirm that its local processes ended.", result.diagnostics);
   }
 
   async connect(config: SshConfig, context: HardwareAccessContext): Promise<ProviderOutcome<HardwareConnection>> {
@@ -273,6 +297,22 @@ class SshConnection implements HardwareConnection {
   }
 }
 
+function connectionCheckResult(result: ProcessResult, cancelled: boolean): HardwareConnectionResult {
+  const diagnostics = processDiagnostics(result);
+  if (result.state === "exited" && result.exitCode === 0 && !result.interrupted) return { online: true, diagnostics };
+  let error = { code: "SSH_CHECK_FAILED", message: "The fixed SSH login check did not complete successfully." };
+  if (result.interrupted) error = cancelled
+    ? { code: "CANCELLED", message: "SSH connection check was cancelled." }
+    : { code: "TIMEOUT", message: "SSH connection check exceeded its deadline." };
+  else if (result.state === "not_started") error = { code: "SSH_NOT_STARTED", message: "The OpenSSH client could not start." };
+  else if (result.exitCode === 255) {
+    if (/Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/i.test(result.stderr)) error = { code: "SSH_HOST_KEY_FAILED", message: "The SSH server host key was rejected. Inspect the configured host and trusted keys." };
+    else if (/Permission denied|Authentication failed|Too many authentication failures/i.test(result.stderr)) error = { code: "SSH_AUTH_FAILED", message: "The SSH server rejected the configured authentication." };
+    else if (/ssh: (?:connect to host|Could not resolve hostname)/i.test(result.stderr)) error = { code: "SSH_NETWORK_FAILED", message: "The configured SSH server could not be reached." };
+  }
+  return { online: false, error, diagnostics };
+}
+
 function processFailure(result: SshProcessResult, label: string): ProviderOutcome<JsonObject> | null {
   if (result.state === "not_started") return failed("TRANSPORT_NOT_STARTED", `${label} could not start.`);
   const rejected = result.connectionFailure;
@@ -357,6 +397,8 @@ class SshProcesses {
     const socket = config.auth.kind === "agent" && config.auth.socketPath ? config.auth.socketPath : (options.environment ?? process.env).SSH_AUTH_SOCK;
     this.environment = { SSH_ASKPASS_REQUIRE: "never", ...(config.auth.kind !== "identity_file" && socket ? { SSH_AUTH_SOCK: socket } : {}) };
   }
+
+  get cancelled(): boolean { return this.controller.signal.aborted; }
 
   run(command: ProcessCommand, credentialRefId?: string): Promise<ProcessResult> {
     const work = this.execute(command, credentialRefId);

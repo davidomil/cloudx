@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { emptyHardwareState, HardwareStore } from "./HardwareStore.js";
+import { emptyHardwareState, HardwareStore, validateHardwareState } from "./HardwareStore.js";
 import { HardwareWriterLease } from "./HardwareWriterLease.js";
 
 const roots: string[] = [], stores: HardwareStore[] = [];
@@ -11,6 +11,30 @@ afterEach(async () => { vi.restoreAllMocks(); for (const store of stores.splice(
 async function fixture() { const root = await fs.mkdtemp(path.join(os.tmpdir(), "hardware-store-")); roots.push(root); const store = new HardwareStore(root); stores.push(store); await store.init(); return { root, store }; }
 
 describe("durable Hardware authority", () => {
+  it("accepts an explicit SSH connection hold without custom status bindings and rejects ambiguous holds", () => {
+    const state = emptyHardwareState();
+    state.nextGeneration = 2;
+    state.groups.push({ id: "lab", revision: 1, name: "Lab" });
+    state.items.push({ id: "ssh", revision: 1, name: "SSH", description: "", enabled: true, physicalResourceId: "lab", typeId: "hardware.ssh", configVersion: 1, config: {}, tagIds: [], notes: "", notesRevision: 1, statuses: [], hooks: {} });
+    state.checkHolds.push({ kind: "system_check", runId: "connection-check", generation: 1, revision: 1, hardwareId: "ssh", resourceKeys: ["physical:lab"], state: "checking", bindingRevisions: [], connectionCheck: { itemRevision: 1 }, startedAt: new Date().toISOString() });
+    expect(validateHardwareState(state)).toEqual(state);
+    const uncertain = structuredClone(state); uncertain.checkHolds[0].state = "recovery_required"; uncertain.checkHolds[0].connectionCheck!.diagnostics = { exitCode: null, stderr: "[redacted]" };
+    expect(validateHardwareState(uncertain)).toEqual(uncertain);
+    const missingPurpose = structuredClone(state); delete missingPurpose.checkHolds[0].connectionCheck;
+    expect(() => validateHardwareState(missingPurpose)).toThrow();
+    const invalidRevision = structuredClone(state); invalidRevision.checkHolds[0].connectionCheck!.itemRevision = 0;
+    expect(() => validateHardwareState(invalidRevision)).toThrow();
+    const mixedPurpose = structuredClone(state); mixedPurpose.checkHolds[0].bindingRevisions.push({ definitionId: "ready", revision: 1 });
+    expect(() => validateHardwareState(mixedPurpose)).toThrow();
+    const wrongProvider = structuredClone(state); wrongProvider.items[0].typeId = "hardware.uart";
+    expect(() => validateHardwareState(wrongProvider)).toThrow();
+    for (const value of [null, false, 0, "", { itemRevision: 1, extra: true }, { itemRevision: 1, diagnostics: "invalid" }, { itemRevision: 1, diagnostics: { stdout: "x".repeat(64 * 1024) } }]) {
+      const malformed = structuredClone(state);
+      (malformed.checkHolds[0] as unknown as Record<string, unknown>).connectionCheck = value;
+      expect(() => validateHardwareState(malformed)).toThrow();
+    }
+  });
+
   it("holds one process writer and permits reacquisition only after release", async () => {
     const { root, store } = await fixture();
     const contender = new HardwareStore(root); stores.push(contender);

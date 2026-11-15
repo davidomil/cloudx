@@ -12,6 +12,16 @@ SSH defaults to **Current SSH agent**. It uses the agent available to the CloudX
 
 No known-hosts path is required. SSH uses the host account's normal known-hosts files, saves a new host key on first connection, and rejects a changed key. Explicit file overrides still require an admitted regular file and strict checking.
 
+## Edit and test SSH connections
+
+Select a machine and choose **Edit hardware** to change its host or IP address, port, username, or authentication. Leave the replacement password blank to keep the saved password. Enter a new password to replace it. The editor never retrieves the saved password.
+
+For a saved machine, **Test connection** checks the current connection fields, including an unsaved IP address or replacement password. The test does not save the machine. Its result identifies the tested endpoint; changing the connection fields marks that result as outdated. Save a new machine before testing it. The test uses a temporary system-check hold and does not run reservation hooks or grant managed access. Connection edits and tests stay blocked while the resource is held. Use **Inspect hold** to inspect its owner and recovery state before releasing it.
+
+Enabled SSH machines check login every 60 seconds by default. Change the interval in the editor, or disable **Enable automatic SSH login checks**. Checks pause while a physical alias is held, the machine is disabled, or local connection prerequisites are unavailable. **SSH login** reports the latest result and its freshness separately from reservation availability and custom statuses. A failed login can mean rejected authentication, an unreachable endpoint, or a host-key error; inspect the reason. It does not identify a wrong password by itself.
+
+Login checks use bounded execution and close their local processes before clearing the check hold. An observed login failure with confirmed cleanup leaves the machine editable. Unconfirmed cleanup retains a recovery hold. A server restart clears the last login observation and preserves any unfinished check for recovery.
+
 To install keys on a machine, save the item, reserve it, and choose **Register SSH key** before opening access. Enter a registration password when needed. Agent/password items register the keys loaded in the current SSH agent; identity-file items use their configured key pair. `ssh-copy-id` checks which keys already work and skips them. Registration does not change the item's authentication method or retry a failed command. A temporary registration password is discarded after the local operation and cleanup finish; interrupted temporary passwords are cleared on server startup.
 
 ## Set statuses and hooks
