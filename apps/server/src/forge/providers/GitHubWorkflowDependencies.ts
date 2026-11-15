@@ -72,25 +72,42 @@ export class GitHubWorkflowDependencies {
     if (Object.keys(this.jobs).length > 200) ambiguous();
   }
 
-  failedDependencies(gate: Record<string, unknown>, runJobs: Record<string, unknown>[]): Record<string, unknown>[] {
-    const [gateId, definition] = this.definition(gate);
+  failedDependencies(gate: Record<string, unknown>, runJobs: Record<string, unknown>[], observe?: (job: Record<string, unknown>) => void): Record<string, unknown>[] {
+    const [gateId] = this.definition(gate);
     this.validateGraph(gateId, new Set(), new Set());
-    const ids = this.needs(definition);
-    if (!ids.length) return ambiguous();
-    const dependencies = ids.flatMap(id => {
-      return jobNames(id, record(this.jobs[id])).map(name => {
-        const owners = Object.entries(this.jobs).filter(([key, value]) => jobNames(key, record(value)).includes(name));
-        const matches = runJobs.filter(job => job.name === name);
-        if (owners.length !== 1 || matches.length !== 1) return ambiguous();
-        const job = matches[0];
-        if (job.status !== "completed") throw new ForgeProviderError("An aggregate dependency is still running.");
-        if (["action_required", "startup_failure", "cancelled"].includes(string(job.conclusion)))
-          throw new ForgeProviderError("An aggregate dependency needs policy or infrastructure intervention.");
-        if (!["success", "failure", "timed_out"].includes(string(job.conclusion))) return ambiguous();
-        return job;
+    const resolved = new Map<string, Record<string, unknown>[]>();
+    const resolve = (id: string): Record<string, unknown>[] => {
+      const cached = resolved.get(id);
+      if (cached) return cached;
+      const ids = this.needs(record(this.jobs[id]));
+      if (!ids.length) return ambiguous();
+      const failures = ids.flatMap(dependencyId => {
+        const definition = record(this.jobs[dependencyId]);
+        return jobNames(dependencyId, definition).flatMap(name => {
+          const owners = Object.entries(this.jobs).filter(([key, value]) => jobNames(key, record(value)).includes(name));
+          const matches = runJobs.filter(job => job.name === name);
+          if (owners.length !== 1 || matches.length !== 1) return ambiguous();
+          const job = matches[0];
+          if (job.status !== "completed") throw new ForgeProviderError("An aggregate dependency is still running.");
+          const conclusion = string(job.conclusion);
+          if (["action_required", "startup_failure", "cancelled"].includes(conclusion))
+            throw new ForgeProviderError("An aggregate dependency needs policy or infrastructure intervention.");
+          observe?.(job);
+          if (conclusion === "skipped") {
+            if (Object.hasOwn(definition, "if")) return ambiguous();
+            const ancestors = resolve(dependencyId);
+            if (!ancestors.length) return ambiguous();
+            return ancestors;
+          }
+          if (!["success", "failure", "timed_out"].includes(conclusion)) return ambiguous();
+          return conclusion === "success" ? [] : [job];
+        });
       });
-    });
-    return dependencies.filter(job => ["failure", "timed_out"].includes(string(job.conclusion)));
+      const unique = [...new Set(failures)];
+      resolved.set(id, unique);
+      return unique;
+    };
+    return resolve(gateId);
   }
 
   pinnedArtifactStep(job: Record<string, unknown>, failedStep: { name: string; number: number }, runJobs: Record<string, unknown>[]): boolean {
