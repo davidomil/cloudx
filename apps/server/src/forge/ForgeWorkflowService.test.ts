@@ -6615,6 +6615,85 @@ describe("Forge issue auto review", () => {
     return { repository, sourceHead, targetHead, testedMerge, token, fetcher, run, checks, job, gate, optional };
   }
 
+  async function realSkippedCoverageFailure(f: Pick<ReturnType<typeof fixture>, "deps" | "change" | "provider" | "reports">) {
+    const evidence = realCiDiagnostics(f, "github", "AssertionError: SshKeyRegistrationPhases.test.ts:90 expected inspecting key\n", "Isolated verifier (coverage-3)", true);
+    const workflow = await fs.readFile(new URL("../../../../.github/workflows/ci.yml", import.meta.url));
+    const names = ["Repository policy", "TypeScript (build, type-check, test)", "Pinned lifecycle revisions",
+      "Clean installation", "Installed previous-version upgrade", "Claude Code native contract",
+      "Terminal stress (Node 22, 2 CPUs, 7 GiB)", "Python services (pytest)",
+      "Browser smoke (desktop and mobile)", "Isolated full verifier", "Trusted merge identity",
+      ...["installer", "0.156.1", "0.166.0"].map(version => `Codex native recovery (${version})`),
+      ...["coverage-1", "coverage-2", "coverage-4", "static", "asr", "documentation", "browser-1", "browser-2"].map(lane => `Isolated verifier (${lane})`),
+      "Merged isolated coverage", "Superseded merge identity", "Pending merge identity"];
+    const jobs = [evidence.gate, evidence.job, ...names.map((name, index) => ({ ...evidence.job, id: index + 12, name,
+      conclusion: ["Python services (pytest)", "Browser smoke (desktop and mobile)", "Isolated full verifier"].includes(name) ? "failure" :
+        ["Merged isolated coverage", "Superseded merge identity", "Pending merge identity"].includes(name) ? "skipped" : "success",
+      check_run_url: `https://api.github.com/repos/a/b/check-runs/${index + 12}`,
+      html_url: `https://github.com/a/b/actions/runs/42/job/${index + 12}`,
+    }))];
+    const original = evidence.fetcher.getMockImplementation()!;
+    evidence.fetcher.mockImplementation(async input => {
+      const url = new URL(String(input));
+      const pathname = url.pathname;
+      if (pathname === "/repos/a/b/actions/runs/42/attempts/1/jobs") return Response.json({ jobs });
+      if (pathname === "/repos/a/b/contents/.github/workflows/ci.yml") {
+        expect(url.searchParams.get("ref")).toBe(evidence.testedMerge);
+        return Response.json({ type: "file", path: ".github/workflows/ci.yml", encoding: "base64", size: workflow.length,
+          content: workflow.toString("base64"), sha: createHash("sha1").update(`blob ${workflow.length}\0`).update(workflow).digest("hex") });
+      }
+      if (/\/jobs\/\d+\/logs$/.test(pathname) && !pathname.endsWith("/jobs/9/logs"))
+        return new Response("Process completed with exit code 1.\n");
+      return original(input);
+    });
+    return { ...evidence, jobs };
+  }
+
+  it("launches one automatic repair for the failed coverage lane behind the pinned skipped coverage merge", async () => {
+    const f = await approvedIssue(1, "github");
+    const evidence = await realSkippedCoverageFailure(f);
+    await f.poll(); await f.poll();
+    const repair = f.currentIssue();
+    expect(repair).toMatchObject({ status: "running", ciRepair: { phase: "repairing", attempts: 1,
+      attemptedHeads: [evidence.sourceHead], diagnostic: { state: "actionable", sourceHeadSha: evidence.sourceHead,
+        targetHeadSha: evidence.targetHead, testedSha: evidence.testedMerge, jobs: [{ jobId: "9", runId: "42", runAttempt: 1,
+          name: "Isolated verifier (coverage-3)", classification: "code", requiredGate: { jobId: "10", name: "CI aggregate" } }] } },
+      completion: { turn: { status: "running", attemptId: repair.attemptId } } });
+    expect(repair.ciRepair!.diagnostic!.jobs).toHaveLength(1);
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(repair.attemptId,
+      expect.objectContaining({ ciRepair: expect.objectContaining({ diagnostic: repair.ciRepair!.diagnostic }) }));
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll(); await restarted.poll();
+    expect(f.currentIssue()).toMatchObject({ attemptId: repair.attemptId, ciRepair: { attempts: 1, attemptedHeads: [evidence.sourceHead] } });
+    expect(evidence.fetcher.mock.calls.filter(([url]) => String(url).endsWith("/jobs/9/logs"))).toHaveLength(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(3);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
+  it("continues one capped manual repair with fresh pinned skipped-coverage evidence and preserves its automatic budget", async () => {
+    const f = await exhaustedCiBudget();
+    const previous = structuredClone(f.currentIssue());
+    const evidence = await realSkippedCoverageFailure(f);
+    const continued = await f.service.continueWorker(f.issue.id, "Repair the current coverage failure.", placement, { ciRepair: true });
+    expect(continued).toMatchObject({ status: "running", branch: previous.branch, worktreePath: previous.worktreePath,
+      changeNumber: previous.changeNumber, headSha: previous.headSha, ciRepair: { manual: true, phase: "repairing", attempts: 2,
+        attemptedHeads: previous.ciRepair!.attemptedHeads, diagnosticStatus: "current",
+        diagnostic: { state: "actionable", sourceHeadSha: evidence.sourceHead, targetHeadSha: evidence.targetHead,
+          testedSha: evidence.testedMerge, jobs: [{ jobId: "9", runId: "42", runAttempt: 1,
+            name: "Isolated verifier (coverage-3)", classification: "code", requiredGate: { jobId: "10", name: "CI aggregate" } }] } },
+      completion: { turn: { status: "running", attemptId: continued.attemptId } } });
+    expect(continued.ciRepair!.diagnostic!.jobs).toHaveLength(1);
+    expect(f.reports.prepare).toHaveBeenLastCalledWith(continued.attemptId,
+      expect.objectContaining({ ciRepair: expect.objectContaining({ manual: true, diagnostic: continued.ciRepair!.diagnostic }) }));
+    await expect(f.service.continueWorker(f.issue.id, "Repair the current coverage failure.", placement, { ciRepair: true })).rejects.toThrow(/Pause/);
+    const restarted = new ForgeWorkflowService(f.deps);
+    await restarted.poll(); await restarted.poll();
+    expect(f.currentIssue()).toMatchObject({ attemptId: continued.attemptId, ciRepair: { manual: true, attempts: 2,
+      attemptedHeads: previous.ciRepair!.attemptedHeads, phase: "repairing" } });
+    expect(evidence.fetcher.mock.calls.filter(([url]) => String(url).endsWith("/jobs/9/logs"))).toHaveLength(1);
+    expect(f.runtime.launch).toHaveBeenCalledTimes(7);
+    expect(f.provider.merge).not.toHaveBeenCalled();
+  });
+
   function realArtifactFailure(f: Awaited<ReturnType<typeof approvedIssue>>, failure: "missing_dependency" | "duplicate_dependency" | "required_check_error" | "required_check_api_error" | "step_collision") {
     const log = "Error: Failed to ListArtifacts: Unable to make request: ECONNRESET\n";
     const evidence = realCiDiagnostics(f, "github", log, "Isolated full verifier", true);
