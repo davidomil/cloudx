@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { GitHubWorkflowDependencies } from "./GitHubWorkflowDependencies.js";
 
 const terminal = (name: string, conclusion = "success") => ({ name, status: "completed", conclusion });
@@ -44,6 +44,76 @@ describe("Pinned workflow dependencies", () => {
   it("proves that an independently failed gate has only successful dependencies", () => {
     const workflow = new GitHubWorkflowDependencies("jobs: {gate: {needs: [test, sibling]}, test: {}, sibling: {}}");
     expect(workflow.failedDependencies(terminal("gate", "failure"), [terminal("test"), terminal("sibling")])).toEqual([]);
+  });
+
+  it("resolves the real verifier's failed matrix lane through the skipped coverage merge exactly once", async () => {
+    const workflow = new GitHubWorkflowDependencies(await fs.readFile(".github/workflows/ci.yml", "utf8"));
+    const lanes = ["static", "coverage-1", "coverage-2", "coverage-3", "coverage-4", "asr", "documentation", "browser-1", "browser-2"];
+    const jobs = lanes.map(lane => terminal(`Isolated verifier (${lane})`, lane === "coverage-3" ? "failure" : "success"));
+    jobs.push(terminal("Merged isolated coverage", "skipped"));
+    expect(workflow.failedDependencies(terminal("Isolated full verifier", "failure"), jobs))
+      .toEqual([jobs.find(job => job.name === "Isolated verifier (coverage-3)")]);
+  });
+
+  it("deduplicates failures reached through direct, nested and shared skipped paths", () => {
+    const workflow = new GitHubWorkflowDependencies(`jobs:
+  gate: {needs: [first, outer, second]}
+  outer: {needs: [inner, sibling]}
+  inner: {needs: [first, second, sibling]}
+  first: {}
+  second: {}
+  sibling: {}
+`);
+    const first = terminal("first", "failure");
+    const second = terminal("second", "timed_out");
+    const jobs = [first, second, terminal("outer", "skipped"), terminal("inner", "skipped"), terminal("sibling")];
+    expect(workflow.failedDependencies(terminal("gate", "failure"), jobs)).toEqual([first, second]);
+  });
+
+  it("memoizes shared skipped subgraphs within each evidence snapshot", () => {
+    const definitions: Record<string, unknown> = { gate: { needs: ["left0", "right0"] }, producer: {} };
+    const jobs = [terminal("producer", "failure")];
+    for (let level = 0; level < 16; level++) {
+      const needs = level === 15 ? ["producer"] : [`left${level + 1}`, `right${level + 1}`];
+      for (const side of ["left", "right"]) {
+        const name = `${side}${level}`;
+        definitions[name] = { needs };
+        jobs.push(terminal(name, "skipped"));
+      }
+    }
+    const workflow = new GitHubWorkflowDependencies(`jobs: ${JSON.stringify(definitions)}`);
+    const observed = vi.fn();
+    expect(workflow.failedDependencies(terminal("gate", "failure"), jobs, observed)).toEqual([jobs[0]]);
+    expect(new Set(observed.mock.calls.map(([job]) => job)).size).toBe(jobs.length);
+    expect(observed.mock.calls.length).toBeLessThanOrEqual(64);
+    jobs[0].conclusion = "success";
+    expect(() => workflow.failedDependencies(terminal("gate", "failure"), jobs)).toThrow("unambiguous");
+  });
+
+  it.each([false, true, null, "", "success()", "${{ success() }}", "always()", "failure()", "github.ref == 'refs/heads/main'"])
+    ("rejects skipped jobs with an explicit condition: %j", condition => {
+      const workflow = new GitHubWorkflowDependencies(`jobs: ${JSON.stringify({
+        gate: { needs: ["producer", "coverage"] }, coverage: { needs: "producer", if: condition }, producer: {},
+      })}`);
+      expect(() => workflow.failedDependencies(terminal("gate", "failure"), [terminal("producer", "failure"), terminal("coverage", "skipped")]))
+        .toThrow("unambiguous");
+    });
+
+  it("rejects an unexplained skip even alongside a separate failed dependency", () => {
+    const workflow = new GitHubWorkflowDependencies("jobs: {gate: {needs: [failed, coverage]}, coverage: {needs: successful}, failed: {}, successful: {}}");
+    expect(() => workflow.failedDependencies(terminal("gate", "failure"), [terminal("failed", "failure"), terminal("successful"), terminal("coverage", "skipped")]))
+      .toThrow("unambiguous");
+  });
+
+  it.each([
+    [], [terminal("sibling"), terminal("sibling")],
+    ...["skipped", "cancelled", "action_required", "startup_failure", "neutral", "unknown"].map(conclusion => [terminal("sibling", conclusion)]),
+    [{ name: "sibling", status: "in_progress", conclusion: null }],
+    [{ name: "sibling", status: "queued", conclusion: null }],
+  ])("requires complete, unique and terminal ancestors before explaining a skip: %j", (...siblings) => {
+    const workflow = new GitHubWorkflowDependencies("jobs: {gate: {needs: coverage}, coverage: {needs: [failed, sibling]}, failed: {}, sibling: {}}");
+    expect(() => workflow.failedDependencies(terminal("gate", "failure"), [terminal("coverage", "skipped"), terminal("failed", "failure"), ...siblings]))
+      .toThrow();
   });
 
   it.each([
