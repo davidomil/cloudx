@@ -621,7 +621,7 @@ export class HardwareService {
         let outcome = await bounded(signal, timeoutMs, childSignal => {
           providerWork = Promise.resolve().then(() => provider.registerKey!(provider.parseConfig(claim.acquiredItem.config), { timeoutMs, ...(credentialRefId ? { credentialRefId } : {}) }, this.accessContext(claim, childSignal, access)));
           return providerWork;
-        });
+        }, 2500);
         const noEffects = outcome.state === "failed" && outcome.effects === "none";
         if (noEffects && !access.cleanup.length) { this.access.delete(claim.reservationId); cleanupConfirmed = true; }
         else { const ownCleanup = access.cleanup.length > priorClosers; cleanupConfirmed = (await this.closeAccess(work.ref, new AbortController().signal)).state === "completed" && (noEffects || ownCleanup); }

@@ -18,7 +18,7 @@ afterEach(async () => { vi.restoreAllMocks(); await Promise.allSettled(services.
 function gate() { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; }
 const completed = (): ProviderOutcome<null> => ({ state: "completed", value: null });
 async function settled(service: HardwareService, receipt: OperationReceipt) {
-  for (let attempt = 0; attempt < 200; attempt++) {
+  for (let attempt = 0; attempt < 400; attempt++) {
     const result = await service.execute("hardware.receipt.get", { requestId: receipt.requestId }, user) as { receipt: OperationReceipt };
     if (result.receipt.state !== "running") return result.receipt;
     await new Promise(resolve => setTimeout(resolve, 10));

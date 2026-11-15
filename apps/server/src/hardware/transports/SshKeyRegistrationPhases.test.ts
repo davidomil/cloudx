@@ -80,7 +80,7 @@ process.exitCode = 255;
     const keygen = path.join(directory, "ssh-keygen");
     const inspecting = path.join(directory, "inspecting");
     const dispatched = path.join(directory, "registration-dispatched");
-    await executable(keygen, `require('node:fs').writeFileSync(${JSON.stringify(inspecting)}, 'ready');process.stdout.write('inspecting key');setInterval(() => {}, 1000);`);
+    await executable(keygen, `const fs=require('node:fs');fs.writeSync(1,'inspecting key');fs.writeFileSync(${JSON.stringify(inspecting)},'ready');setInterval(() => {},1000);`);
     await executable(copyId, `require('node:fs').writeFileSync(${JSON.stringify(dispatched)}, 'unexpected');`);
     const provider = new SshHardwareProvider({ pathPolicy: new PathPolicy([root]), sshExecutable: ssh, sftpExecutable: process.execPath, sshCopyIdExecutable: copyId, sshKeygenExecutable: keygen, environment: {} });
     const controller = new AbortController();

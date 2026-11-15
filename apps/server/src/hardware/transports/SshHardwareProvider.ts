@@ -373,8 +373,10 @@ class SshProcesses {
   }
 
   private async executeTransport(kind: "ssh" | "sftp" | "registration", command: ProcessCommand, credentialRefId?: string): Promise<SshProcessResult> {
-    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ssh-client-"));
+    let directory: string | undefined;
+    let prepared = false;
     try {
+      directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ssh-client-"));
       const wrapper = path.join(directory, "ssh");
       const evidence = new SshExecutionEvidence();
       const executable = (this.options.sshExecutable ?? "/usr/bin/ssh").replace(/'/g, "'\\''");
@@ -383,6 +385,7 @@ class SshProcesses {
       // keeps a real pipe open; the relay drains it into the bounded fd 4.
       // Neither remote stderr nor authentication banners enter this channel.
       await fs.writeFile(wrapper, `#!/bin/bash\ntrap ':' TERM INT\nprintf '${evidence.start}' >&4\nif [ ! -x '${executable}' ]; then\n  printf 'cloudx-ssh-client-unavailable\\n${evidence.end}255\\n' >&4\n  exit 255\nfi\nexec 5> >(${relay})\n'${executable}' -v -E "/proc/$$/fd/5" "$@"\nstatus=$?\nexec 5>&-\nwait\nprintf '${evidence.end}%s\\n' "$status" >&4\nexit "$status"\n`, { mode: 0o700 });
+      prepared = true;
       let rejected: ReturnType<SshExecutionEvidence["connectionFailure"]>;
       let remoteCompleted = false;
       const result = await this.execute({ ...command, executable: kind === "ssh" ? wrapper : command.executable, args: kind === "sftp" ? ["-S", wrapper, ...command.args] : command.args, captureDiagnostics: true, inspectDiagnostics: (result, text, truncated) => {
@@ -391,7 +394,18 @@ class SshProcesses {
         remoteCompleted = evidence.remoteCompletionConfirmed(observed);
       }, environment: { ...command.environment, ...(kind === "registration" ? { PATH: `${directory}:/usr/bin:/bin` } : {}) } }, credentialRefId);
       return { ...result, connectionFailure: rejected, remoteCompleted };
-    } finally { await fs.rm(directory, { recursive: true, force: true }); }
+    } catch (error) {
+      if (!prepared) throw new HardwareProviderError("SSH_CLIENT_PREPARATION_FAILED", "Local SSH client preparation failed before remote command dispatch.");
+      throw error;
+    } finally {
+      if (directory) {
+        try { await fs.rm(directory, { recursive: true, force: true }); }
+        catch (error) {
+          if (!prepared) throw new HardwareProviderError("SSH_CLIENT_PREPARATION_FAILED", "Local SSH client preparation failed before remote command dispatch. Temporary client files require local cleanup.");
+          throw error;
+        }
+      }
+    }
   }
 
   close(signal: AbortSignal): Promise<ProviderOutcome<null>> {
