@@ -6,7 +6,7 @@ Open **Hardware** from Add tab. All panels on one CloudX host share the inventor
 
 ## Configure host access
 
-Hardware storage, script process ownership, and UART control-line handling require Linux. Install OpenSSH client tools for SSH/SFTP and `ssh-copy-id`, and Python 3 for Linux UART modem-control operations. Admit explicit local key files, optional known-hosts overrides, UART paths, transfer paths, and custom script directories through `CLOUDX_ALLOWED_ROOTS`. Inventory inspection does not open the endpoint.
+Hardware storage, script process ownership, and UART control-line handling require Linux. Install Bash and OpenSSH client tools for SSH/SFTP and `ssh-copy-id`, and Python 3 for Linux UART modem-control operations. Admit explicit local key files, optional known-hosts overrides, UART paths, transfer paths, and custom script directories through `CLOUDX_ALLOWED_ROOTS`. Inventory inspection does not open the endpoint.
 
 SSH defaults to **Current SSH agent**. It uses the agent available to the CloudX server through `SSH_AUTH_SOCK`; no socket path is required. This is the server's agent, including when the browser runs on another machine. Choose **Identity file** to use an admitted private key, or **Password** to enter a login password. Passwords are saved in CloudX's private secret store. Inventory contains an opaque reference, and editing an existing item never displays its saved password.
 
@@ -45,6 +45,8 @@ New Codex, Claude, and Forge launches receive four system skills: `hardware-disc
 ## Run and transfer
 
 Use SSH Run script, Upload, or Download with explicit deadlines and output bounds. A no-overwrite upload requires the server’s SFTP hard-link extension and filesystem support. Failed transfers can leave a named remote staging directory for inspection. UART reads and writes bounded exact bytes with explicit line endings and RTS/DTR controls. Opening a UART can affect the attached board; use its documented procedure before sensitive work.
+
+An SSH connection, authentication, or host-key rejection proven to occur before remote dispatch fails without a recovery hold. Inspect the saved receipt diagnostics for the client error. The reservation remains usable for another explicit operation after you fix the endpoint or trust configuration. Hardware does not retry automatically. If remote completion cannot be confirmed, the resource stays held for recovery; closing access does not settle those remote effects.
 
 ## Release and recover
 

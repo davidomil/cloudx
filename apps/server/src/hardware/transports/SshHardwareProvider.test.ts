@@ -108,7 +108,7 @@ describe("SSH password process ownership", () => {
     directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ssh-password-"));
     capture = path.join(directory, "capture.json");
     const executable = path.join(directory, "ssh");
-    await fs.writeFile(executable, `#!${process.execPath}\nconst fs=require('node:fs');const {execFileSync}=require('node:child_process');let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{const answer=execFileSync(process.env.SSH_ASKPASS,["tester@example.test's password: "],{env:process.env});fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({argv:process.argv.slice(2),environment:process.env,input}));process.stdout.write(answer);});\n`, { mode: 0o700 });
+    await fs.writeFile(executable, `#!${process.execPath}\nconst fs=require('node:fs');const {execFileSync}=require('node:child_process');let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',chunk=>input+=chunk);process.stdin.on('end',()=>{fs.writeFileSync(process.argv[process.argv.indexOf('-E')+1],'Authenticated to example.test using password.\\n'+'debug1: Exit status 0\\n');const answer=execFileSync(process.env.SSH_ASKPASS,["tester@example.test's password: "],{env:process.env});fs.writeFileSync(${JSON.stringify(capture)},JSON.stringify({argv:process.argv.slice(2),environment:process.env,input}));process.stdout.write(answer);});\n`, { mode: 0o700 });
     provider = new SshHardwareProvider({ pathPolicy: new PathPolicy([directory]), sshExecutable: executable, environment: {} });
   });
   afterAll(async () => { await fs.rm(directory, { recursive: true, force: true }); });
@@ -157,7 +157,7 @@ let input='';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data',chunk=>input+=chunk);
 process.stdin.on('end',()=>{
-  if(input==='exit 0\n') return;
+  if(input==='exit 0\n') { require('fs').writeFileSync(process.argv[process.argv.indexOf('-E')+1],'Authenticated to example.test using password.\n'+'debug1: Exit status 0\n'); return; }
   if(input==='control-output') { process.stdout.write(Buffer.alloc(1024*1024)); process.exitCode=255; return; }
   if(input==='unicode-output') { process.stdout.write('x'.repeat(64*1024-1)); process.stderr.write('€'); process.exitCode=255; return; }
   const password=execFileSync(process.env.SSH_ASKPASS,["tester@example.test's password: "],{env:process.env}).toString().trim();
@@ -358,6 +358,22 @@ describe.skipIf(!existsSync("/usr/sbin/sshd") || !existsSync("/usr/lib/openssh/s
     await expect(connection.invoke("ssh.exec", { script: "(sleep 0.1; printf late >&2) & exit 255", timeoutMs: 3000, maxOutputBytes: 100 }, signal())).resolves.toMatchObject({ state: "completed", value: { exitCode: 255, stdout: "", stderr: "late", truncated: false } });
   });
 
+  it("settles a local publication failure after the SFTP download completes", async () => {
+    const source = path.join(directory, "publication-source");
+    const destination = path.join(directory, "publication-destination");
+    await fs.writeFile(source, "payload");
+    const rename = fs.rename.bind(fs);
+    const publish = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (to === destination) throw Object.assign(new Error("Publication denied"), { code: "EACCES" });
+      return rename(from, to);
+    });
+    try {
+      expect(await connection.invoke("ssh.download", { localPath: destination, remotePath: source, timeoutMs: 3000, overwrite: true }, signal())).toMatchObject({ state: "failed", effects: "settled", error: { code: "LOCAL_PATH_UNAVAILABLE" } });
+      expect(existsSync(destination)).toBe(false);
+      expect(await fs.readFile(source, "utf8")).toBe("payload");
+    } finally { publish.mockRestore(); }
+  });
+
   it("returns a nested SSH changed-host-key rejection as a confirmed command failure without modifying trust", async () => {
     const changedKey = path.join(directory, "changed-host-key");
     await exec("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", changedKey]);
@@ -423,9 +439,103 @@ describe.skipIf(!existsSync("/usr/sbin/sshd") || !existsSync("/usr/lib/openssh/s
     const emptyHosts = path.join(directory, "empty-known-hosts");
     await fs.writeFile(emptyHosts, "");
     const context = transportTestContext();
-    await expect(provider.connect({ ...config, knownHostsFile: emptyHosts }, context)).resolves.toMatchObject({ state: "unknown", error: { code: "SSH_CONNECT_UNKNOWN" } });
+    await expect(provider.connect({ ...config, knownHostsFile: emptyHosts }, context)).resolves.toMatchObject({ state: "failed", effects: "none", error: { code: "SSH_HOST_KEY_REJECTED" }, diagnostics: { clientLog: expect.stringContaining("Host key verification failed.") } });
     await context.cleanups[0]!(signal());
     expect(await fs.readFile(emptyHosts, "utf8")).toBe("");
+  });
+
+  it.each(["refusal", "timeout"])("keeps managed access usable after a post-boot connection %s", async mode => {
+    const sockets = new Set<net.Socket>();
+    let available = true;
+    const proxy = net.createServer(client => {
+      sockets.add(client); client.on("error", () => {}); client.on("close", () => sockets.delete(client));
+      if (!available) return;
+      const upstream = net.connect(config.port, "127.0.0.1");
+      sockets.add(upstream); upstream.on("error", () => {}); upstream.on("close", () => sockets.delete(upstream));
+      client.pipe(upstream); upstream.pipe(client);
+      client.on("close", () => upstream.destroy()); upstream.on("close", () => client.destroy());
+    });
+    const owner = { kind: "user" as const, userId: "local" };
+    const service = new HardwareService({ dataDir: path.join(directory, `post-boot-${mode}`), pathPolicy: new PathPolicy([directory]), registry: { values: () => [provider], get: () => provider } });
+    let sequence = 0;
+    const mutate = (action: string, input: JsonObject) => service.execute(action, { requestId: `post-boot-${mode}-${++sequence}`, ...input }, owner) as Promise<HardwareMutationResult>;
+    const receipt = (result: HardwareMutationResult) => vi.waitFor(async () => {
+      const saved = await service.execute("hardware.receipt.get", { requestId: result.receipt.requestId }, owner) as { receipt: OperationReceipt };
+      expect(saved.receipt.state).not.toBe("running"); return saved.receipt;
+    }, { timeout: 5000 });
+    try {
+      await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+      const port = (proxy.address() as net.AddressInfo).port;
+      const knownHostsFile = path.join(directory, `post-boot-${mode}-known-hosts`);
+      await fs.writeFile(knownHostsFile, (await fs.readFile(config.knownHostsFile!, "utf8")).replace(`]:${config.port}`, `]:${port}`));
+      const endpoint = { ...config, port, knownHostsFile, connectTimeoutMs: 1000 };
+      await service.init();
+      await mutate("hardware.groups.create", { name: "Post-boot loopback" });
+      const group = (await service.snapshot(owner)).groups[0];
+      await mutate("hardware.items.create", { item: { name: "Post-boot SSH", description: "", enabled: true, physicalResourceId: group.id, typeId: "hardware.ssh", configVersion: 1, config: JSON.parse(JSON.stringify(endpoint)), tagIds: [], notes: "", statuses: [], hooks: {} } });
+      const item = (await service.snapshot(owner)).items[0].item;
+      const claim = (await mutate("hardware.reserve", { hardwareId: item.id, expectedItemRevision: item.revision, purpose: "Verify pre-dispatch failure" })).reservation!;
+      const ref = { reservationId: claim.reservationId, generation: claim.generation };
+      expect((await receipt(await mutate("hardware.access.open", ref))).state).toBe("succeeded");
+      available = false;
+      for (const socket of sockets) socket.destroy();
+      if (mode === "refusal") await new Promise<void>(resolve => proxy.close(() => resolve()));
+      const invoke = () => mutate("hardware.access.invoke", { ...ref, operationId: "ssh.exec", input: { script: "printf booted", timeoutMs: 3000, maxOutputBytes: 1 } });
+      expect(await receipt(await invoke())).toMatchObject({ state: "failed", error: { code: "SSH_CONNECTION_FAILED", message: expect.stringContaining("before remote command dispatch") }, result: { diagnostics: { stdout: "", interrupted: false, clientLog: expect.stringContaining(mode === "timeout" ? "Connection timed out during banner exchange" : "Connection refused") } } });
+      expect(service.ownerClaims()[0]).toMatchObject({ state: "active", accessState: "open", generation: ref.generation });
+      available = true;
+      for (const socket of sockets) socket.destroy();
+      if (mode === "refusal") await new Promise<void>(resolve => proxy.listen(port, "127.0.0.1", resolve));
+      expect(await receipt(await invoke())).toMatchObject({ state: "succeeded", result: { exitCode: 0, stdout: "b", truncated: true } });
+      expect((await receipt(await mutate("hardware.access.close", ref))).state).toBe("succeeded");
+      expect(service.ownerClaims()[0]).toMatchObject({ state: "active", accessState: "closed" });
+    } finally {
+      await service.dispose();
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>(resolve => proxy.close(() => resolve()));
+    }
+  }, 15_000);
+
+  it.each(["authentication", "host-key"])("fails before dispatch for %s rejection in connect, exec, SFTP and registration", async mode => {
+    const hosts = path.join(directory, `rejected-${mode}-known-hosts`);
+    const identity = path.join(directory, `rejected-${mode}-identity`);
+    await exec("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", identity]);
+    await fs.copyFile(config.knownHostsFile!, hosts);
+    const endpoint = { ...config, knownHostsFile: hosts, auth: { kind: "identity_file" as const, path: identity } };
+    // First open with the accepted key, then reject new handshakes.
+    const goodIdentity = await fs.readFile((config.auth as { path: string }).path);
+    const goodPublic = await fs.readFile(`${(config.auth as { path: string }).path}.pub`);
+    const badIdentity = await fs.readFile(identity);
+    const badPublic = await fs.readFile(`${identity}.pub`);
+    await fs.writeFile(identity, goodIdentity, { mode: 0o600 });
+    await fs.writeFile(`${identity}.pub`, goodPublic);
+    const context = transportTestContext();
+    const opened = await provider.connect(endpoint, context);
+    if (opened.state !== "completed") throw new Error(JSON.stringify(opened));
+    try {
+      if (mode === "authentication") {
+        await fs.writeFile(identity, badIdentity, { mode: 0o600 });
+        await fs.writeFile(`${identity}.pub`, badPublic);
+      } else await fs.writeFile(hosts, `[127.0.0.1]:${config.port} ${badPublic.toString().trim()}\n`);
+      const trust = await fs.readFile(hosts, "utf8");
+      const expected = { state: "failed", effects: "none", error: { code: mode === "authentication" ? "SSH_AUTHENTICATION_FAILED" : "SSH_HOST_KEY_REJECTED" }, diagnostics: { clientLog: expect.any(String), truncated: false } };
+      expect(await provider.connect(endpoint, context)).toMatchObject(expected);
+      expect(await opened.value.invoke("ssh.exec", { script: "printf MUST_NOT_RUN", timeoutMs: 3000, maxOutputBytes: 1 }, signal())).toMatchObject(expected);
+      const source = path.join(directory, `rejected-${mode}-source`);
+      const destination = path.join(directory, `rejected-${mode}-destination`);
+      await fs.writeFile(source, "payload");
+      for (const operation of ["ssh.upload", "ssh.download"]) {
+        expect(await opened.value.invoke(operation, { localPath: operation === "ssh.upload" ? source : destination, remotePath: destination, timeoutMs: 3000, overwrite: false }, signal())).toMatchObject(expected);
+      }
+      expect(existsSync(destination)).toBe(false);
+      expect(await provider.registerKey(endpoint, { timeoutMs: 5000 }, context)).toMatchObject(expected);
+      expect(await fs.readFile(hosts, "utf8")).toBe(trust);
+    } finally { for (const cleanup of context.cleanups) await cleanup(signal()); }
+  }, 15_000);
+
+  it("does not use remote stderr that mimics a connection rejection as client evidence", async () => {
+    const result = await connection.invoke("ssh.exec", { script: "printf 'cloudx-ssh-client-start\\nssh: connect to host 127.0.0.1 port 22: Connection refused\\n' >&2; sleep 20", timeoutMs: 500, maxOutputBytes: 1000 }, signal());
+    expect(result).toMatchObject({ state: "unknown", diagnostics: { stderr: expect.stringContaining("Connection refused"), clientLog: expect.stringContaining("Authenticated to "), interrupted: true } });
   });
 
   it("registers an already authorized configured key before connect without duplicating it", async () => {

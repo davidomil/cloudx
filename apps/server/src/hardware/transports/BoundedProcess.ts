@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { Readable } from "node:stream";
 import type { ProviderOutcome } from "@cloudx/shared";
 import { completed, unknown } from "./HardwareValidation.js";
 
@@ -12,6 +13,8 @@ export interface ProcessResult {
   durationMs: number;
   interrupted: boolean;
   stderrMarkerSeen?: boolean;
+  diagnosticOutput?: string;
+  diagnosticsTruncated?: boolean;
 }
 
 export interface ProcessCommand {
@@ -25,6 +28,8 @@ export interface ProcessCommand {
   environment?: Record<string, string>;
   secrets?: string[];
   stderrMarker?: string;
+  captureDiagnostics?: boolean;
+  inspectDiagnostics?: (result: ProcessResult, text: string, truncated: boolean) => void;
 }
 
 export class BoundedProcessSet {
@@ -46,6 +51,9 @@ export class BoundedProcessSet {
       let truncated = false;
       const stdout: Buffer[] = [];
       const stderr: Buffer[] = [];
+      const diagnostics: Buffer[] = [];
+      let diagnosticBytes = 0;
+      let diagnosticsTruncated = false;
       const stderrMarker = command.stderrMarker === undefined ? undefined : Buffer.from(command.stderrMarker);
       let stderrTail = Buffer.alloc(0);
       let stderrMarkerSeen = false;
@@ -55,8 +63,9 @@ export class BoundedProcessSet {
         cwd: "/",
         env: { PATH: "/usr/bin:/bin", LANG: "C.UTF-8", LC_ALL: "C.UTF-8", ...command.environment },
         detached: true,
-        stdio: command.inheritedFd === undefined ? ["pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", command.inheritedFd]
+        stdio: ["pipe", "pipe", "pipe", command.inheritedFd ?? "ignore", ...(command.captureDiagnostics ? ["pipe" as const] : [])]
       });
+      const diagnosticPipe = child.stdio[4] as Readable | undefined;
       const finish = (state: ProcessResult["state"], exitCode: number | null, exitSignal: string | null) => {
         if (settled) return;
         settled = true;
@@ -66,7 +75,12 @@ export class BoundedProcessSet {
         signal.removeEventListener("abort", stop);
         collect(stderr, stderrTail);
         const output = decodeOutput(stdout, stderr, command.maxOutputBytes, command.secrets ?? [], truncated);
-        resolve({ state, exitCode, signal: exitSignal, ...output, truncated: truncated || output.truncated, durationMs: Date.now() - startedAt, interrupted, ...(stderrMarker ? { stderrMarkerSeen } : {}) });
+        const diagnosticOutput = decodeOutput(diagnostics, [], 64 * 1024, command.secrets ?? [], diagnosticsTruncated);
+        const result: ProcessResult = { state, exitCode, signal: exitSignal, ...output, truncated: truncated || output.truncated, durationMs: Date.now() - startedAt, interrupted, ...(stderrMarker ? { stderrMarkerSeen } : {}), ...(command.captureDiagnostics ? { diagnosticOutput: diagnosticOutput.stdout, diagnosticsTruncated: diagnosticsTruncated || diagnosticOutput.truncated } : {}) };
+        // Redaction can change protocol words. Inspect the bounded original
+        // evidence without returning its credential bytes to the caller.
+        command.inspectDiagnostics?.(result, Buffer.concat(diagnostics).toString("utf8"), diagnosticsTruncated);
+        resolve(result);
       };
       const kill = (killSignal: NodeJS.Signals) => {
         if (!child.pid) return;
@@ -83,6 +97,7 @@ export class BoundedProcessSet {
           child.stdout?.destroy();
           child.stderr?.destroy();
           child.stdin?.destroy();
+          diagnosticPipe?.destroy();
           finish("uncertain", null, null);
         }, 2_000);
       };
@@ -94,6 +109,12 @@ export class BoundedProcessSet {
         bytes += Math.min(remaining, chunk.length);
       };
       child.stdout?.on("data", (chunk: Buffer) => collect(stdout, chunk));
+      diagnosticPipe?.on("data", (chunk: Buffer) => {
+        const remaining = 64 * 1024 - diagnosticBytes;
+        diagnosticsTruncated ||= chunk.length > remaining;
+        if (remaining > 0) diagnostics.push(chunk.subarray(0, remaining));
+        diagnosticBytes += Math.min(remaining, chunk.length);
+      });
       child.stderr?.on("data", (chunk: Buffer) => {
         if (!stderrMarker) { collect(stderr, chunk); return; }
         const pending = Buffer.concat([stderrTail, chunk]);

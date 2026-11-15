@@ -7,6 +7,19 @@ import { BoundedProcessSet } from "./BoundedProcess.js";
 const signal = () => new AbortController().signal;
 
 describe("bounded hardware transport processes", () => {
+  it("drains a separate bounded diagnostic channel, redacts it and preserves the upload descriptor", async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-diagnostic-pipe-"));
+    const source = path.join(directory, "source");
+    await fs.writeFile(source, "payload");
+    const handle = await fs.open(source, "r");
+    const processes = new BoundedProcessSet();
+    try {
+      const run = (script: string) => processes.run({ executable: process.execPath, args: ["-e", script], inheritedFd: handle.fd, captureDiagnostics: true, secrets: ["private-password"], timeoutMs: 1000, maxOutputBytes: 2, signal: signal() });
+      expect(await run("const fs=require('fs');process.stdout.write(fs.readFileSync(3));fs.writeSync(4,'private-password');process.stderr.write('remote')")).toMatchObject({ stdout: "pa", stderr: "", truncated: true, diagnosticOutput: "[redacted]", diagnosticsTruncated: false });
+      expect(await run("require('fs').writeSync(4,'x'.repeat(1000000))")).toMatchObject({ state: "exited", exitCode: 0, diagnosticOutput: "x".repeat(64*1024), diagnosticsTruncated: true });
+    } finally { await processes.close(signal()); await handle.close(); await fs.rm(directory, { recursive: true, force: true }); }
+  });
+
   it("recognizes a split stderr confirmation after output truncation without exposing its bytes", async () => {
     const processes = new BoundedProcessSet();
     try {
