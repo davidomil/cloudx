@@ -22,11 +22,11 @@ it("shows retained window usage and its details when no agent tabs remain", asyn
       onOpenChange: vi.fn(), onSelect: complete, onCreate: complete, onUpdate: complete, onDelete: complete,
       onContextSearch: async () => ({ matches: [] }), callHook: callHook as never
     })));
-    expect(callHook).toHaveBeenCalledWith("agent-usage.read", { windowIds: ["window"] });
+    expect(callHook).toHaveBeenCalledWith("agent-usage.read", { windowIds: ["window"] }, undefined, expect.any(AbortSignal));
     expect(container.textContent).toContain("0 tabs · $3.00 API and API-equivalent · 100 tokens");
     await act(async () => container.querySelector<HTMLButtonElement>(".window-row-main")!.dispatchEvent(new FocusEvent("focusin", { bubbles: true })));
     expect(container.querySelector('[role="tooltip"]')?.textContent).toContain("Model requests2");
-    expect(callHook).toHaveBeenLastCalledWith("agent-usage.read", { windowIds: ["window"] });
+    expect(callHook).toHaveBeenLastCalledWith("agent-usage.read", { windowIds: ["window"] }, undefined, expect.any(AbortSignal));
   } finally {
     await act(async () => root.unmount());
     container.remove();

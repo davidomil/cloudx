@@ -30,11 +30,13 @@ export class AgentUsagePlugin implements WorkspacePlugin {
         description: "Tokens and cost for agent tabs, retained window history and Forge workers, with their combined total.",
         exposures: ["app", "plugin", "ui", "http"],
         inputSchema: { type: "object", properties: { tabIds: OWNER_IDS_SCHEMA, windowIds: OWNER_IDS_SCHEMA, forgeWorkerIds: OWNER_IDS_SCHEMA }, additionalProperties: false },
-        execute: async (input) => {
+        execute: async (input, context) => {
+          context.signal?.throwIfAborted();
           const live = owners();
           await ledger.synchronizeWindows(live.tabWindows);
+          context.signal?.throwIfAborted();
           await ledger.prune(new Set(live.tabIds), undefined, new Set(live.windowIds));
-          return { usage: await usage.read({ tabIds: input.tabIds as string[] | undefined, windowIds: input.windowIds as string[] | undefined, forgeWorkerIds: input.forgeWorkerIds as string[] | undefined }) };
+          return { usage: await usage.read({ tabIds: input.tabIds as string[] | undefined, windowIds: input.windowIds as string[] | undefined, forgeWorkerIds: input.forgeWorkerIds as string[] | undefined }, context.signal) };
         }
       },
       {

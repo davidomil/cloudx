@@ -55,6 +55,7 @@ import { ClaudeSettingsPlugin } from "./plugins/ClaudeSettingsPlugin.js";
 import { AgentUsagePlugin } from "./plugins/AgentUsagePlugin.js";
 import { AgentUsageLedger } from "./agents/usage/AgentUsageLedger.js";
 import { AgentUsageRecorder } from "./agents/usage/AgentUsageRecorder.js";
+import { UsageScanScheduler } from "./agents/usage/UsageScanScheduler.js";
 import { AgentUsageService } from "./agents/usage/AgentUsageService.js";
 import { ClaudeUsageReader } from "./agents/usage/ClaudeUsageReader.js";
 import { CodexUsageReader } from "./agents/usage/CodexUsageReader.js";
@@ -1542,9 +1543,12 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   const claudeSettings = new ClaudeSettingsService(config.dataDir, () => agentAccounts.providerHome("claude"));
   const usageLedger = new AgentUsageLedger(config.dataDir);
   const usagePricing = new AgentPricing(config.dataDir);
+  const usageScans = new UsageScanScheduler();
+  const usageIndex = path.join(config.dataDir, "agent-usage-index", "v1");
+  const usageIndexError = (file: string, error: unknown) => logger?.warn({ err: error, file }, "Agent usage indexing stopped; totals are incomplete.");
   const agentUsage = new AgentUsageService(usageLedger, usagePricing, {
-    codex: new CodexUsageReader(() => agentAccounts.providerHome("codex")),
-    claude: new ClaudeUsageReader(() => agentAccounts.providerHome("claude"))
+    codex: new CodexUsageReader(() => agentAccounts.providerHome("codex"), { directory: path.join(usageIndex, "codex"), scheduler: usageScans, onError: usageIndexError }),
+    claude: new ClaudeUsageReader(() => agentAccounts.providerHome("claude"), { directory: path.join(usageIndex, "claude"), scheduler: usageScans, onError: usageIndexError })
   });
   // Native identity can arrive before a prepared tab is placed. The launch
   // request owns that initial window; published tabs follow the live layout.
@@ -1569,6 +1573,8 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   });
   const disposeAgentUsage = async () => {
     releaseUsageWindows();
+    await agentUsage.dispose();
+    await usageScans.dispose();
     await usageRecorder.flush();
     await usageLedger.flush();
   };

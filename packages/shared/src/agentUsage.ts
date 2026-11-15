@@ -31,6 +31,8 @@ export interface AgentModelUsage {
 }
 
 export interface AgentUsageSummary {
+  // Present while totals are incomplete. Errors require attention before indexing can finish.
+  indexing?: "backfilling" | "error";
   totals: AgentUsageTotals;
   byModel: AgentModelUsage[];
   // Cost of the priced models only.
@@ -104,12 +106,18 @@ export function combineAgentUsage(summaries: AgentUsageSummary[]): AgentUsageSum
     }
   }
   return {
+    ...usageIndexing(summaries),
     totals,
     byModel: [...models.values()].sort((a, b) => (b.costUsd ?? 0) - (a.costUsd ?? 0)),
     costUsd,
     ...(bases.size ? { costBasis: bases.size > 1 || bases.has("mixed") ? "mixed" as const : [...bases][0]! } : {}),
     unpricedModels: [...unpriced].sort()
   };
+}
+
+export function usageIndexing(values: { indexing?: AgentUsageSummary["indexing"] }[]): Pick<AgentUsageSummary, "indexing"> {
+  if (values.some(value => value.indexing === "error")) return { indexing: "error" };
+  return values.some(value => value.indexing === "backfilling") ? { indexing: "backfilling" } : {};
 }
 
 function addTotals(target: AgentUsageTotals, source: AgentUsageTotals): void {

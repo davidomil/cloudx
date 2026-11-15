@@ -539,7 +539,23 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(2, "/api/hooks/workspace.tabs.activate", {
       method: "POST",
       body: JSON.stringify({ input: { tabId: "tab-1" } }),
+      signal: undefined,
       headers: { "content-type": "application/json" }
+    });
+  });
+
+  it("cancels an obsolete hook fetch through its caller's signal", async () => {
+    const fetchMock = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init.signal!.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    const response = callHook("agent-usage.read", { tabIds: ["tab"] }, undefined, controller.signal);
+    const rejected = expect(response).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await rejected;
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/api/hooks/agent-usage.read", {
+      method: "POST", body: JSON.stringify({ input: { tabIds: ["tab"] } }), signal: controller.signal, headers: { "content-type": "application/json" }
     });
   });
 

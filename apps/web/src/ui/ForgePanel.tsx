@@ -404,13 +404,13 @@ function reviewStartedAt({ worker, archivedDraft }: ReviewRound): string {
 
 function WorkerUsageLine({ workerId }: { workerId: string }) {
   const summary = useContext(WorkerUsage)[workerId];
-  return summary?.totals.requests ? <p className="forge-muted forge-usage">Usage: {usageLine(summary)}</p> : null;
+  return summary && (summary.totals.requests || summary.indexing) ? <p className="forge-muted forge-usage">Usage: {usageLine(summary)}</p> : null;
 }
 
 function WorkerUsageChip({ workerId }: { workerId: string }) {
   const summary = useContext(WorkerUsage)[workerId];
-  if (!summary?.totals.requests) return null;
-  return <span className="forge-muted forge-usage" title={usageLine(summary)}>{summary.costBasis ? formatUsd(summary.costUsd) : "No price"}</span>;
+  if (!summary || (!summary.totals.requests && !summary.indexing)) return null;
+  return <span className="forge-muted forge-usage" title={usageLine(summary)}>{summary.indexing ? usageLine(summary) : summary.costBasis ? formatUsd(summary.costUsd) : "No price"}</span>;
 }
 
 function ItemWorkerStats({ workers }: { workers: ForgeWorker[] }) {

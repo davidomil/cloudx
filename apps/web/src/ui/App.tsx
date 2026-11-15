@@ -1159,8 +1159,8 @@ export function App() {
     }
   }
 
-  const callUiHook = useCallback(async <T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}, targetTabId?: string): Promise<T> => {
-    const result = await callHook<T>(hookId, input, targetTabId);
+  const callUiHook = useCallback(async <T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}, targetTabId?: string, signal?: AbortSignal): Promise<T> => {
+    const result = await callHook<T>(hookId, input, targetTabId, signal);
     applyHookResult(result);
     if (hookId !== "codex-update.read" && hookId !== "codex-update.releases") setError(undefined);
     return result;
@@ -2065,7 +2065,7 @@ function tabCountForWindow(window: WorkspaceWindow, tabsById: Map<string, Worksp
 
 export function windowUsageText(windowId: string, usage: AgentUsageReadResult | undefined): string {
   const total = usage?.windows[windowId];
-  return total?.totals.requests ? ` · ${usageLine(total)}` : "";
+  return total && (total.totals.requests || total.indexing) ? ` · ${usageLine(total)}` : "";
 }
 
 function WindowDeleteWarning({ window, tabCount, onCancel, onConfirm }: { window: WorkspaceWindow; tabCount: number; onCancel: () => void; onConfirm: () => void }) {

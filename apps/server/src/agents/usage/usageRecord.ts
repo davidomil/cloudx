@@ -1,3 +1,10 @@
+import { isRecord, type AgentUsageSummary } from "@cloudx/shared";
+
+export interface UsageSnapshot {
+  records: UsageRecord[];
+  indexing?: AgentUsageSummary["indexing"];
+}
+
 // One model response as both providers record it, normalized for pricing.
 export interface UsageRecord {
   // Provider response id; records with the same id are counted once.
@@ -20,4 +27,12 @@ export interface UsageRecord {
 
 export function count(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+export function isUsageRecord(value: unknown): value is UsageRecord {
+  return isRecord(value) && typeof value.id === "string" && typeof value.model === "string" &&
+    typeof value.at === "number" && Number.isFinite(value.at) &&
+    ["input", "cachedInput", "cacheWrite", "cacheWrite1h", "output", "reasoning", "webSearches"].every(key =>
+      typeof value[key] === "number" && Number.isFinite(value[key]) && value[key] >= 0) &&
+    typeof value.fast === "boolean" && typeof value.usInference === "boolean";
 }
