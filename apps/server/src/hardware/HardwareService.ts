@@ -581,7 +581,7 @@ export class HardwareService {
         for (const close of run.cleanup) if ((await bounded(new AbortController().signal, 10_000, close)).state !== "completed") cleanupConfirmed = false;
       }
       if (!cleanupConfirmed) {
-        const diagnostics = outcome.state === "completed" ? outcome.value.diagnostics : outcome.state === "unknown" ? outcome.diagnostics : undefined;
+        const diagnostics = outcome.state === "completed" ? outcome.value.diagnostics : outcome.diagnostics;
         outcome = { state: "unknown", error: { code: "CLEANUP_UNCONFIRMED", message: "The SSH connection check could not confirm that its managed processes ended." }, ...(diagnostics ? { diagnostics } : {}) };
       }
       await this.finishConnectionCheck(work, run, outcome);
@@ -592,7 +592,7 @@ export class HardwareService {
     run.outcome = outcome;
     const at = Date.now(), interval = (work.item.config as unknown as SshConfig).onlineCheckIntervalMs;
     const maxAge = interval === null ? 60_000 : Math.max(60_000, 2 * (interval ?? DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS));
-    const result = outcome.state === "completed" ? outcome.value : { online: false, error: outcome.error, ...(outcome.state === "unknown" && outcome.diagnostics ? { diagnostics: outcome.diagnostics } : {}) };
+    const result = outcome.state === "completed" ? outcome.value : { online: false, error: outcome.error, ...(outcome.diagnostics ? { diagnostics: outcome.diagnostics } : {}) };
     const observation = parseHardwareConnectionObservation({ ...result, ...(result.diagnostics ? { diagnostics: connectionDiagnostics(result.diagnostics) } : {}), itemRevision: work.item.revision, checkedAt: new Date(at).toISOString(), expiresAt: new Date(at + maxAge).toISOString() });
     let publish = false;
     const update = (next: HardwareStoredState, receipt?: OperationReceipt) => {

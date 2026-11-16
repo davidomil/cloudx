@@ -104,6 +104,15 @@ describe("SSH connection checks", () => {
     expect(current.connectionCheck?.diagnostics).toBeUndefined(); expect(current.availability).toBe("available"); await idle(f.service);
   });
 
+  it("retains a known provider failure's diagnostics while leaving the machine available", async () => {
+    const f = await fixture(), item = await addItem(f.service);
+    const diagnostics = { state: "exited", exitCode: 255, stderr: "Connection refused" };
+    f.checkConnection.mockImplementationOnce(async (_candidate, context) => { context.registerCleanup(f.close); return { state: "failed", effects: "none", error: { code: "SSH_CONNECTION_FAILED", message: "SSH failed before remote dispatch." }, diagnostics }; });
+    expect(await settle(f.service, (await check(f.service, item)).receipt)).toMatchObject({ state: "failed", error: { code: "SSH_CONNECTION_FAILED" }, result: { connectionCheck: { online: false, diagnostics } } });
+    expect((await f.service.snapshot(operator)).items[0]).toMatchObject({ availability: "available", connectionCheck: { online: false, error: { code: "SSH_CONNECTION_FAILED" } } });
+    await idle(f.service);
+  });
+
   it("tests changed draft settings without saving them or publishing them as the saved target's status", async () => {
     const f = await fixture(), item = await addItem(f.service);
     await settle(f.service, (await check(f.service, item)).receipt);
@@ -313,10 +322,10 @@ describe("SSH connection checks", () => {
     expect((await f.service.snapshot(operator)).items[0].connectionCheck?.diagnostics).toBeUndefined();
   });
 
-  it.each(["completed", "unknown"] as const)("retains %s provider diagnostics when managed cleanup is unconfirmed", async state => {
+  it.each(["completed", "failed", "unknown"] as const)("retains %s provider diagnostics when managed cleanup is unconfirmed", async state => {
     const f = await fixture(), item = await addItem(f.service);
     const diagnostics = { state: "exited", exitCode: 255, interrupted: true, stderr: "[redacted]" };
-    f.checkConnection.mockImplementationOnce(async (_candidate, context) => { context.registerCleanup(f.close); return state === "completed" ? completed({ online: false, diagnostics }) : { state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "Login outcome unknown." }, diagnostics }; });
+    f.checkConnection.mockImplementationOnce(async (_candidate, context) => { context.registerCleanup(f.close); return state === "completed" ? completed({ online: false, diagnostics }) : state === "failed" ? { state: "failed", effects: "none", error: { code: "SSH_CONNECTION_FAILED", message: "SSH failed before remote dispatch." }, diagnostics } : { state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "Login outcome unknown." }, diagnostics }; });
     f.close.mockResolvedValue({ state: "unknown", error: { code: "CLEANUP_UNKNOWN", message: "Local exit is unconfirmed." } });
     expect(await settle(f.service, (await check(f.service, item)).receipt)).toMatchObject({ state: "unknown", error: { code: "CLEANUP_UNCONFIRMED" }, result: { connectionCheck: { diagnostics } } });
     expect((await f.service.snapshot(operator)).checkHolds).toMatchObject([{ state: "recovery_required" }]);
@@ -359,15 +368,17 @@ describe("SSH connection checks", () => {
     await schedule(restored); expect(f.checkConnection).toHaveBeenCalledTimes(1); expect((await restored.snapshot(operator)).items[0].connectionCheck).toBeUndefined();
   });
 
-  it("persists an unresolved background hold across restart without creating a permanent request receipt", async () => {
+  it.each(["completed", "failed"] as const)("persists an unresolved background hold from a %s check across restart without creating a permanent request receipt", async state => {
     const f = await fixture(), item = await addItem(f.service);
+    const diagnostics = { state: "exited", exitCode: state === "completed" ? 0 : 255 };
+    if (state === "failed") f.checkConnection.mockImplementationOnce(async (_candidate, context) => { context.registerCleanup(f.close); return { state: "failed", effects: "none", error: { code: "SSH_CONNECTION_FAILED", message: "SSH failed before remote dispatch." }, diagnostics }; });
     const before = (await f.service.snapshot(operator)).receipts;
     f.close.mockResolvedValue({ state: "unknown", error: { code: "CLEANUP_UNKNOWN", message: "Local exit is unconfirmed." } });
     await schedule(f.service);
-    await vi.waitFor(async () => expect((await f.service.snapshot(operator)).checkHolds).toMatchObject([{ hardwareId: item.id, state: "recovery_required", connectionCheck: { diagnostics: { state: "exited", exitCode: 0 } } }]));
+    await vi.waitFor(async () => expect((await f.service.snapshot(operator)).checkHolds).toMatchObject([{ hardwareId: item.id, state: "recovery_required", connectionCheck: { diagnostics } }]));
     expect((await f.service.snapshot(operator)).receipts).toEqual(before); await f.service.dispose();
     const restored = new HardwareService({ dataDir: f.root, registry: f.registry }); services.push(restored); await restored.init();
-    expect((await restored.snapshot(operator)).checkHolds).toMatchObject([{ hardwareId: item.id, state: "recovery_required", connectionCheck: { diagnostics: { state: "exited", exitCode: 0 } } }]);
+    expect((await restored.snapshot(operator)).checkHolds).toMatchObject([{ hardwareId: item.id, state: "recovery_required", connectionCheck: { diagnostics } }]);
     await schedule(restored); expect(f.checkConnection).toHaveBeenCalledTimes(1);
     const hold = (await restored.snapshot(operator)).checkHolds[0];
     const release = await mutate(restored, "hardware.forceRelease", { target: { kind: "system_check", runId: hold.runId, generation: hold.generation }, expectedHoldRevision: hold.revision, reason: "Operator reconciled the prior process", acceptUnresolvedExternalActivity: true });
