@@ -206,7 +206,7 @@ export interface HardwareEndpointInspection {
 // A known command exit failure is completed with its observed domain result.
 export type ProviderOutcome<T> =
   | { state: "completed"; value: T }
-  | { state: "failed"; effects: "none" | "settled"; error: { code: string; message: string } }
+  | { state: "failed"; effects: "none" | "settled"; error: { code: string; message: string }; diagnostics?: JsonObject }
   | { state: "unknown"; error: { code: string; message: string }; diagnostics?: JsonObject };
 
 

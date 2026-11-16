@@ -102,6 +102,22 @@ describe("provider operation diagnostics", () => {
     expect(restored.ownerClaims()[0].state).toBe("recovery_required");
   });
 
+  it("preserves failed connection diagnostics without a recovery hold and keeps them after restart", async () => {
+    const { service, provider, registry, root } = await fixture();
+    const diagnostics = { state: "exited", exitCode: 255, stderr: "Connection refused", interrupted: false };
+    useInvocation(provider, async () => ({ state: "failed", effects: "none", error: { code: "ENDPOINT_UNAVAILABLE", message: "Connection establishment failed before remote dispatch." }, diagnostics }));
+    const ref = await openDevice(service);
+    const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice);
+    expect(await settled(service, operation.receipt, alice)).toMatchObject({ state: "failed", error: { code: "ENDPOINT_UNAVAILABLE" }, result: { diagnostics } });
+    expect(service.ownerClaims()[0].state).toBe("active");
+    expect((await settled(service, (await mutate(service, "hardware.access.close", ref, alice)).receipt, alice)).state).toBe("succeeded");
+    await service.dispose();
+    const restored = new HardwareService({ dataDir: root, registry, pathPolicy: new PathPolicy([root]), ownerState: () => "active" });
+    services.push(restored); await restored.init();
+    expect((await restored.execute("hardware.receipt.get", { requestId: operation.receipt.requestId }, alice) as { receipt: OperationReceipt }).receipt).toMatchObject({ state: "failed", result: { diagnostics } });
+    expect(restored.ownerClaims()[0].state).toBe("active");
+  });
+
   it("waits for bounded diagnostics after the operation deadline and keeps the outcome unknown", async () => {
     const { service, provider } = await fixture();
     provider.descriptor.operations[0].inputSchema = { type: "object", properties: { timeoutMs: { type: "integer" } }, additionalProperties: false };
@@ -113,6 +129,19 @@ describe("provider operation diagnostics", () => {
     const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: { timeoutMs: 25 } }, alice);
     expect(await settled(service, operation.receipt, alice)).toMatchObject({ state: "unknown", error: { code: "OUTCOME_UNKNOWN" }, result: { diagnostics } });
     expect(service.ownerClaims()[0].state).toBe("recovery_required");
+  });
+
+  it("accepts confirmed absence of remote effects after cancellation settles within the diagnostic deadline", async () => {
+    const { service, provider } = await fixture();
+    provider.descriptor.operations[0].inputSchema = { type: "object", properties: { timeoutMs: { type: "integer" } }, additionalProperties: false };
+    const diagnostics = { state: "exited", exitCode: null, signal: "SIGTERM", stderr: "Connection establishment interrupted", interrupted: true };
+    useInvocation(provider, async (_id, _input, signal) => new Promise(resolve => {
+      signal.addEventListener("abort", () => setTimeout(() => resolve({ state: "failed", effects: "none", error: { code: "SSH_CONNECTION_FAILED", message: "The transport exited before remote dispatch." }, diagnostics }), 10), { once: true });
+    }));
+    const ref = await openDevice(service);
+    const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: { timeoutMs: 25 } }, alice);
+    expect(await settled(service, operation.receipt, alice)).toMatchObject({ state: "failed", error: { code: "SSH_CONNECTION_FAILED" }, result: { diagnostics } });
+    expect(service.ownerClaims()[0].state).toBe("active");
   });
 
   it("bounds diagnostic settlement when the provider ignores the deadline", async () => {
@@ -148,19 +177,21 @@ describe("provider operation diagnostics", () => {
     expect(service.ownerClaims()[0].state).toBe("recovery_required");
   });
 
-  it.each([
-    ["an array", []],
-    ["a non-finite value", { durationMs: Number.POSITIVE_INFINITY }],
-    ["an oversized object", { stdout: "x".repeat(1024 * 1024), stderr: "x".repeat(1024 * 1024) }],
-  ])("rejects provider diagnostics containing %s while preserving uncertainty", async (_label, diagnostics) => {
-    const { service, provider } = await fixture();
-    useInvocation(provider, async () => ({ state: "unknown", error: { code: "LOST_TRANSPORT", message: "Remote completion cannot be confirmed." }, diagnostics: diagnostics as JsonObject }));
-    const ref = await openDevice(service);
-    const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice);
-    const receipt = await settled(service, operation.receipt, alice);
-    expect(receipt).toMatchObject({ state: "unknown", error: { code: "OUTCOME_UNKNOWN" } });
-    expect(receipt.result).toBeUndefined();
-    expect(service.ownerClaims()[0].state).toBe("recovery_required");
+  describe.each(["unknown", "failed"] as const)("%s diagnostic validation", state => {
+    it.each([
+      ["an array", []],
+      ["a non-finite value", { durationMs: Number.POSITIVE_INFINITY }],
+      ["an oversized object", { stdout: "x".repeat(1024 * 1024), stderr: "x".repeat(1024 * 1024) }],
+    ])("rejects provider diagnostics containing %s while preserving uncertainty", async (_label, diagnostics) => {
+      const { service, provider } = await fixture();
+      useInvocation(provider, async () => ({ state, effects: "none", error: { code: "TRANSPORT_FAILURE", message: "The transport failed." }, diagnostics: diagnostics as JsonObject }));
+      const ref = await openDevice(service);
+      const operation = await mutate(service, "hardware.access.invoke", { ...ref, operationId: "device.measure", input: {} }, alice);
+      const receipt = await settled(service, operation.receipt, alice);
+      expect(receipt).toMatchObject({ state: "unknown", error: { code: "OUTCOME_UNKNOWN" } });
+      expect(receipt.result).toBeUndefined();
+      expect(service.ownerClaims()[0].state).toBe("recovery_required");
+    });
   });
 });
 

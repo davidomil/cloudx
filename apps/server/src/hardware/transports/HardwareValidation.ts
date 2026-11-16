@@ -59,8 +59,8 @@ export function validateHardwareValue(validate: ValidateFunction, value: unknown
 }
 
 export function completed<T>(value: T): ProviderOutcome<T> { return { state: "completed", value }; }
-export function failed<T>(code: string, message: string, effects: "none" | "settled" = "none"): ProviderOutcome<T> {
-  return { state: "failed", effects, error: { code, message } };
+export function failed<T>(code: string, message: string, effects: "none" | "settled" = "none", diagnostics?: JsonObject): ProviderOutcome<T> {
+  return { state: "failed", effects, error: { code, message }, ...(diagnostics ? { diagnostics } : {}) };
 }
 export function unknown<T>(code: string, message: string, diagnostics?: JsonObject): ProviderOutcome<T> {
   return { state: "unknown", error: { code, message }, ...(diagnostics ? { diagnostics } : {}) };

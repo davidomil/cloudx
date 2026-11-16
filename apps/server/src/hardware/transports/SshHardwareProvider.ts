@@ -9,6 +9,7 @@ import type { HardwareAccessDescription, HardwareEndpointInspection, HardwareTyp
 import type { PathPolicy } from "../../pathPolicy.js";
 import { BoundedProcessSet, type ProcessCommand, type ProcessResult } from "./BoundedProcess.js";
 import { SshAskpass } from "./SshAskpass.js";
+import { SshExecutionEvidence } from "./SshExecutionEvidence.js";
 import { byteLimitSchema, compileHardwareSchema, completed, deadlineSchema, failed, HardwareProviderError, MAX_HARDWARE_BYTES, objectSchema, unknown, validateHardwareValue } from "./HardwareValidation.js";
 
 const absolutePathSchema = { type: "string", minLength: 1, maxLength: 4096, pattern: "^/[^\\u0000\\r\\n]*$" };
@@ -98,10 +99,12 @@ export class SshHardwareProvider implements HardwareTypeProvider<SshConfig> {
     try {
       const inspection = await this.inspectEndpoint(config);
       if (!inspection.ready) return failed("ENDPOINT_UNAVAILABLE", inspection.blockers.join("; "));
-      const result = await processes.run({ executable: this.options.sshExecutable ?? "/usr/bin/ssh", args: [...sshArguments(config), "--", config.host, "/bin/bash --noprofile --norc -s --"], stdin: "exit 0\n", timeoutMs: config.connectTimeoutMs + 1000, maxOutputBytes: 64 * 1024, signal: context.signal }, passwordReference(config));
+      const result = await processes.runTransport("ssh", { executable: this.options.sshExecutable ?? "/usr/bin/ssh", args: [...sshArguments(config), "--", config.host, "/bin/bash --noprofile --norc -s --"], stdin: "exit 0\n", timeoutMs: config.connectTimeoutMs + 1000, maxOutputBytes: 64 * 1024, signal: context.signal }, passwordReference(config));
       if (result.state === "not_started") return failed("SSH_NOT_STARTED", "The OpenSSH client could not start.");
-      if (result.interrupted || result.state !== "exited" || result.exitCode === 255 || result.exitCode === null) return unknown("SSH_CONNECT_UNKNOWN", "SSH connection completion could not be confirmed.", processDiagnostics(result));
-      if (result.exitCode !== 0) return failed("SSH_CONNECT_FAILED", "The configured remote Bash entrypoint failed.", "settled");
+      const rejected = result.connectionFailure;
+      if (rejected) return failed(rejected.code, rejected.message, "none", processDiagnostics(result));
+      if (result.interrupted || result.state !== "exited" || result.exitCode === 255 || result.exitCode === null || !result.remoteCompleted) return unknown("SSH_CONNECT_UNKNOWN", "SSH connection completion could not be confirmed.", processDiagnostics(result));
+      if (result.exitCode !== 0) return failed("SSH_CONNECT_FAILED", "The configured remote Bash entrypoint failed.", "settled", processDiagnostics(result));
       return completed(connection);
     } catch (error) { return error instanceof HardwareProviderError ? failed(error.code, error.message) : unknown("SSH_CONNECT_UNKNOWN", "SSH connection completion could not be confirmed."); }
   }
@@ -127,16 +130,14 @@ export class SshHardwareProvider implements HardwareTypeProvider<SshConfig> {
         if (!stat.isFile() || stat.size > 64 * 1024) return failed("INVALID_INPUT", "SSH public identity must be a bounded regular file.");
         const publicText = await fs.readFile(publicKey, "utf8");
         const derived = await processes.run({ executable: this.options.sshKeygenExecutable ?? "/usr/bin/ssh-keygen", args: ["-y", "-P", "", "-f", privateKey], timeoutMs: input.timeoutMs as number, maxOutputBytes: 64 * 1024, signal });
-        if (derived.state === "uncertain") return unknown("SSH_KEY_INSPECTION_UNKNOWN", "The local key inspection did not confirm completion.");
-        if (derived.state === "not_started" || derived.interrupted) return failed("SSH_KEY_UNAVAILABLE", "The local key inspection did not complete before registration.");
+        if (derived.state !== "exited" || derived.interrupted) return failed("SSH_KEY_UNAVAILABLE", "The local key inspection did not complete before registration.", "none", processDiagnostics(derived));
         if (derived.exitCode !== 0 || derived.truncated || keyMaterial(derived.stdout) !== keyMaterial(publicText) || !keyMaterial(publicText)) return failed("SSH_KEY_UNAVAILABLE", "Key registration requires a matching readable public/private pair without a passphrase.");
         keyArgs.push("-i", `${config.auth.path}.pub`);
       } else {
         const agent = this.agentSocket(config);
         if (!agent || !(await fs.stat(agent)).isSocket()) return failed("SSH_AGENT_UNAVAILABLE", "The server has no current SSH agent socket.");
         const keys = await processes.run({ executable: this.options.sshAddExecutable ?? "/usr/bin/ssh-add", args: ["-L"], timeoutMs: input.timeoutMs as number, maxOutputBytes: 64 * 1024, signal });
-        if (keys.state === "uncertain") return unknown("SSH_KEY_INSPECTION_UNKNOWN", "The SSH agent inspection did not confirm completion.");
-        if (keys.state === "not_started" || keys.interrupted) return failed("SSH_AGENT_UNAVAILABLE", "The SSH agent inspection did not complete before registration.");
+        if (keys.state !== "exited" || keys.interrupted) return failed("SSH_AGENT_UNAVAILABLE", "The SSH agent inspection did not complete before registration.", "none", processDiagnostics(keys));
         if (keys.exitCode !== 0 || keys.truncated || !keys.stdout.trim() || !keys.stdout.trim().split("\n").every(key => keyMaterial(key))) return failed("SSH_AGENT_UNAVAILABLE", "The current SSH agent has no usable public identities.");
       }
       // A private empty HOME also prevents ssh-copy-id selecting a disk key if the agent disappears.
@@ -145,9 +146,12 @@ export class SshHardwareProvider implements HardwareTypeProvider<SshConfig> {
       const credentialRefId = typeof input.credentialRefId === "string" ? input.credentialRefId : passwordReference(config);
       if (signal.aborted) return failed("CANCELLED", "SSH key registration was cancelled before dispatch.");
       dispatched = true;
-      const result = await processes.run({ executable: this.options.sshCopyIdExecutable ?? "/usr/bin/ssh-copy-id", args: ["-F", "/dev/null", ...registrationOptions(config, !!credentialRefId).flatMap(option => ["-o", option]), ...keyArgs, "--", config.host], environment: { HOME: directory }, timeoutMs: input.timeoutMs as number, maxOutputBytes: 64 * 1024, signal }, credentialRefId);
+      const result = await processes.runTransport("registration", { executable: this.options.sshCopyIdExecutable ?? "/usr/bin/ssh-copy-id", args: ["-F", "/dev/null", ...registrationOptions(config, !!credentialRefId).flatMap(option => ["-o", option]), ...keyArgs, "--", config.host], environment: { HOME: directory }, timeoutMs: input.timeoutMs as number, maxOutputBytes: 64 * 1024, signal }, credentialRefId);
       if (result.state === "not_started") return failed("SSH_NOT_STARTED", "The SSH key registration client could not start.");
-      if (result.state !== "exited" || result.interrupted || result.exitCode !== 0) return unknown("SSH_KEY_REGISTRATION_UNKNOWN", "SSH key registration could not be confirmed. Inspect the target before another explicit attempt.");
+      const rejected = result.connectionFailure;
+      if (rejected) return failed(rejected.code, rejected.message, "none", processDiagnostics(result));
+      if (result.exitCode !== 0 && result.remoteCompleted) return failed("SSH_KEY_REGISTRATION_FAILED", "SSH key registration failed after all remote commands confirmed completion. Inspect the target for partial key changes.", "settled", processDiagnostics(result));
+      if (result.state !== "exited" || result.interrupted || result.exitCode !== 0 || !result.remoteCompleted) return unknown("SSH_KEY_REGISTRATION_UNKNOWN", "SSH key registration could not be confirmed. Inspect the target before another explicit attempt.", processDiagnostics(result));
       return completed({ registered: true });
     } catch (error) {
       if (error instanceof HardwareProviderError) return failed(error.code, error.message);
@@ -197,9 +201,10 @@ class SshConnection implements HardwareConnection {
     // Keep the supplied script in its own Bash. Its exit, traps and redirections
     // must not bypass the parent's confirmation or change the script's stdin.
     const wrapper = `/bin/bash --noprofile --norc -s --; status=$?; if [ "$status" -eq 255 ]; then printf "${marker}" >&2 || exit 255; exit 0; fi; exit "$status"`;
-    const result = await this.processes.run({ executable: this.options.sshExecutable ?? "/usr/bin/ssh", args: [...sshArguments(this.config), "--", this.config.host, `/bin/bash --noprofile --norc -c '${wrapper}'`], stdin: input.script as string, timeoutMs: input.timeoutMs as number, maxOutputBytes: input.maxOutputBytes as number, stderrMarker: marker, signal }, passwordReference(this.config));
+    const result = await this.processes.runTransport("ssh", { executable: this.options.sshExecutable ?? "/usr/bin/ssh", args: [...sshArguments(this.config), "--", this.config.host, `/bin/bash --noprofile --norc -c '${wrapper}'`], stdin: input.script as string, timeoutMs: input.timeoutMs as number, maxOutputBytes: input.maxOutputBytes as number, stderrMarker: marker, signal }, passwordReference(this.config));
     const failure = processFailure(result, "SSH command");
     if (failure) return failure;
+    if (!result.remoteCompleted) return unknown("OUTCOME_UNKNOWN", "SSH remote command completion could not be confirmed.", processDiagnostics(result));
     return completed({ exitCode: result.exitCode === 0 && result.stderrMarkerSeen ? 255 : result.exitCode!, stdout: result.stdout, stderr: result.stderr, truncated: result.truncated, durationMs: result.durationMs });
   }
 
@@ -207,6 +212,7 @@ class SshConnection implements HardwareConnection {
     let localStage: string | undefined;
     let sourceHandle: Awaited<ReturnType<typeof fs.open>> | undefined;
     let dispatched = false;
+    let transferCompleted = false;
     try {
       const local = this.options.pathPolicy.resolve(input.localPath as string);
       const remote = normalizeTransferPath(input.remotePath as string);
@@ -240,10 +246,11 @@ class SshConnection implements HardwareConnection {
       if (signal.aborted) return failed("CANCELLED", "SFTP transfer was cancelled before dispatch.");
       dispatched = true;
       const command: ProcessCommand = { executable: this.options.sftpExecutable ?? "/usr/bin/sftp", args: [...sshArguments(this.config, true), "-b", "-", "--", isIP(this.config.host) === 6 ? `[${this.config.host}]` : this.config.host], stdin: batch, timeoutMs: input.timeoutMs as number, maxOutputBytes: 64 * 1024, signal, inheritedFd: sourceHandle?.fd };
-      const result = await this.processes.run(command, passwordReference(this.config));
+      const result = await this.processes.runTransport("sftp", command, passwordReference(this.config));
       const failure = processFailure(result, "SFTP transfer");
       if (failure) return failure;
       if (result.exitCode !== 0) return failed("SFTP_FAILED", isUpload && !input.overwrite ? "SFTP no-overwrite upload failed. The destination must support SFTP hard links. A remote staging directory can remain." : "The SFTP batch reported a completed transfer error; a remote staging directory can remain.", "settled");
+      transferCompleted = true;
       if (!isUpload) {
         const payload = path.join(localStage!, "payload");
         const stat = await fs.lstat(payload);
@@ -257,6 +264,7 @@ class SshConnection implements HardwareConnection {
       if (error instanceof HardwareProviderError) return failed(error.code, error.message);
       const code = (error as NodeJS.ErrnoException).code;
       if (!dispatched || code === "EEXIST") return failed(code === "EEXIST" ? "DESTINATION_EXISTS" : "LOCAL_PATH_UNAVAILABLE", "The local transfer path cannot be used.", dispatched ? "settled" : "none");
+      if (transferCompleted) return failed("LOCAL_PATH_UNAVAILABLE", "The SFTP transfer completed, but the local download could not be published.", "settled");
       return unknown("SFTP_OUTCOME_UNKNOWN", "File transfer completion could not be confirmed.");
     } finally {
       await sourceHandle?.close();
@@ -265,8 +273,10 @@ class SshConnection implements HardwareConnection {
   }
 }
 
-function processFailure(result: ProcessResult, label: string): ProviderOutcome<JsonObject> | null {
+function processFailure(result: SshProcessResult, label: string): ProviderOutcome<JsonObject> | null {
   if (result.state === "not_started") return failed("TRANSPORT_NOT_STARTED", `${label} could not start.`);
+  const rejected = result.connectionFailure;
+  if (rejected) return failed(rejected.code, rejected.message, "none", processDiagnostics(result));
   if (result.interrupted || result.state !== "exited" || result.exitCode === null || result.exitCode === 255) return unknown("OUTCOME_UNKNOWN", `${label} may still have remote effects; completion could not be confirmed.`, processDiagnostics(result));
   return null;
 }
@@ -276,7 +286,8 @@ function processDiagnostics(result: ProcessResult): JsonObject {
   const limit = 64 * 1024;
   const stdout = diagnosticText(result.stdout, limit);
   const stderr = diagnosticText(result.stderr, limit - Buffer.byteLength(stdout));
-  return { state: result.state, exitCode: result.exitCode, signal: result.signal, stdout, stderr, truncated: result.truncated || stdout !== result.stdout || stderr !== result.stderr, durationMs: result.durationMs, interrupted: result.interrupted };
+  const clientLog = diagnosticText(result.diagnosticOutput ?? "", limit - Buffer.byteLength(stdout) - Buffer.byteLength(stderr));
+  return { state: result.state, exitCode: result.exitCode, signal: result.signal, stdout, stderr, ...(result.diagnosticOutput !== undefined ? { clientLog } : {}), truncated: result.truncated || !!result.diagnosticsTruncated || stdout !== result.stdout || stderr !== result.stderr || clientLog !== (result.diagnosticOutput ?? ""), durationMs: result.durationMs, interrupted: result.interrupted };
 }
 
 function diagnosticText(value: string, maxBytes: number): string {
@@ -330,6 +341,11 @@ function keyMaterial(value: string): string | undefined {
   return /^[a-zA-Z0-9@._+-]+$/.test(fields[0] ?? "") && /^[a-zA-Z0-9+/]+=*$/.test(fields[1] ?? "") ? `${fields[0]} ${fields[1]}` : undefined;
 }
 
+interface SshProcessResult extends ProcessResult {
+  connectionFailure?: ReturnType<SshExecutionEvidence["connectionFailure"]>;
+  remoteCompleted?: boolean;
+}
+
 class SshProcesses {
   private readonly processes = new BoundedProcessSet();
   private readonly runs = new Set<Promise<ProcessResult>>();
@@ -337,7 +353,7 @@ class SshProcesses {
   private readonly environment: Record<string, string>;
   private closing?: Promise<ProviderOutcome<null>>;
 
-  constructor(private readonly config: SshConfig, options: SshHardwareOptions, private readonly resolveCredential: HardwareAccessContext["resolveCredential"]) {
+  constructor(private readonly config: SshConfig, private readonly options: SshHardwareOptions, private readonly resolveCredential: HardwareAccessContext["resolveCredential"]) {
     const socket = config.auth.kind === "agent" && config.auth.socketPath ? config.auth.socketPath : (options.environment ?? process.env).SSH_AUTH_SOCK;
     this.environment = { SSH_ASKPASS_REQUIRE: "never", ...(config.auth.kind !== "identity_file" && socket ? { SSH_AUTH_SOCK: socket } : {}) };
   }
@@ -347,6 +363,49 @@ class SshProcesses {
     this.runs.add(work);
     void work.then(() => this.runs.delete(work), () => this.runs.delete(work));
     return work;
+  }
+
+  runTransport(kind: "ssh" | "sftp" | "registration", command: ProcessCommand, credentialRefId?: string): Promise<SshProcessResult> {
+    const work = this.executeTransport(kind, command, credentialRefId);
+    this.runs.add(work);
+    void work.then(() => this.runs.delete(work), () => this.runs.delete(work));
+    return work;
+  }
+
+  private async executeTransport(kind: "ssh" | "sftp" | "registration", command: ProcessCommand, credentialRefId?: string): Promise<SshProcessResult> {
+    let directory: string | undefined;
+    let prepared = false;
+    try {
+      directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ssh-client-"));
+      const wrapper = path.join(directory, "ssh");
+      const evidence = new SshExecutionEvidence();
+      const executable = (this.options.sshExecutable ?? "/usr/bin/ssh").replace(/'/g, "'\\''");
+      const relay = kind === "registration" ? `while IFS= read -r line; do printf '%s\\n' "$line" >&4; printf '%s\\n' "$line" >&2; done` : "/bin/cat >&4";
+      // OpenSSH closes inherited descriptors before opening -E. The parent
+      // keeps a real pipe open; the relay drains it into the bounded fd 4.
+      // Neither remote stderr nor authentication banners enter this channel.
+      await fs.writeFile(wrapper, `#!/bin/bash\ntrap ':' TERM INT\nprintf '${evidence.start}' >&4\nif [ ! -x '${executable}' ]; then\n  printf 'cloudx-ssh-client-unavailable\\n${evidence.end}255\\n' >&4\n  exit 255\nfi\nexec 5> >(${relay})\n'${executable}' -v -E "/proc/$$/fd/5" "$@"\nstatus=$?\nexec 5>&-\nwait\nprintf '${evidence.end}%s\\n' "$status" >&4\nexit "$status"\n`, { mode: 0o700 });
+      prepared = true;
+      let rejected: ReturnType<SshExecutionEvidence["connectionFailure"]>;
+      let remoteCompleted = false;
+      const result = await this.execute({ ...command, executable: kind === "ssh" ? wrapper : command.executable, args: kind === "sftp" ? ["-S", wrapper, ...command.args] : command.args, captureDiagnostics: true, inspectDiagnostics: (result, text, truncated) => {
+        const observed = { ...result, diagnosticOutput: text, diagnosticsTruncated: truncated };
+        rejected = evidence.connectionFailure(observed);
+        remoteCompleted = evidence.remoteCompletionConfirmed(observed);
+      }, environment: { ...command.environment, ...(kind === "registration" ? { PATH: `${directory}:/usr/bin:/bin` } : {}) } }, credentialRefId);
+      return { ...result, connectionFailure: rejected, remoteCompleted };
+    } catch (error) {
+      if (!prepared) throw new HardwareProviderError("SSH_CLIENT_PREPARATION_FAILED", "Local SSH client preparation failed before remote command dispatch.");
+      throw error;
+    } finally {
+      if (directory) {
+        try { await fs.rm(directory, { recursive: true, force: true }); }
+        catch (error) {
+          if (!prepared) throw new HardwareProviderError("SSH_CLIENT_PREPARATION_FAILED", "Local SSH client preparation failed before remote command dispatch. Temporary client files require local cleanup.");
+          throw error;
+        }
+      }
+    }
   }
 
   close(signal: AbortSignal): Promise<ProviderOutcome<null>> {

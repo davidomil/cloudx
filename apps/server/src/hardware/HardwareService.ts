@@ -621,7 +621,7 @@ export class HardwareService {
         let outcome = await bounded(signal, timeoutMs, childSignal => {
           providerWork = Promise.resolve().then(() => provider.registerKey!(provider.parseConfig(claim.acquiredItem.config), { timeoutMs, ...(credentialRefId ? { credentialRefId } : {}) }, this.accessContext(claim, childSignal, access)));
           return providerWork;
-        });
+        }, 2500);
         const noEffects = outcome.state === "failed" && outcome.effects === "none";
         if (noEffects && !access.cleanup.length) { this.access.delete(claim.reservationId); cleanupConfirmed = true; }
         else { const ownCleanup = access.cleanup.length > priorClosers; cleanupConfirmed = (await this.closeAccess(work.ref, new AbortController().signal)).state === "completed" && (noEffects || ownCleanup); }
@@ -1090,7 +1090,7 @@ export class HardwareService {
         if (outcome.state === "completed") receipt.result = clone(outcome.value);
         else {
           receipt.error = clone(outcome.error);
-          if (outcome.state === "unknown" && outcome.diagnostics !== undefined) receipt.result = { diagnostics: clone(outcome.diagnostics) };
+          if (outcome.diagnostics !== undefined) receipt.result = { diagnostics: clone(outcome.diagnostics) };
         }
       }
       if (claim) {
@@ -1187,7 +1187,7 @@ async function bounded<T>(parent: AbortSignal, timeoutMs: number, work: (signal:
       requireHardware(result && ["completed", "failed", "unknown"].includes(result.state), "INVALID_PROVIDER_OUTPUT", "Provider returned an invalid execution envelope.");
       if (result.state === "failed") requireHardware(["none", "settled"].includes(result.effects), "INVALID_PROVIDER_OUTPUT", "Provider omitted its effect disposition.");
       if (result.state !== "completed") requireHardware(result.error && typeof result.error.code === "string" && result.error.code.length > 0 && result.error.code.length <= 128 && !result.error.code.includes("\0") && typeof result.error.message === "string" && result.error.message.length > 0 && result.error.message.length <= 4096 && !result.error.message.includes("\0"), "INVALID_PROVIDER_OUTPUT", "Provider returned an invalid error envelope.");
-      if (result.state === "unknown" && result.diagnostics !== undefined) {
+      if (result.state !== "completed" && result.diagnostics !== undefined) {
         hardwareRecord(result.diagnostics, "Provider diagnostics");
         validateHardwareJson({ diagnostics: result.diagnostics });
       }
@@ -1199,7 +1199,8 @@ async function bounded<T>(parent: AbortSignal, timeoutMs: number, work: (signal:
     const settled = await Promise.race([operation, new Promise<undefined>(resolve => {
       settlementTimer = setTimeout(() => resolve(undefined), diagnosticSettlementMs); settlementTimer.unref();
     })]);
-    return settled?.state === "unknown" && settled.diagnostics !== undefined ? { ...interruptedOutcome, diagnostics: settled.diagnostics } : interruptedOutcome;
+    if (settled?.state === "failed" && settled.effects === "none") return settled;
+    return settled && settled.state !== "completed" && settled.diagnostics !== undefined ? { ...interruptedOutcome, diagnostics: settled.diagnostics } : interruptedOutcome;
   } catch { return { state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "The provider stopped without confirming its dispatched operation outcome." } }; }
   finally { clearTimeout(timer); clearTimeout(settlementTimer); parent.removeEventListener("abort", abort); }
 }
