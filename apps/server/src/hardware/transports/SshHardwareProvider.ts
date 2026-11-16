@@ -10,6 +10,7 @@ import type { PathPolicy } from "../../pathPolicy.js";
 import { BoundedProcessSet, type ProcessCommand, type ProcessResult } from "./BoundedProcess.js";
 import { SshAskpass } from "./SshAskpass.js";
 import { SshExecutionEvidence } from "./SshExecutionEvidence.js";
+import { ManagedSshKeyStore } from "./ManagedSshKeyStore.js";
 import { byteLimitSchema, compileHardwareSchema, completed, deadlineSchema, failed, HardwareProviderError, MAX_HARDWARE_BYTES, objectSchema, unknown, validateHardwareValue } from "./HardwareValidation.js";
 
 const absolutePathSchema = { type: "string", minLength: 1, maxLength: 4096, pattern: "^/[^\\u0000\\r\\n]*$" };
@@ -18,6 +19,7 @@ const transferInput = objectSchema({ localPath: transferPathSchema, remotePath: 
 const transferOutput = objectSchema({ bytesTransferred: { type: "integer", minimum: 0 }, destination: { type: "string" }, completed: { const: true } });
 const credentialRefSchema = { type: "string", minLength: 1, maxLength: 128, pattern: "^[a-zA-Z0-9][a-zA-Z0-9._:-]*$" };
 const registerKeyValidator = compileHardwareSchema(objectSchema({ credentialRefId: credentialRefSchema, timeoutMs: deadlineSchema }, ["timeoutMs"]), "SSH key registration");
+const setupKeyValidator = compileHardwareSchema(objectSchema({ hardwareId: credentialRefSchema, credentialRefId: credentialRefSchema, timeoutMs: deadlineSchema }), "SSH key setup");
 
 export const sshHardwareDescriptor: HardwareTypeDescriptor = {
   id: "hardware.ssh", ownerPluginId: "hardware", apiVersion: 1, configVersion: 1,
@@ -45,6 +47,7 @@ export interface SshHardwareOptions {
   sshCopyIdExecutable?: string;
   sshAddExecutable?: string;
   sshKeygenExecutable?: string;
+  managedKeysDirectory?: string;
   environment?: NodeJS.ProcessEnv;
 }
 
@@ -69,18 +72,27 @@ export class SshHardwareProvider implements HardwareTypeProvider<SshConfig> {
   async inspectEndpoint(config: SshConfig): Promise<HardwareEndpointInspection> {
     const blockers: string[] = [];
     const files = [
-      ...(config.knownHostsFile ? [{ path: config.knownHostsFile, socket: false, explicit: true }] : []),
-      ...(config.auth.kind === "identity_file" ? [{ path: config.auth.path, socket: false, explicit: true }] : []),
-      ...(config.auth.kind === "agent" ? [{ path: this.agentSocket(config) ?? "", socket: true, explicit: !!config.auth.socketPath }] : [])
+      ...(config.knownHostsFile ? [{ path: config.knownHostsFile, socket: false }] : []),
+      ...(config.auth.kind === "identity_file" ? [{ path: config.auth.path, socket: false }] : []),
+      ...(config.auth.kind === "agent" && config.auth.socketPath ? [{ path: config.auth.socketPath, socket: true }] : [])
     ];
     for (const file of files) {
       try {
-        if (!file.path) throw new Error("No SSH agent is available in the server environment.");
-        const admitted = file.explicit ? await this.localPath(file.path) : await fs.realpath(file.path);
+        const admitted = await this.localPath(file.path);
         const stat = await fs.stat(admitted);
         if (file.socket ? !stat.isSocket() : !stat.isFile()) blockers.push(`SSH configuration path has the wrong file type: ${file.path}`);
-        await fs.access(admitted, constants.R_OK);
-      } catch { blockers.push(file.explicit ? `SSH configuration path is unavailable or outside allowed roots: ${file.path}` : "The server's current SSH agent socket is unavailable."); }
+        await fs.access(admitted, file.socket ? constants.W_OK : constants.R_OK);
+      } catch { blockers.push(`SSH configuration path is unavailable or outside allowed roots: ${file.path}`); }
+    }
+    if (config.auth.kind === "agent" && !config.auth.socketPath) {
+      const available = async (file: string, socket: boolean) => {
+        try { const stat = await fs.stat(file); await fs.access(file, socket ? constants.W_OK : constants.R_OK); return socket ? stat.isSocket() : stat.isFile(); }
+        catch { return false; }
+      };
+      const agent = this.agentSocket(config);
+      const home = os.userInfo().homedir;
+      const identities = ["id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk", "id_xmss", "id_dsa"];
+      if (!(agent && await available(agent, true)) && !(await Promise.all(identities.map(name => available(path.join(home, ".ssh", name), false)))).some(Boolean)) blockers.push("The server account has no accessible SSH agent or default identity file.");
     }
     for (const executable of [this.options.sshExecutable ?? "/usr/bin/ssh", this.options.sftpExecutable ?? "/usr/bin/sftp"]) {
       try { await fs.access(executable, constants.X_OK); } catch { blockers.push(`Required OpenSSH executable is unavailable: ${executable}`); }
@@ -133,7 +145,37 @@ export class SshHardwareProvider implements HardwareTypeProvider<SshConfig> {
     } catch (error) { return error instanceof HardwareProviderError ? failed(error.code, error.message) : unknown("SSH_CONNECT_UNKNOWN", "SSH connection completion could not be confirmed."); }
   }
 
-  async registerKey(config: SshConfig, input: JsonObject, context: HardwareAccessContext): Promise<ProviderOutcome<JsonObject>> {
+  async setupKey(config: SshConfig, input: JsonObject, context: HardwareConnectionCheckContext): Promise<ProviderOutcome<JsonObject>> {
+    const cleanups: Parameters<HardwareConnectionCheckContext["registerCleanup"]>[0][] = [];
+    let diagnostics: JsonObject | undefined;
+    let registrationStarted = false;
+    const finish = async (result: ProviderOutcome<JsonObject>): Promise<ProviderOutcome<JsonObject>> => {
+      const settled = await Promise.allSettled(cleanups.splice(0).map(async close => close(context.signal)));
+      return settled.every(outcome => outcome.status === "fulfilled" && outcome.value.state === "completed") ? result
+        : unknown("SSH_KEY_SETUP_CLEANUP_UNKNOWN", "SSH key setup could not confirm that all local processes ended.", result.state === "completed" ? diagnostics : result.diagnostics);
+    };
+    try {
+      validateHardwareValue(setupKeyValidator, input, "SSH key setup");
+      const setupContext: HardwareConnectionCheckContext = { ...context, signal: AbortSignal.any([context.signal, AbortSignal.timeout(input.timeoutMs as number)]), registerCleanup: close => { cleanups.push(close); context.registerCleanup(close); } };
+      const keys = new ManagedSshKeyStore({ directory: this.options.managedKeysDirectory, pathPolicy: this.options.pathPolicy, sshKeygenExecutable: this.options.sshKeygenExecutable });
+      const identity = await keys.getOrCreate(input.hardwareId as string, setupContext, input.timeoutMs as number);
+      if (identity.state !== "completed") return await finish(identity);
+      const keyConfig = this.parseConfig({ ...config, auth: { kind: "identity_file", path: identity.value.path } });
+      registrationStarted = true;
+      const registered = await finish(await this.registerKey(keyConfig, { credentialRefId: input.credentialRefId, timeoutMs: input.timeoutMs }, setupContext));
+      if (registered.state !== "completed") return registered;
+      const checked = await this.checkConnection(keyConfig, setupContext);
+      if (checked.state !== "completed") return await finish(checked);
+      diagnostics = checked.value.diagnostics;
+      if (!checked.value.online) return await finish(failed("SSH_KEY_VERIFICATION_FAILED", "The installed SSH key could not complete a key-only login. The machine settings were not changed.", "settled", diagnostics));
+      return await finish(completed({ config: keyConfig as unknown as JsonObject, connectionCheck: checked.value as unknown as JsonObject }));
+    } catch (error) {
+      return finish(registrationStarted ? unknown("SSH_KEY_SETUP_UNKNOWN", "SSH key setup could not confirm its registration and verification outcome.", diagnostics)
+        : failed(error instanceof HardwareProviderError ? error.code : "SSH_KEY_SETUP_FAILED", error instanceof HardwareProviderError ? error.message : "SSH key setup failed before registration."));
+    }
+  }
+
+  async registerKey(config: SshConfig, input: JsonObject, context: HardwareConnectionCheckContext): Promise<ProviderOutcome<JsonObject>> {
     const processes = new SshProcesses(config, this.options, context.resolveCredential);
     context.registerCleanup(signal => processes.close(signal));
     let directory: string | undefined;
@@ -350,7 +392,7 @@ export function sshArguments(config: SshConfig, sftp = false): string[] {
   const password = config.auth.kind === "password";
   const options = [
     ...baseOptions(config), `BatchMode=${password ? "no" : "yes"}`, `PreferredAuthentications=${password ? "password" : "publickey"}`, `PubkeyAuthentication=${password ? "no" : "yes"}`, `PasswordAuthentication=${password ? "yes" : "no"}`, `NumberOfPasswordPrompts=${password ? 1 : 0}`,
-    ...(config.auth.kind === "identity_file" ? ["IdentitiesOnly=yes", "IdentityAgent=none", `IdentityFile=${quoteSshConfigPath(config.auth.path)}`] : config.auth.kind === "agent" ? ["IdentitiesOnly=no", "IdentityFile=none", ...(config.auth.socketPath ? [`IdentityAgent=${quoteSshConfigPath(config.auth.socketPath)}`] : [])] : ["IdentityAgent=none", "IdentityFile=none"])
+    ...(config.auth.kind === "identity_file" ? ["IdentitiesOnly=yes", "IdentityAgent=none", `IdentityFile=${quoteSshConfigPath(config.auth.path)}`] : config.auth.kind === "agent" ? ["IdentitiesOnly=no", ...(config.auth.socketPath ? ["IdentityFile=none", `IdentityAgent=${quoteSshConfigPath(config.auth.socketPath)}`] : [])] : ["IdentityAgent=none", "IdentityFile=none"])
   ];
   return ["-F", "/dev/null", ...(sftp ? [] : ["-T"]), ...options.flatMap((option) => ["-o", option])];
 }
@@ -426,7 +468,7 @@ class SshProcesses {
       // OpenSSH closes inherited descriptors before opening -E. The parent
       // keeps a real pipe open; the relay drains it into the bounded fd 4.
       // Neither remote stderr nor authentication banners enter this channel.
-      await fs.writeFile(wrapper, `#!/bin/bash\ntrap ':' TERM INT\nprintf '${evidence.start}' >&4\nif [ ! -x '${executable}' ]; then\n  printf 'cloudx-ssh-client-unavailable\\n${evidence.end}255\\n' >&4\n  exit 255\nfi\nexec 5> >(${relay})\n'${executable}' -v -E "/proc/$$/fd/5" "$@"\nstatus=$?\nexec 5>&-\nwait\nprintf '${evidence.end}%s\\n' "$status" >&4\nexit "$status"\n`, { mode: 0o700 });
+      await fs.writeFile(wrapper, `#!/bin/bash\numask 077\ntrap ':' TERM INT\nprintf '${evidence.start}' >&4\nif [ ! -x '${executable}' ]; then\n  printf 'cloudx-ssh-client-unavailable\\n${evidence.end}255\\n' >&4\n  exit 255\nfi\nexec 5> >(${relay})\n'${executable}' -v -E "/proc/$$/fd/5" "$@"\nstatus=$?\nexec 5>&-\nwait\nprintf '${evidence.end}%s\\n' "$status" >&4\nexit "$status"\n`, { mode: 0o700 });
       prepared = true;
       let rejected: ReturnType<SshExecutionEvidence["connectionFailure"]>;
       let remoteCompleted = false;

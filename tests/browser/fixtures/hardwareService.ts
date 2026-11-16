@@ -50,6 +50,9 @@ export class HardwareBrowserService {
   }[] = [];
   readonly connections: { authKind: string; credentialRefId?: string }[] = [];
   readonly connectionChecks: JsonObject[] = [];
+  readonly keySetups: JsonObject[] = [];
+  keySetupGate?: Promise<void>;
+  keySetupOutcome?: ProviderOutcome<JsonObject>;
   connectionCheckGate?: Promise<void>;
   connectionCheckOutcome?: ProviderOutcome<HardwareConnectionResult>;
   registrationGate?: Promise<void>;
@@ -116,6 +119,30 @@ export class HardwareBrowserService {
       }),
       ...(descriptor.id === "hardware.ssh"
         ? {
+            setupKey: async (config, input, context) => {
+              context.registerCleanup(async () => ({
+                state: "completed",
+                value: null,
+              }));
+              await context.resolveCredential(String(input.credentialRefId));
+              this.keySetups.push(structuredClone(config));
+              await this.keySetupGate;
+              return (
+                this.keySetupOutcome ?? {
+                  state: "completed",
+                  value: {
+                    config: {
+                      ...config,
+                      auth: {
+                        kind: "identity_file",
+                        path: `${this.root}/managed-ssh-key`,
+                      },
+                    },
+                    connectionCheck: { online: true },
+                  },
+                }
+              );
+            },
             checkConnection: async (config, context) => {
               context.registerCleanup(async () => ({
                 state: "completed",

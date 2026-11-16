@@ -165,11 +165,20 @@ export async function callHardwareAction<T = HardwareMutationResult>(
   return body.result as T;
 }
 
-export async function saveHardwareSshPassword(
+export async function stageHardwareSshPassword(
   credentialRefId: string,
   password: string,
   signal?: AbortSignal,
 ): Promise<{ credentialRefId: string }> {
+  if (
+    !/^ssh-registration-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+      credentialRefId,
+    )
+  )
+    throw new HardwareApiError(
+      "Choose a one-time SSH credential reference.",
+      "INVALID_INPUT",
+    );
   let body: unknown;
   try {
     body = await request(
@@ -185,7 +194,7 @@ export async function saveHardwareSshPassword(
   } catch (cause) {
     if (cause instanceof HardwareApiError && cause.code === "OUTCOME_UNKNOWN")
       throw new HardwareApiError(
-        "The password save response was lost. Explicitly retry this same password before continuing.",
+        "The one-time password response was lost. Explicitly retry this same password before continuing.",
         "OUTCOME_UNKNOWN",
         credentialRefId,
       );
@@ -193,7 +202,7 @@ export async function saveHardwareSshPassword(
   }
   if (!isRecord(body) || body.credentialRefId !== credentialRefId)
     throw new HardwareApiError(
-      "The password save response is invalid. Explicitly retry this same password before continuing.",
+      "The one-time password response is invalid. Explicitly retry this same password before continuing.",
       "OUTCOME_UNKNOWN",
       credentialRefId,
     );

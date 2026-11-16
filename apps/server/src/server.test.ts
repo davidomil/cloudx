@@ -702,6 +702,26 @@ describe("buildServer", () => {
       expect(blockedHttp.statusCode).toBe(403);
       expect(blockedHttp.json()).toEqual({ error: "Forbidden" });
 
+      const passwordReference = "ssh-registration-11111111-2222-4333-8444-555555555555";
+      const blockedPassword = await app.inject({
+        method: "PUT",
+        url: `/api/hardware/ssh-passwords/${passwordReference}`,
+        headers: { host: "127.0.0.1:3001", origin: "http://attacker.example:3001" },
+        payload: { password: "origin-admission-fixture" },
+      });
+      expect(blockedPassword.statusCode).toBe(403);
+      expect(blockedPassword.json()).toEqual({ error: "Forbidden" });
+      const stagedPassword = await app.inject({
+        method: "PUT",
+        url: `/api/hardware/ssh-passwords/${passwordReference}`,
+        headers: { host: "127.0.0.1:3001", origin: "http://127.0.0.1:3001" },
+        payload: { password: "origin-admission-fixture" },
+      });
+      expect(stagedPassword.statusCode).toBe(200);
+      expect(stagedPassword.json()).toEqual({ credentialRefId: passwordReference });
+      const secrets = await fs.readFile(path.join(root, "secrets/config-secrets.json"), "utf8").catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return ""; throw error; });
+      expect(secrets).not.toContain("origin-admission-fixture");
+
       for (const headers of [
         { host: "127.0.0.1:3001", origin: "http://127.0.0.1:3001" },
         { host: "cloudx.example.com", origin: "https://cloudx.example.com" },

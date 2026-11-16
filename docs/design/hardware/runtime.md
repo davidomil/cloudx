@@ -8,13 +8,17 @@ Open **Hardware** from Add tab. All panels on one CloudX host share the inventor
 
 Hardware storage, script process ownership, and UART control-line handling require Linux. Install Bash and OpenSSH client tools for SSH/SFTP and `ssh-copy-id`, and Python 3 for Linux UART modem-control operations. Admit explicit local key files, optional known-hosts overrides, UART paths, transfer paths, and custom script directories through `CLOUDX_ALLOWED_ROOTS`. Inventory inspection does not open the endpoint.
 
-SSH defaults to **Current SSH agent**. It uses the agent available to the CloudX server through `SSH_AUTH_SOCK`; no socket path is required. This is the server's agent, including when the browser runs on another machine. Choose **Identity file** to use an admitted private key, or **Password** to enter a login password. Passwords are saved in CloudX's private secret store. Inventory contains an opaque reference, and editing an existing item never displays its saved password.
+SSH defaults to **Current host user**. It uses the CloudX server account's inherited `SSH_AUTH_SOCK` and standard SSH identity files. The browser user's agent is not available to the server. No socket path is required. An explicit socket selects agent-only authentication. Choose **Identity file** to use an admitted private key.
+
+Save a new machine once before setting up a key with a password. In **Edit hardware**, choose **Set up SSH key with password**, enter the one-time password, and select **Set up SSH key**. CloudX creates a dedicated Ed25519 identity, installs its public key with `ssh-copy-id`, and verifies key-only login. The password authorizes installation; it is not used to derive the key. After success, select **Save hardware** to use the verified identity. The private key stays on the CloudX host with owner-only permissions, under `secrets/hardware-ssh` in its data directory. This directory must be within the allowed roots.
+
+New passwords are kept only in host-process memory, expire after 15 minutes, and are never written to the config secret file. Finishing a known key setup discards its temporary password. Restart loses temporary passwords. Existing saved login passwords remain readable until explicitly replaced. Saving key authentication removes the old password when no other item, acquired reservation, or unfinished hardware operation can still need it. The editor reports retained passwords and removal failures. It never displays a saved password.
 
 No known-hosts path is required. SSH uses the host account's normal known-hosts files, saves a new host key on first connection, and rejects a changed key. Explicit file overrides still require an admitted regular file and strict checking.
 
 ## Edit and test SSH connections
 
-Select a machine and choose **Edit hardware** to change its host or IP address, port, username, or authentication. Leave the replacement password blank to keep the saved password. Enter a new password to replace it. The editor never retrieves the saved password.
+Select a machine and choose **Edit hardware** to change its host or IP address, port, username, or authentication. An existing password-authenticated machine can use its saved password for key setup when the password field is blank. Entering a replacement stages a one-time password instead of saving a new login password. Complete key setup before saving password-mode connection edits.
 
 For a saved machine, **Test connection** checks the current connection fields, including an unsaved IP address or replacement password. The test does not save the machine. Its result identifies the tested endpoint; changing the connection fields marks that result as outdated. Save a new machine before testing it. The test uses a temporary system-check hold and does not run reservation hooks or grant managed access. Connection edits and tests stay blocked while the resource is held. Use **Inspect hold** to inspect its owner and recovery state before releasing it.
 
@@ -24,7 +28,7 @@ Login checks and custom status checks share time across the machine's physical a
 
 Login checks use bounded execution and close their local processes before clearing the check hold. An observed login failure with confirmed cleanup leaves the machine editable. Unconfirmed cleanup retains a recovery hold. A server restart clears the last login observation and preserves any unfinished check for recovery.
 
-To install keys on a machine, save the item, reserve it, and choose **Register SSH key** before opening access. Enter a registration password when needed. Agent/password items register the keys loaded in the current SSH agent; identity-file items use their configured key pair. `ssh-copy-id` checks which keys already work and skips them. Registration does not change the item's authentication method or retry a failed command. A temporary registration password is discarded after the local operation and cleanup finish; interrupted temporary passwords are cleared on server startup.
+The separate **Register SSH key** action remains available under a user-owned active reservation before opening access. It installs current agent keys or a configured identity-file pair. It requires usable agent identities when no identity file is selected, even if ordinary host-user SSH can use a disk key. Registration does not change saved authentication. Use editor key setup when a password should install a dedicated key. `ssh-copy-id` skips keys that already work. A temporary registration password is discarded after the local operation and cleanup finish.
 
 ## Set statuses and hooks
 

@@ -1585,7 +1585,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
   plugins.register(new CooperationPlugin());
-  plugins.register(new HardwarePlugin(createHardwareProviders({ pathPolicy }), (action, input, owner) => {
+  plugins.register(new HardwarePlugin(createHardwareProviders({ pathPolicy, managedKeysDirectory: path.join(config.dataDir, "secrets", "hardware-ssh") }), (action, input, owner) => {
     if (!hardware) throw new Error("The Hardware service is unavailable.");
     return hardware.execute(action, input, owner);
   }));
@@ -1629,6 +1629,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   }
   hardware = new HardwareService({ dataDir: config.dataDir, pathPolicy, registry: new HardwareTypeRegistry(plugins.values()), resolveCredential: hardwareCredentialResolver(process.env, hardwarePasswords),
     discardCredential: id => hardwarePasswords.discardRegistration(id),
+    discardSavedPassword: id => hardwarePasswords.discardSavedPassword(id),
     ownerState: async owner => {
       if (owner.kind === "user") return "active";
       if (owner.ownerPluginId === "forge" && await forgeRuntime?.hardwareOwnerState(owner) === "confirmed_ended") return "confirmed_ended";

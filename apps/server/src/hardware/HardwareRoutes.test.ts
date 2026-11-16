@@ -95,9 +95,9 @@ it("runs the authenticated reservation, notes, managed access, and release workf
   expect((await f.hardware.snapshot(f.owner())).items[0].availability).toBe("available");
 });
 
-it("saves an SSH password through a write-only route without adding it to Hardware state", async () => {
+it("stages a key setup password through a write-only route without saving it to disk or Hardware state", async () => {
   const f = await fixture();
-  const id = "ssh-password-11111111-2222-4333-8444-555555555555";
+  const id = "ssh-registration-11111111-2222-4333-8444-555555555555";
   const password = 'private-password $`" marker';
   const response = await f.app.inject({ method: "PUT", url: `/api/hardware/ssh-passwords/${id}`, payload: { password } });
   expect(response.statusCode, response.body).toBe(200);
@@ -111,6 +111,27 @@ it("saves an SSH password through a write-only route without adding it to Hardwa
   expect(conflict.statusCode).toBe(409);
   expect(conflict.body).not.toContain(password);
   expect(conflict.body).not.toContain("replacement-value");
+  await expect(fs.stat(path.join(f.root, "secrets"))).rejects.toMatchObject({ code: "ENOENT" });
+  await expect(new HardwareSshPasswords(f.root).resolve(id)).rejects.toMatchObject({ code: "CREDENTIAL_UNAVAILABLE" });
+  await f.sshPasswords.discardRegistration(id);
+  await expect(fs.stat(path.join(f.root, "secrets"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+it("refuses durable password writes and reports staging capacity without echoing passwords", async () => {
+  const f = await fixture();
+  const persistent = "ssh-password-11111111-2222-4333-8444-555555555555";
+  const password = "private-password-marker";
+  const rejected = await f.app.inject({ method: "PUT", url: `/api/hardware/ssh-passwords/${persistent}`, payload: { password } });
+  expect(rejected.statusCode).toBe(400);
+  expect(rejected.json()).toMatchObject({ code: "INVALID_INPUT", message: "Saving an SSH login password is disabled. Use SSH key setup." });
+  expect(rejected.body).not.toContain(password);
+  for (let index = 0; index < 256; index++)
+    await f.sshPasswords.save(`ssh-registration-${index.toString(16).padStart(8, "0")}-2222-4333-8444-555555555555`, "pending-password");
+  const response = await f.app.inject({ method: "PUT", url: "/api/hardware/ssh-passwords/ssh-registration-ffffffff-2222-4333-8444-555555555555", payload: { password } });
+  expect(response.statusCode).toBe(503);
+  expect(response.json()).toMatchObject({ code: "SERVICE_UNAVAILABLE" });
+  expect(response.body).not.toContain(password);
+  await expect(fs.stat(path.join(f.root, "secrets"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 it("rejects invalid or oversized password writes without echoing their values", async () => {
@@ -124,6 +145,11 @@ it("rejects invalid or oversized password writes without echoing their values", 
   expect((await f.app.inject({ method: "PUT", url: "/api/hardware/ssh-passwords/not-a-reference", payload: { password: "private" } })).statusCode).toBe(400);
   expect((await f.app.inject({ method: "PUT", url: `/api/hardware/ssh-passwords/${id}`, payload: { password: "x".repeat(8192) } })).statusCode).toBe(413);
   await expect(f.sshPasswords.resolve(id)).rejects.toMatchObject({ code: "CREDENTIAL_UNAVAILABLE" });
+  const denied = await f.app.inject({ method: "POST", url: "/api/hardware/agent", headers: { authorization: "Bearer invalid-capability" },
+    payload: { tabId: f.owner().tabId, executionId: f.owner().executionId, action: "hardware.ssh.registerKey", input: { requestId: "registration-without-capability", credentialRefId: id } } });
+  expect(denied.statusCode).toBe(403);
+  expect(denied.body).not.toContain("invalid-capability");
+  await expect(fs.stat(path.join(f.root, "secrets"))).rejects.toMatchObject({ code: "ENOENT" });
 });
 
 it("rejects spoofed owners and revokes stale execution access without giving claims to replacements", async () => {

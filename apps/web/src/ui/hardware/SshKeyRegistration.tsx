@@ -7,7 +7,7 @@ import type {
 } from "@cloudx/shared";
 import {
   hardwareRequestId,
-  saveHardwareSshPassword,
+  stageHardwareSshPassword,
 } from "../../hardwareApi.js";
 import { ControlButton } from "../Control.js";
 import { HardwareDialog, type HardwareRun } from "./HardwareControls.js";
@@ -70,7 +70,7 @@ export function SshKeyRegistration({
         reference =
           credentialRefId ?? `ssh-registration-${hardwareRequestId()}`;
         setCredentialRefId(reference);
-        await saveHardwareSshPassword(reference, password);
+        await stageHardwareSshPassword(reference, password);
         setPassword("");
       }
       const receipt = await run("hardware.ssh.registerKey", {
@@ -85,7 +85,7 @@ export function SshKeyRegistration({
       setError(
         cause instanceof Error
           ? cause.message
-          : "The registration password could not be saved.",
+          : "The one-time registration password could not be staged.",
       );
     } finally {
       setSaving(false);
@@ -125,18 +125,20 @@ export function SshKeyRegistration({
             <p className="hardware-muted">
               {auth.kind === "identity_file"
                 ? "Adds the configured identity's public key to the remote user's authorized keys."
-                : "Adds all keys from the CloudX host's current SSH agent to the remote user's authorized keys."}{" "}
+                : "Adds keys loaded in the CloudX server account's SSH agent to the remote user's authorized keys."}{" "}
               This does not change the saved login method.
             </p>
             {savedPassword ? (
               <p className="hardware-muted">
                 Uses the saved login password unless you enter a one-time
-                password below.
+                password below. One-time passwords expire after 15 minutes and
+                are not saved to disk.
               </p>
             ) : (
               <p className="hardware-muted">
                 Enter the remote login password if the current keys cannot log
-                in. Leave it blank to use key authentication.
+                in. Leave it blank to use key authentication. One-time passwords
+                expire after 15 minutes and are not saved to disk.
               </p>
             )}
             <label>
@@ -156,7 +158,7 @@ export function SshKeyRegistration({
             </label>
             {credentialRefId && !password ? (
               <p className="hardware-muted">
-                Registration password saved for this attempt.
+                Registration password staged in memory for this attempt.
               </p>
             ) : null}
             {error ? (
