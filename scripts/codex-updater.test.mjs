@@ -686,8 +686,10 @@ describe("shared Codex update", () => {
     const output = [];
     const result = updateCodexInstallation({ ...fixture, signal: controller.signal, onOutput: text => output.push(text) }).catch(error => error);
     try {
-      await vi.waitFor(() => expect(fs.statSync(fixture.env.TEST_WRITES).size).toBeGreaterThan(0));
-      expect(output.join("")).toContain("Retained-state snapshot is progressing.");
+      await vi.waitFor(() => {
+        expect(fs.statSync(fixture.env.TEST_WRITES).size).toBeGreaterThan(0);
+        expect(output.join("")).toContain("Retained-state snapshot is progressing.");
+      });
       expect(() => acquireCodexInstallationLock(fixture.prefix)).toThrow(/Another CloudX installer/);
       controller.abort();
       expect(await result).toMatchObject({ code: "cancelled", usableVersion: "1.0.0" });
