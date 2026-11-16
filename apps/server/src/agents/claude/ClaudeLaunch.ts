@@ -64,8 +64,9 @@ export function buildClaudeLaunchArgs(initialInput: Record<string, unknown> | un
 }
 
 // Claude stores each conversation as projects/<cwd slug>/<session id>.jsonl.
-export async function findClaudeTranscript(projectsDir: string, sessionId: string): Promise<string> {
+export async function findClaudeTranscript(projectsDir: string, sessionId: string, signal?: AbortSignal): Promise<string> {
   if (!SESSION_ID_PATTERN.test(sessionId)) throw new Error("An exact Claude conversation ID is required. Select a saved session.");
+  signal?.throwIfAborted();
   let projects;
   try { projects = await fs.readdir(projectsDir, { withFileTypes: true }); }
   catch (error) {
@@ -74,6 +75,7 @@ export async function findClaudeTranscript(projectsDir: string, sessionId: strin
   }
   if (projects.length > 100_000) throw new Error("Claude session lookup exceeded the directory limit.");
   for (const project of projects) {
+    signal?.throwIfAborted();
     if (!project.isDirectory()) continue;
     const candidate = path.join(projectsDir, project.name, `${sessionId}.jsonl`);
     try {

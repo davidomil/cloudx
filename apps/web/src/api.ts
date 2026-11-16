@@ -717,10 +717,11 @@ export async function readCodexCommandDetails(tabId: string, signal?: AbortSigna
   return parseCodexCommandDetailsSnapshot(await fetchJson(`/api/tabs/${encodeURIComponent(tabId)}/command-details`, { signal, cache: "no-store" }));
 }
 
-export async function callHook<T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}, targetTabId?: string): Promise<T> {
+export async function callHook<T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input: Record<string, unknown> = {}, targetTabId?: string, signal?: AbortSignal): Promise<T> {
   const body = await fetchJson<HookCallResponse>(`/api/hooks/${encodeURIComponent(hookId)}`, {
     method: "POST",
-    body: JSON.stringify({ input, targetTabId })
+    body: JSON.stringify({ input, targetTabId }),
+    signal
   });
   return body.result as T;
 }

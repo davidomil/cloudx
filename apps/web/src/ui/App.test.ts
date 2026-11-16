@@ -656,6 +656,11 @@ class TestWorkspaceWebSocket extends EventTarget {
 
 
 describe("window usage summary", () => {
+  it("shows backfill status before a window has any indexed usage", () => {
+    const total = { totals: emptyAgentUsageTotals(), byModel: [], costUsd: 0, unpricedModels: [], indexing: "backfilling" as const };
+    expect(windowUsageText("window", { tabs: {}, windows: { window: total }, forgeWorkers: {}, total })).toBe(" · Backfilling usage…");
+  });
+
   it("uses durable window history independently from open tab summaries", () => {
     const total = { totals: { ...emptyAgentUsageTotals(), input: 100, requests: 2 }, byModel: [], costUsd: 3, costBasis: "mixed" as const, unpricedModels: [] };
     const result = { tabs: {}, windows: { retained: total }, forgeWorkers: {}, total };

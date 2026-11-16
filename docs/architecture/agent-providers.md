@@ -105,6 +105,42 @@ tab's usage is the usage recorded inside its time ranges, so a resumed
 conversation counts only from when the tab took it over. Tabs owned by
 Forge record their worker too.
 
+`JsonlCache` stores derived usage records, parser state and byte checkpoints
+under `<dataDir>/agent-usage-index/v1/{codex,claude}`. Checkpoints include the
+absolute transcript path and filesystem identity. They do not change ledger
+ownership or native conversation identity. An unchanged indexed file needs
+metadata checks only after restart. Appends resume at the saved offset.
+
+One `UsageScanScheduler` serves both providers. It reads at most 256 KiB per
+slice and waits 100 ms after each slice, including its checkpoint write. Files
+rotate through the queue. Usage requests return the indexed snapshot with
+`indexing: "backfilling"` until its sampled history is complete. Errors retain
+the previous checkpoint, set `indexing: "error"`, and log the cause. Repair the
+cause and restart the service to clear a stopped index. A damaged derived
+checkpoint can be removed to request a bounded rebuild; keep the ledger and
+provider transcripts.
+
+Each journal frame stores a checkpoint and only its new usage records. Frames
+append and flush without rewriting prior results. A new source generation
+flushes its first frame, replaces the journal atomically, and flushes its
+directory. Restart recovery validates frame order and discards only an
+incomplete final append. Complete corrupt frames stop indexing with an error.
+During a long record, the durable offset stays at the
+last complete line. A crash can replay one unfinished record of at most
+16 MiB; committed usage is not replayed. At EOF, an incomplete record is saved
+as bytes so a restart preserves split UTF-8 characters. Oversized records are
+dropped through their next newline, without limiting retained history.
+
+Replacement identity, observed shrinkage, and same-size metadata changes
+invalidate a checkpoint. Native transcript writers append. An in-place
+rewrite that regrows beyond the previous size entirely between metadata
+samples cannot be distinguished from append without reading historical data.
+
+`UsageReadRequests` coalesces concurrent discovery for the same home and
+session. The last consumer can cancel unfinished discovery. Already scheduled
+indexing continues until complete or service disposal. Browser refreshes wait
+for the previous request and abort when their consumer disappears.
+
 Verified on 2026-10-05:
 
 - A `claude -p` run priced by CloudX matched the `total_cost_usd` Claude

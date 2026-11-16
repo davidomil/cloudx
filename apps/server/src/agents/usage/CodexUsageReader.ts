@@ -1,11 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { isRecord } from "@cloudx/shared";
+import { isRecord, usageIndexing } from "@cloudx/shared";
 
-import { findCodexTranscript } from "../../plugins/CodexConversationRecovery.js";
-import { JsonlCache } from "./JsonlCache.js";
-import { count, type UsageRecord } from "./usageRecord.js";
+import { isCodexConversationId } from "../../plugins/CodexConversationRecovery.js";
+import { JsonlCache, type JsonlCacheOptions } from "./JsonlCache.js";
+import { UsageReadRequests } from "./UsageReadRequests.js";
+import { count, isUsageRecord, type UsageRecord, type UsageSnapshot } from "./usageRecord.js";
 
 interface CodexParseState {
   ownThread?: string;
@@ -24,41 +25,94 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // records of the file's own thread count, and subagent threads are found by
 // the root session id their records carry.
 export class CodexUsageReader {
-  private readonly cache = new JsonlCache<CodexParseState, CodexUsage>(() => ({ model: "unknown" }), parseCodexLine);
+  private readonly cache: JsonlCache<CodexParseState, CodexUsage>;
   private readonly rootFiles = new Map<string, string>();
+  private readonly requests = new UsageReadRequests();
 
-  constructor(private readonly codexHome: () => string) {}
-
-  async records(sessionId: string, since: number): Promise<UsageRecord[]> {
-    const sessions = path.join(this.codexHome(), "sessions");
-    const files = new Set(await this.datedRollouts(sessions, since));
-    const root = await this.rootFile(sessionId);
-    if (root) files.add(root);
-    const records: UsageRecord[] = [];
-    for (const file of files)
-      for (const usage of await this.cache.read(file))
-        if (usage.rootSession === sessionId) records.push(usage.record);
-    return records;
+  constructor(private readonly codexHome: () => string, options: JsonlCacheOptions<CodexParseState, CodexUsage> = {}) {
+    this.cache = new JsonlCache(() => ({ model: "unknown" }), parseCodexLine, {
+      ...options,
+      validateState: value => isRecord(value) && typeof value.model === "string" &&
+        (value.ownThread === undefined || typeof value.ownThread === "string"),
+      validateResult: value => isRecord(value) && typeof value.rootSession === "string" && isUsageRecord(value.record)
+    });
   }
 
-  private async rootFile(sessionId: string): Promise<string | undefined> {
-    const cached = this.rootFiles.get(sessionId);
-    if (cached) return cached;
-    try {
-      const file = await findCodexTranscript(sessionId, this.codexHome());
-      this.rootFiles.set(sessionId, file);
-      return file;
-    } catch {
-      return undefined;
+  snapshot(sessionId: string, since: number, signal?: AbortSignal): Promise<UsageSnapshot> {
+    const home = path.resolve(this.codexHome());
+    return this.requests.read(JSON.stringify([home, sessionId, since]), active => this.readSnapshot(home, sessionId, since, active), signal);
+  }
+
+  async idle(): Promise<void> {
+    await this.requests.idle();
+    await this.cache.idle();
+  }
+
+  async dispose(): Promise<void> {
+    await this.requests.dispose();
+    await this.cache.dispose();
+  }
+
+  private async readSnapshot(home: string, sessionId: string, since: number, signal: AbortSignal): Promise<UsageSnapshot> {
+    if (!isCodexConversationId(sessionId) || !Number.isFinite(since)) throw new Error("Usage requires an exact session and finite start time.");
+    signal.throwIfAborted();
+    const sessions = path.join(home, "sessions");
+    const files = new Set(await this.datedRollouts(sessions, since, signal));
+    const root = await this.rootFile(sessions, sessionId, files, signal);
+    if (root) files.add(root);
+    const snapshots = [];
+    const records: UsageRecord[] = [];
+    for (const file of files) {
+      signal.throwIfAborted();
+      const snapshot = await this.cache.readWithStatus(file);
+      signal.throwIfAborted();
+      snapshots.push(snapshot);
+      for (const usage of snapshot.results)
+        if (usage.rootSession === sessionId) records.push(usage.record);
     }
+    if (!root) snapshots.push({ indexing: "error" as const });
+    return { records, ...usageIndexing(snapshots) };
+  }
+
+  // Locate by directory metadata only. The normal recovery helper reads a 1 MiB
+  // header; using it here would reread historical payload after every restart.
+  private async rootFile(sessions: string, sessionId: string, candidates: Set<string>, signal: AbortSignal): Promise<string | undefined> {
+    signal.throwIfAborted();
+    const key = JSON.stringify([sessions, sessionId]);
+    const known = this.rootFiles.get(key);
+    if (known) {
+      try { if ((await fs.lstat(known)).isFile()) return known; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      this.rootFiles.delete(key);
+    }
+    let found = [...candidates].find(file => file.endsWith(`-${sessionId}.jsonl`));
+    const pending = found ? [] : [sessions];
+    let inspected = 0;
+    while (pending.length && !found) {
+      signal.throwIfAborted();
+      const directory = pending.pop()!;
+      let entries;
+      try { entries = await fs.readdir(directory, { withFileTypes: true }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      signal.throwIfAborted();
+      for (const entry of entries) {
+        if (++inspected > 100_000) throw new Error("Usage transcript lookup exceeded the directory limit.");
+        const file = path.join(directory, entry.name);
+        if (entry.isDirectory()) pending.push(file);
+        if (entry.isFile() && entry.name.endsWith(`-${sessionId}.jsonl`)) { found = file; break; }
+      }
+    }
+    if (found) this.rootFiles.set(key, found);
+    return found;
   }
 
   // Rollouts live under sessions/YYYY/MM/DD by local creation date. Subagent
   // and resumed work after `since` is in folders from that day onward; one
   // extra day on each side covers the local time zone offset.
-  private async datedRollouts(sessions: string, since: number): Promise<string[]> {
+  private async datedRollouts(sessions: string, since: number, signal: AbortSignal): Promise<string[]> {
     const files: string[] = [];
     for (let day = startOfUtcDay(since - DAY_MS); day <= Date.now() + DAY_MS; day += DAY_MS) {
+      signal.throwIfAborted();
       const date = new Date(day);
       const directory = path.join(sessions, String(date.getUTCFullYear()), pad(date.getUTCMonth() + 1), pad(date.getUTCDate()));
       let names: string[];
@@ -82,7 +136,7 @@ function parseCodexLine(line: unknown, state: CodexParseState): CodexUsage | und
     return undefined;
   }
   if (line.type !== "token_usage_record" || payload.thread_id !== state.ownThread || !isRecord(payload.usage) ||
-      typeof payload.response_id !== "string" || typeof payload.session_id !== "string" || typeof line.timestamp !== "string")
+      typeof payload.response_id !== "string" || typeof payload.session_id !== "string" || typeof line.timestamp !== "string" || !Number.isFinite(Date.parse(line.timestamp)))
     return undefined;
   const usage = payload.usage;
   // input_tokens includes both cache reads and cache writes.
