@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, Info, Plus, RefreshCw, Save, Trash2 } from "lucide-react";
+import {
+  ArrowLeft,
+  Info,
+  KeyRound,
+  Plus,
+  RefreshCw,
+  Save,
+  Trash2,
+} from "lucide-react";
 import {
   DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS,
+  isRecord,
   parseHardwareConnectionObservation,
 } from "@cloudx/shared";
 import type {
@@ -17,7 +26,7 @@ import type {
 import { ControlButton } from "../Control.js";
 import {
   hardwareRequestId,
-  saveHardwareSshPassword,
+  stageHardwareSshPassword,
 } from "../../hardwareApi.js";
 import {
   emptyScript,
@@ -107,8 +116,14 @@ export function HardwareEditor({
   const [passwordReference, setPasswordReference] = useState<string>();
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string>();
-  const [testing, setTesting] = useState(false);
+  const [passwordRetirement, setPasswordRetirement] = useState<{
+    state: "retained" | "failed";
+    reason?: string;
+  }>();
+  const [testing, setTesting] = useState<"test" | "setup">();
   const [connectionTest, setConnectionTest] = useState<{
+    kind: "test" | "setup";
+    keyApplied?: boolean;
     receipt: OperationReceipt;
     hardwareId: string;
     config: string;
@@ -140,10 +155,12 @@ export function HardwareEditor({
   const testReceipt =
     connectionTest?.receipt.state === "running"
       ? (state.receipts.find(
-          (receipt) => receipt.requestId === connectionTest.receipt.requestId,
+          (receipt) =>
+            receipt.requestId === connectionTest.receipt.requestId &&
+            receipt.runId === connectionTest.receipt.runId,
         ) ?? connectionTest.receipt)
       : connectionTest?.receipt;
-  const testPending = testing || testReceipt?.state === "running";
+  const testPending = Boolean(testing) || testReceipt?.state === "running";
   const testCurrent =
     connectionTest?.hardwareId === item?.id &&
     connectionTest?.config === JSON.stringify(value.config) &&
@@ -165,6 +182,30 @@ export function HardwareEditor({
     testResult.itemRevision === connectionTest?.revision
       ? testResult
       : undefined;
+  const passwordAuth =
+    value.typeId === "hardware.ssh" &&
+    (value.config.auth as JsonObject).kind === "password";
+  const setupPending =
+    (testing ?? connectionTest?.kind) === "setup" && testPending;
+  const keyConfig =
+    connectionTest?.kind === "setup" &&
+    !connectionTest.keyApplied &&
+    testReceipt?.result?.draft === true &&
+    confirmedTestResult?.online
+      ? verifiedKeyConfig(testReceipt?.result?.sshKeyConfig, value.config)
+      : undefined;
+  useEffect(() => {
+    if (!keyConfig || !testCurrent || held || stale || !connectionTest) return;
+    setDraft((current) => ({
+      ...current,
+      value: { ...current.value, config: keyConfig },
+    }));
+    setConnectionTest({
+      ...connectionTest,
+      config: JSON.stringify(keyConfig),
+      keyApplied: true,
+    });
+  }, [keyConfig, testCurrent, held, stale, connectionTest]);
   const edit = (patch: Partial<HardwareItemDraft>) =>
     setDraft({ ...draft, value: { ...value, ...patch } });
   async function preparePassword(): Promise<HardwareItemDraft> {
@@ -176,14 +217,14 @@ export function HardwareEditor({
     if (!password) {
       if (!(value.config.auth as JsonObject).credentialRefId)
         throw new Error(
-          "Enter an SSH password before testing or saving password authentication.",
+          "Enter a one-time SSH password before testing or setting up a key.",
         );
       return value;
     }
     const credentialRefId =
-      passwordReference ?? `ssh-password-${hardwareRequestId()}`;
+      passwordReference ?? `ssh-registration-${hardwareRequestId()}`;
     setPasswordReference(credentialRefId);
-    await saveHardwareSshPassword(credentialRefId, password);
+    await stageHardwareSshPassword(credentialRefId, password);
     const prepared = {
       ...value,
       config: { ...value.config, auth: { kind: "password", credentialRefId } },
@@ -198,7 +239,7 @@ export function HardwareEditor({
     }
     return prepared;
   }
-  async function testConnection() {
+  async function runConnectionAction(kind: "test" | "setup") {
     if (
       working.current ||
       testPending ||
@@ -210,7 +251,7 @@ export function HardwareEditor({
     )
       return;
     working.current = true;
-    setTesting(true);
+    setTesting(kind);
     setSaveError(undefined);
     setConnectionTest(undefined);
     try {
@@ -225,17 +266,30 @@ export function HardwareEditor({
         latest.current.item.revision !== draft.baseRevision
       ) {
         setSaveError(
-          "The item changed or became held. Inspect the current hardware before testing its connection.",
+          "The item changed or became held. Inspect the current hardware before continuing.",
         );
         return;
       }
-      const receipt = await latest.current.run("hardware.connection.check", {
-        hardwareId: capturedItem.id,
-        expectedItemRevision: draft.baseRevision,
-        config: prepared.config,
-      });
+      const receipt = await latest.current.run(
+        kind === "setup"
+          ? "hardware.ssh.setupKey"
+          : "hardware.connection.check",
+        {
+          hardwareId: capturedItem.id,
+          expectedItemRevision: draft.baseRevision,
+          config: prepared.config,
+          ...(kind === "setup"
+            ? {
+                credentialRefId: (prepared.config.auth as JsonObject)
+                  .credentialRefId,
+                timeoutMs: 60000,
+              }
+            : {}),
+        },
+      );
       if (receipt && alive.current)
         setConnectionTest({
+          kind,
           receipt,
           hardwareId: capturedItem.id,
           config: JSON.stringify(prepared.config),
@@ -247,20 +301,28 @@ export function HardwareEditor({
         setSaveError(
           cause instanceof Error
             ? cause.message
-            : "The SSH connection could not be tested.",
+            : kind === "setup"
+              ? "The SSH key could not be set up."
+              : "The SSH connection could not be tested.",
         );
     } finally {
       working.current = false;
-      if (alive.current) setTesting(false);
+      if (alive.current) setTesting(undefined);
     }
   }
   async function save() {
     if (working.current || testPending || saving || busy || stale) return;
+    if (passwordAuth && !held) {
+      setSaveError(
+        "Set up an SSH key before saving these connection settings.",
+      );
+      return;
+    }
     working.current = true;
     setSaving(true);
     setSaveError(undefined);
     try {
-      const savedValue = held ? value : await preparePassword();
+      const savedValue = value;
       if (!alive.current) return;
       if (latest.current.stale || (!held && latest.current.held)) {
         setSaveError(
@@ -303,14 +365,25 @@ export function HardwareEditor({
       );
       if (receipt?.state === "succeeded" && alive.current) {
         drafts.delete(key);
-        onSaved();
+        const retirement = receipt.result?.passwordRetirement;
+        if (
+          isRecord(retirement) &&
+          (retirement.state === "retained" || retirement.state === "failed")
+        )
+          setPasswordRetirement({
+            state: retirement.state,
+            ...(typeof retirement.reason === "string"
+              ? { reason: retirement.reason }
+              : {}),
+          });
+        else onSaved();
       }
     } catch (cause) {
       if (alive.current)
         setSaveError(
           cause instanceof Error
             ? cause.message
-            : "The SSH password could not be saved.",
+            : "The hardware item could not be saved.",
         );
     } finally {
       working.current = false;
@@ -553,6 +626,7 @@ export function HardwareEditor({
                 config={value.config}
                 onChange={(config) => edit({ config })}
                 password={password}
+                saved={item?.typeId === "hardware.ssh"}
                 onPasswordChange={(next) => {
                   setPassword(next);
                   setPasswordReference(undefined);
@@ -571,17 +645,44 @@ export function HardwareEditor({
                         testPending ||
                         item?.typeId !== "hardware.ssh"
                       }
-                      onClick={() => void testConnection()}
+                      onClick={() => void runConnectionAction("test")}
                     >
                       <RefreshCw size={14} />
-                      {testPending ? "Testing connection…" : "Test connection"}
+                      {testPending && !setupPending
+                        ? "Testing connection…"
+                        : "Test connection"}
                     </ControlButton>
+                    {passwordAuth ? (
+                      <ControlButton
+                        disabled={
+                          held ||
+                          stale ||
+                          busy ||
+                          saving ||
+                          testPending ||
+                          item?.typeId !== "hardware.ssh"
+                        }
+                        onClick={() => void runConnectionAction("setup")}
+                      >
+                        <KeyRound size={14} />
+                        {setupPending
+                          ? "Setting up SSH key…"
+                          : "Set up SSH key"}
+                      </ControlButton>
+                    ) : null}
                   </div>
                   <p className="hardware-muted">
                     {item?.typeId === "hardware.ssh"
-                      ? "Testing signs in with these settings and closes the connection. It does not save the hardware item. Replacement passwords are stored privately when testing or saving."
+                      ? "Testing signs in with these settings and closes the connection. It does not install a key or save the hardware item. One-time passwords expire after 15 minutes and are not saved to disk."
                       : "Save this hardware item before testing its connection."}
                   </p>
+                  {passwordAuth ? (
+                    <p className="hardware-muted">
+                      Set up an SSH key before saving these connection settings.
+                      Setup installs a dedicated public key and verifies
+                      key-only login.
+                    </p>
+                  ) : null}
                   {connectionTest ? (
                     <section
                       className="hardware-connection-result"
@@ -595,7 +696,22 @@ export function HardwareEditor({
                           again to check the current draft.
                         </p>
                       ) : testPending ? (
-                        <p>Testing connection…</p>
+                        <p>
+                          {setupPending
+                            ? "Setting up SSH key…"
+                            : "Testing connection…"}
+                        </p>
+                      ) : connectionTest.kind === "setup" ? (
+                        <p
+                          className={
+                            connectionTest.keyApplied ? "positive" : "warning"
+                          }
+                        >
+                          {connectionTest.keyApplied
+                            ? "SSH key installed and login verified. Save hardware to use it."
+                            : (testReceipt?.error?.message ??
+                              "No verified SSH key is available. Inspect the operation receipt before another attempt.")}
+                        </p>
                       ) : confirmedTestResult ? (
                         <>
                           <p
@@ -672,13 +788,34 @@ export function HardwareEditor({
           tone="primary"
           type="submit"
           disabled={
-            busy || saving || testPending || stale || !state.types.length
+            busy ||
+            saving ||
+            testPending ||
+            stale ||
+            !state.types.length ||
+            (passwordAuth && !held)
           }
         >
           <Save size={15} />
           Save hardware
         </ControlButton>
       </footer>
+      {passwordRetirement ? (
+        <HardwareDialog title="SSH key saved" onClose={onSaved}>
+          <p>The hardware now uses the SSH key.</p>
+          <p className="hardware-banner warning" role="status">
+            {passwordRetirement.state === "retained"
+              ? "The previous saved password is still needed and was retained."
+              : "The previous saved password could not be removed."}
+            {passwordRetirement.reason ? ` ${passwordRetirement.reason}` : ""}
+          </p>
+          <footer className="hardware-form-actions">
+            <ControlButton tone="primary" onClick={onSaved}>
+              Done
+            </ControlButton>
+          </footer>
+        </HardwareDialog>
+      ) : null}
       {deleting && item ? (
         <HardwareDialog
           title={`Delete ${item.name}`}
@@ -723,18 +860,43 @@ export function HardwareEditor({
   );
 }
 
+function verifiedKeyConfig(
+  value: unknown,
+  expected: JsonObject,
+): JsonObject | undefined {
+  if (
+    !isRecord(value) ||
+    !isRecord(value.auth) ||
+    value.auth.kind !== "identity_file" ||
+    typeof value.auth.path !== "string" ||
+    !value.auth.path.startsWith("/") ||
+    /[\0\r\n]/.test(value.auth.path) ||
+    Object.keys(value.auth).length !== 2 ||
+    Object.keys(value).length !== Object.keys(expected).length ||
+    !Object.keys(expected).every(
+      (key) =>
+        key === "auth" ||
+        JSON.stringify(value[key]) === JSON.stringify(expected[key]),
+    )
+  )
+    return;
+  return value as JsonObject;
+}
+
 function ConnectionFields({
   typeId,
   config,
   onChange,
   password,
   onPasswordChange,
+  saved,
 }: {
   typeId: string;
   config: JsonObject;
   onChange: (config: JsonObject) => void;
   password: string;
   onPasswordChange: (password: string) => void;
+  saved: boolean;
 }) {
   const set = (key: string, value: string | number | null | JsonObject) =>
     onChange({ ...config, [key]: value });
@@ -791,10 +953,12 @@ function ConnectionFields({
             }
           >
             <option value="agent">
-              {auth.socketPath ? "Configured SSH agent" : "Current SSH agent"}
+              {auth.socketPath ? "Configured SSH agent" : "Current host user"}
             </option>
             <option value="identity_file">Identity file</option>
-            <option value="password">Password</option>
+            <option value="password" disabled={!saved}>
+              One-time password for key setup
+            </option>
           </select>
         </label>
         {auth.kind === "identity_file" ? (
@@ -815,9 +979,7 @@ function ConnectionFields({
         ) : null}
         {auth.kind === "password" ? (
           <label>
-            {auth.credentialRefId
-              ? "Replacement SSH password (optional)"
-              : "SSH password"}
+            One-time SSH password (optional for an existing password)
             <input
               aria-label="SSH password"
               type="password"
@@ -827,14 +989,14 @@ function ConnectionFields({
               onChange={(event) => onPasswordChange(event.target.value)}
             />
             <span className="hardware-muted">
-              {auth.credentialRefId
-                ? "Password saved on CloudX host"
-                : "Saved privately on the CloudX host. Hardware stores only a reference."}
+              Used only for testing or installing an SSH key. New passwords are
+              kept in memory and are not saved to disk.
             </span>
             {auth.credentialRefId ? (
               <span className="hardware-muted">
-                Leave blank to keep the saved password. Enter a replacement to
-                change it.
+                {String(auth.credentialRefId).startsWith("ssh-registration-")
+                  ? "Leave blank to use the staged password until it expires."
+                  : "Leave blank to use the existing password. It can be removed after switching to a key when no other machine or reservation needs it."}
               </span>
             ) : null}
           </label>
@@ -842,7 +1004,13 @@ function ConnectionFields({
           <p className="hardware-muted">
             {auth.socketPath
               ? "Uses the item's explicitly configured SSH agent."
-              : "Uses the SSH agent available to the CloudX server."}
+              : "Uses the SSH agent and standard identity files of the account running the CloudX server, not the browser user."}
+          </p>
+        ) : null}
+        {!saved ? (
+          <p className="hardware-muted">
+            Save this hardware item before setting up a key with a one-time
+            password.
           </p>
         ) : null}
         <label>

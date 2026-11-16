@@ -6,6 +6,6 @@ import { UartHardwareProvider } from "./UartHardwareProvider.js";
 export { SshHardwareProvider, sshHardwareDescriptor } from "./SshHardwareProvider.js";
 export { UartHardwareProvider, uartHardwareDescriptor } from "./UartHardwareProvider.js";
 
-export function createHardwareProviders(options: { pathPolicy: Pick<PathPolicy, "resolve" | "isAllowed"> }): HardwareTypeProvider<unknown>[] {
+export function createHardwareProviders(options: { pathPolicy: Pick<PathPolicy, "resolve" | "isAllowed">; managedKeysDirectory?: string }): HardwareTypeProvider<unknown>[] {
   return [new SshHardwareProvider(options), new UartHardwareProvider(options)];
 }

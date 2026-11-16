@@ -13,6 +13,7 @@ import { PathPolicy } from "../../pathPolicy.js";
 import { HardwareService } from "../HardwareService.js";
 import { SshHardwareProvider, serializeSftpPath, sshArguments } from "./SshHardwareProvider.js";
 import { BoundedProcessSet } from "./BoundedProcess.js";
+import { ManagedSshKeyStore } from "./ManagedSshKeyStore.js";
 import { transportTestContext } from "./TransportTestContext.js";
 
 const exec = promisify(execFile);
@@ -45,6 +46,9 @@ describe("SSH configuration and batch boundaries", () => {
     expect(provider.parseConfig(defaults)).toEqual(defaults);
     const args = sshArguments(provider.parseConfig(defaults));
     expect(args).toContain("StrictHostKeyChecking=accept-new");
+    expect(args).not.toContain("IdentityFile=none");
+    const effectiveDefault = await exec("/usr/bin/ssh", [...args, "-G", "--", defaults.host]);
+    expect(effectiveDefault.stdout).toContain("identityfile ~/.ssh/id_ed25519\n");
     expect(args.some(value => value.startsWith("IdentityAgent=") || value.startsWith("UserKnownHostsFile="))).toBe(false);
     const password = provider.parseConfig({ ...defaults, auth: { kind: "password", credentialRefId: "hardware-password" } });
     const effective = await exec("/usr/bin/ssh", [...sshArguments(password), "-G", "--", password.host]);
@@ -107,6 +111,22 @@ describe("SSH configuration and batch boundaries", () => {
       await new Promise<void>((resolve, reject) => agent.close(error => error ? reject(error) : resolve()));
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+
+  it("allows the account's default disk identity without requiring an SSH agent", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ssh-default-identity-"));
+    try {
+      await fs.mkdir(path.join(root, ".ssh"), { mode: 0o700 });
+      await fs.writeFile(path.join(root, ".ssh/id_ed25519"), "private fixture", { mode: 0o600 });
+      const type = new SshHardwareProvider({ pathPolicy: new PathPolicy([root]), environment: { HOME: root } });
+      const defaults = { ...config, knownHostsFile: undefined, auth: { kind: "agent" as const } };
+      expect(await type.inspectEndpoint(defaults)).toMatchObject({ ready: true, blockers: [] });
+      const explicit = { ...defaults, auth: { kind: "agent" as const, socketPath: path.join(root, "missing-agent") } };
+      expect(await type.inspectEndpoint(explicit)).toMatchObject({ ready: false });
+      expect(sshArguments(explicit)).toContain("IdentityFile=none");
+      await fs.rm(path.join(root, ".ssh/id_ed25519"));
+      expect(await type.inspectEndpoint(defaults)).toMatchObject({ ready: false, blockers: [expect.stringContaining("SSH agent or default identity")] });
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 });
 
@@ -701,6 +721,28 @@ describe.skipIf(!existsSync("/usr/sbin/sshd") || !existsSync("/usr/lib/openssh/s
     expect(await fs.readFile(path.join(directory, "authorized_keys"), "utf8")).toBe(before);
     expect(context.cleanups).toHaveLength(1);
     await expect(context.cleanups[0]!(signal())).resolves.toEqual({ state: "completed", value: null });
+  });
+
+  it("reuses a machine's managed key through native ssh-copy-id and verifies key-only login without an agent", async () => {
+    const managedKeysDirectory = path.join(directory, "managed-identities");
+    const pathPolicy = new PathPolicy([directory]);
+    const store = new ManagedSshKeyStore({ directory: managedKeysDirectory, pathPolicy });
+    const prepared = await store.getOrCreate("native-machine", transportTestContext(), 3000);
+    if (prepared.state !== "completed") throw new Error(JSON.stringify(prepared));
+    const authorized = path.join(directory, "authorized_keys");
+    const before = await fs.readFile(authorized);
+    const installed = await fs.readFile(`${prepared.value.path}.pub`);
+    await fs.appendFile(authorized, installed);
+    const type = new SshHardwareProvider({ pathPolicy, managedKeysDirectory, environment: {} });
+    const context = { ...transportTestContext(), resolveCredential: vi.fn(async () => "unused-bootstrap-password") };
+    try {
+      const result = await type.setupKey(config, { hardwareId: "native-machine", credentialRefId: "bootstrap", timeoutMs: 5000 }, context);
+      expect(result).toMatchObject({ state: "completed", value: { config: { auth: { kind: "identity_file", path: prepared.value.path } }, connectionCheck: { online: true, diagnostics: { exitCode: 0 } } } });
+      expect(await fs.readFile(authorized)).toEqual(Buffer.concat([before, installed]));
+      expect(context.resolveCredential).toHaveBeenCalledExactlyOnceWith("bootstrap");
+      expect(JSON.stringify(result)).not.toContain("unused-bootstrap-password");
+      for (const cleanup of context.cleanups) expect(await cleanup(signal())).toEqual({ state: "completed", value: null });
+    } finally { await fs.writeFile(authorized, before); }
   });
 
   it("preserves the configured private/public pair when its public key is a symlink to another basename", async () => {

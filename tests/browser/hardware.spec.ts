@@ -10,6 +10,7 @@ import { AgentHardwareContext } from "../../apps/server/src/hardware/AgentHardwa
 import { registerHardwareRoutes } from "../../apps/server/src/hardware/HardwareRoutes.js";
 import type { HardwareService } from "../../apps/server/src/hardware/HardwareService.js";
 import { HardwareSshPasswords } from "../../apps/server/src/hardware/HardwareSshPasswords.js";
+import { ConfigSecretStore } from "../../apps/server/src/configSecretStore.js";
 import {
   HardwareBrowserService,
   operator,
@@ -128,7 +129,10 @@ test("SSH connection checks: test an edited IP and replacement password without 
   page,
 }, info) => {
   const originalRef = "ssh-password-11111111-2222-4333-8444-555555555555";
-  await sshPasswords.save(originalRef, "original fixture password");
+  await new ConfigSecretStore(root).update({
+    global: {},
+    plugins: { hardware: { [originalRef]: "original fixture password" } },
+  });
   await lab.mutate("hardware.items.update", {
     hardwareId: lab.ssh.id,
     expectedItemRevision: lab.ssh.revision,
@@ -196,21 +200,9 @@ test("SSH connection checks: test an edited IP and replacement password without 
       "11-ssh-draft-connection",
       "SSH connection test",
     );
-    await button(page, "Save hardware").click();
-    await expect(button(page, "Select Atlas SSH")).toBeVisible();
-    const saved = (await lab.service.snapshot(operator)).items.find(
-      (value) => value.item.id === lab.ssh.id,
-    )!.item;
-    expect(saved.config.host).toBe("192.0.2.42");
-    expect(
-      (saved.config.auth as { credentialRefId: string }).credentialRefId,
-    ).toBe(testedRef);
-    await button(page, "Select Atlas SSH").click();
-    await button(page, "Edit hardware").click();
-    await expect(label(page, "SSH password")).toHaveValue("");
-    await button(page, "Test connection").click();
-    await expect.poll(() => lab.connectionChecks.length).toBe(2);
-    expect(lab.connectionChecks[1]!.auth).toEqual(saved.config.auth);
+    await expect(button(page, "Save hardware")).toBeDisabled();
+    expect(testedRef).toMatch(/^ssh-registration-/);
+    expect(lab.keySetups).toHaveLength(0);
     expect(JSON.stringify(actions)).not.toContain("fixture password");
     expect(JSON.stringify(await lab.service.snapshot(operator))).not.toContain(
       "fixture password",
@@ -364,7 +356,7 @@ test("SSH connection checks: a lost response inspects the original test without 
   expect(lab.connectionChecks).toHaveLength(1);
 });
 
-for (const actionButton of ["Test connection", "Save hardware"]) {
+for (const actionButton of ["Test connection", "Set up SSH key"]) {
   test(`SSH connection checks: ${actionButton} cannot dispatch after disconnect during password storage`, async ({
     page,
   }) => {
@@ -443,11 +435,11 @@ test("SSH authentication: default agent needs no socket or known-hosts path", as
   expect(item.config.knownHostsFile).toBeUndefined();
 });
 
-test("SSH authentication: password saves only an opaque reference and is never restored into a draft", async ({
+test("SSH authentication: one-time setup verifies a key for the edited endpoint before explicit save", async ({
   page,
 }, info) => {
   const writes: string[] = [];
-  const actions: unknown[] = [];
+  const actions: { action: string; input: Record<string, unknown> }[] = [];
   page.on("request", (request) => {
     if (
       request.method() === "PUT" &&
@@ -460,89 +452,127 @@ test("SSH authentication: password saves only an opaque reference and is never r
     )
       actions.push(request.postDataJSON());
   });
-  await newSsh(page, "Password SSH");
+  await newSsh(page, "Key setup SSH");
   await expect(
     label(page, "SSH authentication").locator('option[value="password"]'),
-  ).toHaveCount(1, { timeout: 2000 });
+  ).toHaveAttribute("disabled", "");
+  await expect(
+    page.getByText(
+      "Save this hardware item before setting up a key with a one-time password.",
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await button(page, "Save hardware").click();
+  await expect(button(page, "Select Key setup SSH")).toBeVisible();
+  await button(page, "Select Key setup SSH").click();
+  await button(page, "Edit hardware").click();
   await label(page, "SSH authentication").selectOption("password");
-  await label(page, "SSH password").fill("fixture password only");
+  await label(page, "SSH password").fill("discarded fixture password");
   await label(page, "SSH authentication").selectOption("agent");
   await label(page, "SSH authentication").selectOption("password");
   await expect(label(page, "SSH password")).toHaveValue("");
-  await label(page, "SSH password").fill("fixture password only");
+  await label(page, "SSH password").fill("discarded fixture password");
   await button(page, "Back to inventory").click();
-  await button(page, "Add hardware").click();
-  await expect(label(page, "SSH password")).toHaveValue("");
-  await label(page, "SSH password").fill("fixture password only");
-  await button(page, "Save hardware").click();
-  await expect(button(page, "Select Password SSH")).toBeVisible();
-  const snapshot = await lab.service.snapshot(operator);
-  const config = snapshot.items.find(
-    (value) => value.item.name === "Password SSH",
-  )!.item.config;
-  expect(config.auth).toMatchObject({
-    kind: "password",
-    credentialRefId: expect.stringMatching(/^ssh-password-/),
-  });
-  expect(JSON.stringify(snapshot)).not.toContain("fixture password only");
-  await button(page, "Select Password SSH").click();
   await button(page, "Edit hardware").click();
   await expect(label(page, "SSH password")).toHaveValue("");
-  await expect(
-    page.getByText("Password saved on CloudX host", { exact: true }),
-  ).toBeVisible();
-  await label(page, "SSH password").fill("discarded replacement fixture");
-  const savedItem = (await lab.service.snapshot(operator)).items.find(
-    (value) => value.item.name === "Password SSH",
-  )!.item;
-  await lab.mutate("hardware.items.update", {
-    hardwareId: savedItem.id,
-    expectedItemRevision: savedItem.revision,
-    patch: { description: "Updated externally" },
+  await label(page, "SSH host").fill("192.0.2.44");
+  await label(page, "SSH password").fill("bootstrap fixture password");
+  await expect(button(page, "Save hardware")).toBeDisabled();
+  let release!: () => void;
+  lab.keySetupGate = new Promise<void>((resolve) => {
+    release = resolve;
   });
-  await button(page, "Discard draft and load current item").click();
-  await expect(label(page, "SSH password")).toHaveValue("");
-  await screenshot(page, info, "08-ssh-password-editor", "SSH password");
-  await label(page, "Hardware description").fill("Password reference retained");
-  await button(page, "Save hardware").click();
-  await expect(button(page, "Select Password SSH")).toBeVisible();
-  expect(writes).toHaveLength(1);
-  await button(page, "Select Password SSH").click();
+  try {
+    await button(page, "Set up SSH key").click();
+    await expect.poll(() => lab.keySetups.length).toBe(1);
+    await expect(button(page, "Setting up SSH key…")).toBeDisabled();
+    await expect(label(page, "SSH host")).toBeDisabled();
+    expect(lab.keySetups[0]!.host).toBe("192.0.2.44");
+    const setup = actions.find(
+      (value) => value.action === "hardware.ssh.setupKey",
+    )!;
+    expect(setup.input.credentialRefId).toMatch(/^ssh-registration-/);
+    const before = (await lab.service.snapshot(operator)).items.find(
+      (value) => value.item.name === "Key setup SSH",
+    )!.item;
+    expect(before.config.auth).toEqual({ kind: "agent" });
+    expect(before.config.host).toBe("password.example");
+    release();
+    await expect(label(page, "SSH connection test")).toContainText(
+      "SSH key installed and login verified. Save hardware to use it.",
+    );
+    await expect(label(page, "SSH authentication")).toHaveValue(
+      "identity_file",
+    );
+    await expect(label(page, "Identity file reference")).toHaveValue(
+      `${lab.root}/managed-ssh-key`,
+    );
+    await screenshot(
+      page,
+      info,
+      "08-ssh-key-editor",
+      "Identity file reference",
+    );
+    await button(page, "Save hardware").click();
+    await expect(button(page, "Select Key setup SSH")).toBeVisible();
+    const saved = (await lab.service.snapshot(operator)).items.find(
+      (value) => value.item.id === before.id,
+    )!.item;
+    expect(saved.config.host).toBe("192.0.2.44");
+    expect(saved.config.auth).toEqual({
+      kind: "identity_file",
+      path: `${lab.root}/managed-ssh-key`,
+    });
+    await button(page, "Select Key setup SSH").click();
+    await button(page, "Edit hardware").click();
+    await button(page, "Test connection").click();
+    await expect(label(page, "SSH connection test")).toContainText(
+      "Connection succeeded",
+    );
+    expect(lab.connectionChecks.at(-1)!.auth).toEqual(saved.config.auth);
+    expect(writes).toHaveLength(1);
+    expect(JSON.stringify(actions)).not.toContain("fixture password");
+    expect(JSON.stringify(await lab.service.snapshot(operator))).not.toContain(
+      "fixture password",
+    );
+    const secrets = await fs
+      .readFile(path.join(root, "secrets/config-secrets.json"), "utf8")
+      .catch((error) => {
+        if (error.code === "ENOENT") return "";
+        throw error;
+      });
+    expect(secrets).not.toContain("bootstrap fixture password");
+  } finally {
+    release?.();
+  }
+});
+
+test("SSH authentication: failed key setup keeps the original configuration and prevents password save", async ({
+  page,
+}) => {
+  lab.keySetupOutcome = {
+    state: "failed",
+    effects: "none",
+    error: {
+      code: "AUTHENTICATION_FAILED",
+      message: "The one-time password was rejected.",
+    },
+  };
+  await button(page, "Select Atlas SSH").click();
   await button(page, "Edit hardware").click();
-  await label(page, "SSH password").fill("replacement fixture only");
-  await button(page, "Save hardware").click();
-  await expect(button(page, "Select Password SSH")).toBeVisible();
-  expect(writes).toHaveLength(2);
-  expect(lab.registrations).toHaveLength(0);
-  expect(new Set(writes).size).toBe(2);
-  const replaced = (await lab.service.snapshot(operator)).items.find(
-    (value) => value.item.name === "Password SSH",
-  )!.item;
-  expect(replaced.config.auth).not.toEqual(config.auth);
-  await openAccess(page, "Password SSH");
-  expect(lab.connections).toContainEqual({
-    authKind: "password",
-    credentialRefId: (replaced.config.auth as { credentialRefId: string })
-      .credentialRefId,
-  });
-  await expect(button(page, "Register SSH key…")).toBeDisabled();
-  await button(page, "Close access").click();
-  await expect(button(page, "Register SSH key…")).toBeEnabled();
-  await button(page, "Register SSH key…").click();
-  await expect(label(page, "SSH registration password")).toHaveValue("");
-  await button(page, "Register key").click();
-  await expect(
-    page.getByRole("dialog", { name: "Register SSH key" }),
-  ).toHaveCount(0);
-  await expect(
-    page.getByRole("article", { name: "Operation receipt" }),
-  ).toContainText("succeeded");
-  expect(writes).toHaveLength(2);
-  expect(JSON.stringify(actions)).not.toContain("fixture password only");
-  expect(JSON.stringify(actions)).not.toContain("fixture only");
-  expect(JSON.stringify(await lab.service.snapshot(operator))).not.toContain(
-    "fixture only",
+  await label(page, "SSH authentication").selectOption("password");
+  await label(page, "SSH password").fill("rejected setup fixture");
+  await button(page, "Set up SSH key").click();
+  await expect(label(page, "SSH connection test")).toContainText(
+    "The one-time password was rejected.",
   );
+  await expect(button(page, "Save hardware")).toBeDisabled();
+  await expect(label(page, "SSH authentication")).toHaveValue("password");
+  const current = (await lab.service.snapshot(operator)).items.find(
+    (value) => value.item.id === lab.ssh.id,
+  )!.item;
+  expect(current.config.auth).toEqual({ kind: "agent" });
+  expect(lab.keySetups).toHaveLength(1);
 });
 
 test("SSH authentication: registration is explicit and available before opening access", async ({
@@ -631,20 +661,23 @@ test("SSH authentication: a lost password response retries only the same immutab
     if (writes.length === 1) await route.abort("connectionfailed");
     else await route.fulfill({ response });
   });
-  await newSsh(page, "Lost-password SSH");
+  await button(page, "Select Atlas SSH").click();
+  await button(page, "Edit hardware").click();
   await label(page, "SSH authentication").selectOption("password");
   await label(page, "SSH password").fill("lost-response fixture");
-  await button(page, "Save hardware").click();
+  await button(page, "Test connection").click();
   await expect(page.getByRole("alert")).toContainText(
-    "password save response was lost",
+    "one-time password response was lost",
   );
   await expect(label(page, "SSH password")).toHaveValue(
     "lost-response fixture",
   );
   expect(actions).toHaveLength(0);
   expect(writes).toHaveLength(1);
-  await button(page, "Save hardware").click();
-  await expect(button(page, "Select Lost-password SSH")).toBeVisible();
+  await button(page, "Test connection").click();
+  await expect(label(page, "SSH connection test")).toContainText(
+    "Connection succeeded",
+  );
   expect(writes).toHaveLength(2);
   expect(new Set(writes).size).toBe(1);
   expect(actions).toHaveLength(1);
@@ -662,21 +695,26 @@ test("SSH authentication: a confirmed password reference survives an item valida
     )
       writes.push(request.url());
   });
-  await newSsh(page, "Staged-password SSH");
+  await button(page, "Select Atlas SSH").click();
+  await button(page, "Edit hardware").click();
   await label(page, "SSH host").fill("bad host");
   await label(page, "SSH authentication").selectOption("password");
   await label(page, "SSH password").fill("staged fixture only");
-  await button(page, "Save hardware").click();
+  await button(page, "Test connection").click();
   await expect(page.getByRole("alert")).toContainText(
     "SSH configuration /host",
   );
   await expect(label(page, "SSH password")).toHaveValue("");
   await expect(
-    page.getByText("Password saved on CloudX host", { exact: true }),
+    page.getByText("Leave blank to use the staged password until it expires.", {
+      exact: true,
+    }),
   ).toBeVisible();
   await label(page, "SSH host").fill("valid.example");
-  await button(page, "Save hardware").click();
-  await expect(button(page, "Select Staged-password SSH")).toBeVisible();
+  await button(page, "Test connection").click();
+  await expect(label(page, "SSH connection test")).toContainText(
+    "Connection succeeded",
+  );
   expect(writes).toHaveLength(1);
 });
 

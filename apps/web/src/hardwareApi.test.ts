@@ -4,19 +4,20 @@ import {
   getHardwareReceipt,
   getHardwareState,
   hardwareRequestId,
-  saveHardwareSshPassword,
+  stageHardwareSshPassword,
 } from "./hardwareApi.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe("SSH password transport", () => {
-  const credentialRefId = "ssh-password-123e4567-e89b-42d3-a456-426614174000";
+describe("One-time SSH password transport", () => {
+  const credentialRefId =
+    "ssh-registration-123e4567-e89b-42d3-a456-426614174000";
 
   it("writes a password only to its immutable credential endpoint", async () => {
     const fetch = vi.fn().mockResolvedValue(response({ credentialRefId }));
     vi.stubGlobal("fetch", fetch);
     await expect(
-      saveHardwareSshPassword(credentialRefId, "test-only password"),
+      stageHardwareSshPassword(credentialRefId, "test-only password"),
     ).resolves.toEqual({ credentialRefId });
     expect(fetch).toHaveBeenCalledExactlyOnceWith(
       `/api/hardware/ssh-passwords/${credentialRefId}`,
@@ -33,7 +34,7 @@ describe("SSH password transport", () => {
     const fetch = vi.fn().mockRejectedValue(new TypeError("Response lost"));
     vi.stubGlobal("fetch", fetch);
     await expect(
-      saveHardwareSshPassword(credentialRefId, "test-only password"),
+      stageHardwareSshPassword(credentialRefId, "test-only password"),
     ).rejects.toMatchObject({
       code: "OUTCOME_UNKNOWN",
       requestId: credentialRefId,
@@ -47,7 +48,7 @@ describe("SSH password transport", () => {
       vi.fn().mockResolvedValue(response({ credentialRefId: "other" })),
     );
     await expect(
-      saveHardwareSshPassword(credentialRefId, "test-only password"),
+      stageHardwareSshPassword(credentialRefId, "test-only password"),
     ).rejects.toMatchObject({
       code: "OUTCOME_UNKNOWN",
       requestId: credentialRefId,
@@ -70,8 +71,20 @@ describe("SSH password transport", () => {
       ),
     );
     await expect(
-      saveHardwareSshPassword(credentialRefId, "test-only password"),
+      stageHardwareSshPassword(credentialRefId, "test-only password"),
     ).rejects.toMatchObject({ code: "CREDENTIAL_CONFLICT" });
+  });
+
+  it("rejects a persistent password reference before transmitting a secret", async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    await expect(
+      stageHardwareSshPassword(
+        "ssh-password-123e4567-e89b-42d3-a456-426614174000",
+        "test-only password",
+      ),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 const response = (value: unknown, status = 200) =>

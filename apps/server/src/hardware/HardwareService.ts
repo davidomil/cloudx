@@ -18,6 +18,7 @@ export interface HardwareServiceOptions {
   pathPolicy?: PathPolicy;
   resolveCredential?: (id: string) => Promise<string>;
   discardCredential?: (id: string) => Promise<void>;
+  discardSavedPassword?: (id: string) => Promise<void>;
   ownerState?: (owner: HardwareOwner) => "active" | "confirmed_ended" | "unknown" | Promise<"active" | "confirmed_ended" | "unknown">;
   retention?: Partial<HardwareRetentionSettings>;
 }
@@ -25,8 +26,8 @@ interface Endpoint { provider?: HardwareTypeProvider<unknown>; config?: unknown;
 interface Inventory { endpoints: Map<string, Endpoint>; groupKeys: Map<string, string[]>; conflictingGroups: Set<string> }
 interface Task { ref?: ReservationRef; hardwareId: string; controller: AbortController; promise: Promise<void> }
 interface Access { generation: number; connection?: HardwareConnection; cleanup: Array<(signal: AbortSignal) => Promise<ProviderOutcome<null>>> }
-interface ConnectionCheckWork { runId: string; generation: number; item: HardwareItem; candidate: HardwareItem; resourceKeys: string[]; draft: boolean; scheduled: boolean }
-interface ConnectionCheckRun { cleanup: Access["cleanup"]; outcome?: ProviderOutcome<HardwareConnectionResult> }
+interface ConnectionCheckWork { runId: string; generation: number; item: HardwareItem; candidate: HardwareItem; resourceKeys: string[]; draft: boolean; scheduled: boolean; keySetup?: { credentialRefId: string; timeoutMs: number } }
+interface ConnectionCheckRun { cleanup: Access["cleanup"]; outcome?: ProviderOutcome<HardwareConnectionResult>; keyConfig?: JsonObject }
 type ScheduledCheck = { item: HardwareItem; resourceKeys: string[]; observedAt: number } & ({ kind: "connection" } | { kind: "statuses"; statusIds: string[] });
 interface RevokedCleanup {
   runId: string; hardwareId: string; priorRef?: ReservationRef; currentRef?: ReservationRef; checkRunId?: string;
@@ -43,6 +44,12 @@ const json = (value: unknown): JsonObject => JSON.parse(JSON.stringify(value)) a
 const refOf = (claim: ReservationRef): ReservationRef => ({ reservationId: claim.reservationId, generation: claim.generation });
 const publicClaim = (record: HardwareReservationRecord): HardwareReservation => { const { acquiredItem: _item, preparationRunId: _prepare, releaseRunId: _release, recoveryCause: _cause, ...claim } = record; return clone(claim); };
 const failure = (code: string, message: string): ProviderOutcome<JsonObject> => ({ state: "failed", effects: "none", error: { code, message } });
+const savedPassword = (item?: HardwareItem): string | undefined => {
+  const auth = item?.typeId === "hardware.ssh" ? item.config.auth : undefined;
+  return isRecord(auth) && auth.kind === "password" && typeof auth.credentialRefId === "string" && auth.credentialRefId.startsWith("ssh-password-") ? auth.credentialRefId : undefined;
+};
+const referencesCredential = (value: unknown, reference: string): boolean => value === reference || (Array.isArray(value) ? value.some(child => referencesCredential(child, reference)) : isRecord(value) && Object.values(value).some(child => referencesCredential(child, reference)));
+const itemUsesCredential = (item: HardwareItem, reference: string): boolean => referencesCredential([item.config, item.hooks, item.statuses], reference);
 
 export class HardwareService {
   private readonly store: HardwareStore;
@@ -151,6 +158,7 @@ export class HardwareService {
     if (action === "hardware.forceRelease") return this.override(input, owner);
     if (action === "hardware.statuses.refresh") return this.refresh(input, owner);
     if (action === "hardware.connection.check") return this.checkConnection(input, owner);
+    if (action === "hardware.ssh.setupKey") return this.checkConnection(input, owner, "key_setup");
     if (action === "hardware.ssh.registerKey") return this.registerSshKey(input, owner);
     if (["hardware.access.open", "hardware.access.invoke", "hardware.access.close"].includes(action)) return this.accessAction(action, input, owner);
     if (/^hardware\.(items|tags|groups|statuses)\.(create|update|delete|set)$/.test(action)) return this.manage(action, input, owner);
@@ -159,18 +167,41 @@ export class HardwareService {
 
   private async manage(action: string, input: Record<string, unknown>, owner: HardwareOwner): Promise<HardwareMutationResult> {
     requireHardware(owner.kind === "user", "FORBIDDEN", "Hardware catalog and configuration changes belong to the user.");
-    return this.change(async next => {
+    let replacedPassword: string | undefined;
+    const result = await this.change(async next => {
       const admitted = this.admit(next, action, input, owner);
       if (admitted.existing) return { receipt: admitted.record.receipt };
       const receipt = admitted.record.receipt;
       let result: unknown;
-      if (action.startsWith("hardware.items.")) result = { item: await this.manageItem(next, action, input) };
+      if (action.startsWith("hardware.items.")) {
+        const previous = next.items.find(item => item.id === input.hardwareId);
+        const password = savedPassword(previous);
+        const item = await this.manageItem(next, action, input);
+        if (password && password !== savedPassword(item ?? undefined)) replacedPassword = password;
+        result = { item };
+      }
       else if (action === "hardware.statuses.set") result = { item: this.setManualStatus(next, input) };
       else result = this.manageCatalog(next, action, input);
       receipt.state = "succeeded"; receipt.finishedAt = now(); receipt.result = json(result);
       this.addHistory(next, action, "Hardware configuration updated.", owner);
       return { receipt };
     });
+    if (!replacedPassword || !this.options.discardSavedPassword) return result;
+    return this.change(async next => {
+      const receipt = next.receipts.find(record => record.receipt.runId === result.receipt.runId)!.receipt;
+      const referenced = next.items.some(item => itemUsesCredential(item, replacedPassword!)) || next.reservations.some(claim => itemUsesCredential(claim.acquiredItem, replacedPassword!));
+      const activeCredentials = next.checkHolds.length > 0 || next.reservations.some(claim => claim.activeOperationIds.length > 0 || claim.state === "recovery_required");
+      let retirement: JsonObject = { state: "retained", reason: "An item, script or unfinished hardware operation can still need this password." };
+      if (!referenced && !activeCredentials) {
+        try { await this.options.discardSavedPassword!(replacedPassword!); retirement = { state: "removed" }; }
+        catch {
+          retirement = { state: "failed", reason: "Key authentication was saved, but the old password could not be removed from private storage." };
+          this.addHistory(next, "credential_discard_failed", retirement.reason as string, owner);
+        }
+      }
+      if (receipt.result) receipt.result.passwordRetirement = retirement;
+      return { receipt };
+    }, true);
   }
 
   private async manageItem(next: HardwareStoredState, action: string, input: Record<string, unknown>): Promise<HardwareItem | null> {
@@ -180,6 +211,7 @@ export class HardwareService {
       const raw = clone(draft);
       if (input.newGroupName !== undefined) { const group = { id: `group-${randomUUID()}`, revision: 1, name: hardwareInput(() => hardwareText(input.newGroupName, "Group name", 200)).trim() }; this.uniqueLabel(next.groups, group.name, undefined, record => record.name); next.groups.push(group); raw.physicalResourceId = group.id; }
       const item = hardwareInput(() => parseHardwareItem({ ...raw, id: `hardware-${randomUUID()}`, revision: 1, notesRevision: 1 }));
+      this.requireDurableSshAuthentication(item);
       this.validateItemReferences(next, item); this.provider(item);
       await this.validateItemScripts(item);
       next.items.push(item); this.manualObservations(next, item);
@@ -208,6 +240,7 @@ export class HardwareService {
     const changesIdentity = ["physicalResourceId", "typeId", "configVersion", "config"].some(key => Object.hasOwn(patch, key) && canonical(patch[key]) !== canonical(item[key as keyof HardwareItem]));
     if (changesIdentity || ["statuses", "hooks"].some(key => Object.hasOwn(patch, key) && canonical(patch[key]) !== canonical(item[key as keyof HardwareItem]))) this.requireNoHold(next, oldKeys);
     const updated = hardwareInput(() => parseHardwareItem({ ...item, ...patch, revision: item.revision + 1, notesRevision: item.notesRevision + (patch.notes !== undefined && patch.notes !== item.notes ? 1 : 0) }));
+    this.requireDurableSshAuthentication(updated);
     for (const binding of updated.statuses) {
       const previous = item.statuses.find(previous => previous.definitionId === binding.definitionId);
       if (!previous) continue;
@@ -221,6 +254,11 @@ export class HardwareService {
     requireHardware(!changesIdentity || !prospective.conflictingGroups.has(updated.physicalResourceId), "ENDPOINT_CONFLICT", "An endpoint belongs to another physical group.");
     if (updated.physicalResourceId !== item.physicalResourceId) this.requireNoHold(next, prospective.groupKeys.get(updated.physicalResourceId)!);
     this.manualObservations(next, updated); return updated;
+  }
+
+  private requireDurableSshAuthentication(item: HardwareItem): void {
+    const auth = item.config.auth;
+    requireHardware(item.typeId !== "hardware.ssh" || !isRecord(auth) || auth.kind !== "password" || typeof auth.credentialRefId !== "string" || !auth.credentialRefId.startsWith("ssh-registration-"), "INVALID_INPUT", "A one-time SSH setup password cannot be saved as machine authentication. Set up its SSH key first.");
   }
 
   private manageCatalog(next: HardwareStoredState, action: string, input: Record<string, unknown>): unknown {
@@ -510,13 +548,15 @@ export class HardwareService {
     return result;
   }
 
-  private async checkConnection(input: Record<string, unknown>, owner: HardwareOwner, scheduled = false): Promise<HardwareMutationResult | undefined> {
+  private async checkConnection(input: Record<string, unknown>, owner: HardwareOwner, mode: "manual" | "scheduled" | "key_setup" = "manual"): Promise<HardwareMutationResult | undefined> {
+    const scheduled = mode === "scheduled", setupKey = mode === "key_setup";
     requireHardware(owner.kind === "user", "FORBIDDEN", "Connection tests belong to the user.");
-    fields(input, ["requestId", "hardwareId", "expectedItemRevision", "config"]);
+    fields(input, ["requestId", "hardwareId", "expectedItemRevision", "config", ...(setupKey ? ["credentialRefId", "timeoutMs"] : [])]);
+    const timeoutMs = setupKey ? hardwareInput(() => hardwareInteger(input.timeoutMs, "SSH key setup deadline", 1, 120_000)) : undefined;
     let dispatch: ConnectionCheckWork | undefined;
     const result = await this.change(async next => {
       if (scheduled) requireHardware(this.capacity.canSchedule(next), "CAPACITY_EXCEEDED", "Hardware has no ordinary capacity for another connection check.");
-      const admitted = scheduled ? undefined : this.admit(next, "hardware.connection.check", input, owner);
+      const admitted = scheduled ? undefined : this.admit(next, setupKey ? "hardware.ssh.setupKey" : "hardware.connection.check", input, owner);
       if (admitted?.existing) return { receipt: admitted.record.receipt };
       const item = this.requireItem(next, hardwareInput(() => hardwareId(input.hardwareId)));
       this.requireRevision(item.revision, input.expectedItemRevision);
@@ -525,6 +565,14 @@ export class HardwareService {
       if (input.config !== undefined) candidate.config = clone(hardwareInput(() => hardwareRecord(input.config))) as JsonObject;
       const provider = this.provider(candidate);
       requireHardware(item.typeId === "hardware.ssh" && typeof provider.checkConnection === "function", "INVALID_INPUT", "This hardware provider does not support SSH connection checks.");
+      let keySetup: ConnectionCheckWork["keySetup"];
+      if (setupKey) {
+        requireHardware(typeof provider.setupKey === "function", "INVALID_INPUT", "This SSH provider does not support password-based key setup.");
+        const auth = hardwareInput(() => hardwareRecord(candidate.config.auth));
+        const credentialRefId = hardwareInput(() => hardwareId(input.credentialRefId ?? auth.credentialRefId, "SSH setup credential reference"));
+        requireHardware(/^ssh-(?:registration|password)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(credentialRefId), "INVALID_INPUT", "Choose a private one-time SSH setup credential.");
+        keySetup = { credentialRefId, timeoutMs: timeoutMs! };
+      }
       const current = await this.inspectInventory(next), prospectiveState = clone(next);
       prospectiveState.items[prospectiveState.items.findIndex(record => record.id === item.id)] = candidate;
       const prospective = await this.inspectInventory(prospectiveState);
@@ -535,7 +583,7 @@ export class HardwareService {
       const runId = admitted?.record.receipt.runId ?? `connection-${randomUUID()}`, generation = next.nextGeneration++;
       next.checkHolds.push({ kind: "system_check", runId, revision: 1, generation, hardwareId: item.id, resourceKeys, state: "checking", bindingRevisions: [], connectionCheck: { itemRevision: item.revision }, startedAt: now() });
       if (scheduled) requireHardware(this.capacity.canSchedule(next), "CAPACITY_EXCEEDED", "Hardware has no ordinary capacity for this connection-check hold and its cleanup.");
-      dispatch = { runId, generation, item: clone(item), candidate, resourceKeys, draft: canonical(candidate.config) !== canonical(item.config), scheduled };
+      dispatch = { runId, generation, item: clone(item), candidate, resourceKeys, draft: setupKey || canonical(candidate.config) !== canonical(item.config), scheduled, ...(keySetup ? { keySetup } : {}) };
       return admitted ? { receipt: admitted.record.receipt } : undefined;
     });
     if (dispatch) this.startConnectionCheck(dispatch);
@@ -558,14 +606,40 @@ export class HardwareService {
       prospective.items[prospective.items.findIndex(record => record.id === item.id)] = work.candidate;
       const inventory = await this.inspectInventory(prospective);
       signal.throwIfAborted(); this.currentConnectionCheck(work);
+      this.requireRevision(this.requireItem(this.state, work.item.id).revision, work.item.revision);
       requireHardware(inventory.endpoints.get(item.id)!.inspection.ready && !inventory.conflictingGroups.has(item.physicalResourceId) && inventory.groupKeys.get(item.physicalResourceId)!.every(key => work.resourceKeys.includes(key)), "INVALID_INPUT", "The SSH endpoint identity or prerequisites changed before dispatch.");
       const provider = this.provider(work.candidate), config = provider.parseConfig(work.candidate.config);
-      const timeoutMs = (work.candidate.config as unknown as SshConfig).connectTimeoutMs + 5000;
-      let outcome = await bounded<HardwareConnectionResult>(signal, timeoutMs, childSignal => provider.checkConnection!(config, {
-        signal: childSignal,
-        resolveCredential: async id => { requireHardware(this.options.resolveCredential, "CREDENTIAL_UNAVAILABLE", "The configured hardware credential cannot be resolved."); return this.options.resolveCredential(id); },
-        registerCleanup: close => { this.currentConnectionCheck(work); childSignal.throwIfAborted(); run.cleanup.push(close); },
-      }), 2500);
+      const timeoutMs = work.keySetup?.timeoutMs ?? (work.candidate.config as unknown as SshConfig).connectTimeoutMs + 5000;
+      let outcome = await bounded<HardwareConnectionResult>(signal, timeoutMs, async childSignal => {
+        if (work.keySetup) {
+          try { this.currentConnectionCheck(work); this.requireRevision(this.requireItem(this.state, work.item.id).revision, work.item.revision); }
+          catch (error) {
+            if (error instanceof HardwareError) return { state: "failed", effects: "none", error: { code: error.code, message: "The SSH item or its exclusive hold changed before key setup dispatch." } };
+            throw error;
+          }
+        }
+        const context = {
+          signal: childSignal,
+          resolveCredential: async (id: string) => { requireHardware(this.options.resolveCredential, "CREDENTIAL_UNAVAILABLE", "The configured hardware credential cannot be resolved."); return this.options.resolveCredential(id); },
+          registerCleanup: (close: Access["cleanup"][number]) => { this.currentConnectionCheck(work); childSignal.throwIfAborted(); run.cleanup.push(close); },
+        };
+        if (!work.keySetup) return provider.checkConnection!(config, context);
+        const setup = await provider.setupKey!(config, { hardwareId: item.id, ...work.keySetup }, context);
+        if (setup.state !== "completed") return setup;
+        try {
+          const value = hardwareRecord(setup.value);
+          fields(value, ["config", "connectionCheck"], "INVALID_PROVIDER_OUTPUT");
+          const keyConfig = hardwareRecord(value.config), auth = hardwareRecord(keyConfig.auth);
+          requireHardware(auth.kind === "identity_file" && typeof auth.path === "string" && auth.path.startsWith("/"), "INVALID_PROVIDER_OUTPUT", "SSH key setup must return an explicit identity file.");
+          const { auth: _before, ...before } = work.candidate.config, { auth: _after, ...after } = keyConfig;
+          requireHardware(canonical(before) === canonical(after), "INVALID_PROVIDER_OUTPUT", "SSH key setup changed settings outside authentication.");
+          provider.parseConfig(keyConfig);
+          const connection = hardwareRecord(value.connectionCheck);
+          requireHardware(connection.online === true, "INVALID_PROVIDER_OUTPUT", "SSH key setup did not confirm key-only login.");
+          run.keyConfig = json(keyConfig);
+          return { state: "completed", value: connection as unknown as HardwareConnectionResult };
+        } catch { return { state: "unknown", error: { code: "INVALID_PROVIDER_OUTPUT", message: "SSH key setup returned an invalid configuration or did not verify key-only login." } }; }
+      }, 2500);
       if (outcome.state === "completed") {
         try {
           const value = hardwareRecord(outcome.value);
@@ -593,10 +667,10 @@ export class HardwareService {
     const at = Date.now(), interval = (work.item.config as unknown as SshConfig).onlineCheckIntervalMs;
     const maxAge = interval === null ? 60_000 : Math.max(60_000, 2 * (interval ?? DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS));
     const result = outcome.state === "completed" ? outcome.value : { online: false, error: outcome.error, ...(outcome.diagnostics ? { diagnostics: outcome.diagnostics } : {}) };
-    const observation = parseHardwareConnectionObservation({ ...result, ...(result.diagnostics ? { diagnostics: connectionDiagnostics(result.diagnostics) } : {}), itemRevision: work.item.revision, checkedAt: new Date(at).toISOString(), expiresAt: new Date(at + maxAge).toISOString() });
+    let observation = parseHardwareConnectionObservation({ ...result, ...(result.diagnostics ? { diagnostics: connectionDiagnostics(result.diagnostics) } : {}), itemRevision: work.item.revision, checkedAt: new Date(at).toISOString(), expiresAt: new Date(at + maxAge).toISOString() });
     let publish = false;
     const update = (next: HardwareStoredState, receipt?: OperationReceipt) => {
-      if (receipt) receipt.result = json({ hardwareId: work.item.id, connectionCheck: observation, draft: work.draft });
+      if (receipt) receipt.result = json({ hardwareId: work.item.id, connectionCheck: observation, draft: work.draft, ...(outcome.state === "completed" && run.keyConfig ? { sshKeyConfig: run.keyConfig } : {}) });
       const hold = next.checkHolds.find(hold => hold.runId === work.runId);
       if (work.scheduled && outcome.state === "unknown" && observation.diagnostics && hold?.connectionCheck) hold.connectionCheck.diagnostics = clone(observation.diagnostics);
       if (!hold || hold.generation !== work.generation) return;
@@ -605,7 +679,19 @@ export class HardwareService {
       publish = !work.draft;
     };
     if (work.scheduled) await this.change(next => update(next), true);
-    else await this.finish(work.runId, undefined, outcome.state === "completed" ? { state: "completed", value: json(outcome.value) } : outcome, (next, _claim, receipt) => update(next, receipt));
+    else await this.finish(work.runId, undefined, next => {
+      if (work.keySetup && outcome.state === "completed") {
+        const hold = next.checkHolds.find(hold => hold.runId === work.runId && hold.generation === work.generation && hold.state === "checking");
+        const current = next.items.find(item => item.id === work.item.id);
+        if (!hold || current?.revision !== work.item.revision || !run.keyConfig) {
+          const error = { code: "SSH_KEY_SETUP_SUPERSEDED", message: "SSH key setup lost its item revision or exclusive hold. Inspect the operation before using the generated key." };
+          outcome = { state: "unknown", error, ...(observation.diagnostics ? { diagnostics: observation.diagnostics } : {}) };
+          observation = parseHardwareConnectionObservation({ ...observation, online: false, error });
+          run.outcome = outcome;
+        }
+      }
+      return outcome.state === "completed" ? { state: "completed", value: json(outcome.value) } : outcome;
+    }, (next, _claim, receipt) => update(next, receipt));
     const current = this.state.items.find(item => item.id === work.item.id);
     if (publish && current?.revision === work.item.revision && canonical(current.config) === canonical(work.candidate.config)) {
       const { diagnostics: _diagnostics, ...compact } = observation;
@@ -613,6 +699,10 @@ export class HardwareService {
       this.notifyChange();
     }
     if (!this.state.checkHolds.some(hold => hold.runId === work.runId)) this.connectionRuns.delete(work.runId);
+    if (work.keySetup?.credentialRefId.startsWith("ssh-registration-") && outcome.state !== "unknown") {
+      try { await this.options.discardCredential?.(work.keySetup.credentialRefId); }
+      catch { await this.change(next => this.addHistory(next, "credential_discard_failed", "A one-time SSH setup credential could not be discarded.", undefined, undefined, work.item.id), true); }
+    }
   }
 
   private async accessAction(action: string, input: Record<string, unknown>, owner: HardwareOwner, internal = false): Promise<HardwareMutationResult> {
@@ -1194,10 +1284,11 @@ export class HardwareService {
     this.lanes.set(group, promise);
   }
 
-  private async finish(runId: string, ref: ReservationRef | undefined, outcome: ProviderOutcome<JsonObject>, update?: (next: HardwareStoredState, claim: HardwareReservationRecord | undefined, receipt: OperationReceipt) => void): Promise<void> {
+  private async finish(runId: string, ref: ReservationRef | undefined, completion: ProviderOutcome<JsonObject> | ((next: HardwareStoredState) => ProviderOutcome<JsonObject>), update?: (next: HardwareStoredState, claim: HardwareReservationRecord | undefined, receipt: OperationReceipt) => void): Promise<void> {
     await this.change(next => {
       const records = next.receipts.filter(record => record.receipt.runId === runId && record.receipt.state === "running");
       if (!records.length) return;
+      const outcome = typeof completion === "function" ? completion(next) : completion;
       const claim = ref ? next.reservations.find(claim => sameRef(claim, ref)) : undefined;
       for (const record of records) {
         const receipt = record.receipt;
@@ -1278,7 +1369,7 @@ export class HardwareService {
       for (const check of checks) {
         if (check.resourceKeys.some(key => admittedKeys.has(key))) continue;
         try {
-          if (check.kind === "connection") await this.checkConnection({ hardwareId: check.item.id, expectedItemRevision: check.item.revision }, { kind: "user", userId: "local" }, true);
+          if (check.kind === "connection") await this.checkConnection({ hardwareId: check.item.id, expectedItemRevision: check.item.revision }, { kind: "user", userId: "local" }, "scheduled");
           else await this.refresh({ requestId: `scheduled-${randomUUID()}`, hardwareId: check.item.id, statusIds: check.statusIds }, { kind: "user", userId: "local" });
           for (const key of check.resourceKeys) admittedKeys.add(key);
         }

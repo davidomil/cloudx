@@ -82,6 +82,16 @@ const success: OperationReceipt = {
   startedAt: checked.checkedAt,
   result: { hardwareId: item.id, connectionCheck: checked, draft: true },
 };
+const keyConfig = {
+  ...item.config,
+  auth: { kind: "identity_file", path: "/home/test/.ssh/cloudx-hardware" },
+};
+const setupSuccess: OperationReceipt = {
+  ...success,
+  requestId: "setup-request",
+  runId: "setup-run",
+  result: { ...success.result, sshKeyConfig: keyConfig },
+};
 
 afterEach(async () => {
   await act(async () => roots.splice(0).forEach((root) => root.unmount()));
@@ -168,7 +178,7 @@ async function render(
 }
 
 describe("SSH draft connection checks", () => {
-  it("tests the edited host and replacement password without saving inventory, then reuses the staged reference on save", async () => {
+  it("tests an edited host with an ephemeral password and requires key setup before saving", async () => {
     const fetch = vi.fn(
       async (_url, options) =>
         new Response(
@@ -179,7 +189,7 @@ describe("SSH draft connection checks", () => {
     vi.stubGlobal("fetch", fetch);
     const ui = await render();
     expect(ui.container.textContent).toContain(
-      "Leave blank to keep the saved password",
+      "Leave blank to use the existing password",
     );
     await ui.fill("SSH host", "192.0.2.10");
     await ui.fill("SSH password", "replacement fixture only");
@@ -194,7 +204,7 @@ describe("SSH draft connection checks", () => {
         host: "192.0.2.10",
         auth: {
           kind: "password",
-          credentialRefId: expect.stringMatching(/^ssh-password-/),
+          credentialRefId: expect.stringMatching(/^ssh-registration-/),
         },
       },
     });
@@ -210,10 +220,199 @@ describe("SSH draft connection checks", () => {
     expect(ui.props().onSaved).not.toHaveBeenCalled();
     await ui.submit();
     expect(fetch).toHaveBeenCalledTimes(1);
-    expect(ui.run.mock.calls[1]?.[0]).toBe("hardware.items.update");
-    expect(ui.run.mock.calls[1]?.[1].patch.config).toEqual(
-      ui.run.mock.calls[0]?.[1].config,
+    expect(ui.run).toHaveBeenCalledTimes(1);
+    expect(ui.button("Save hardware").disabled).toBe(true);
+    expect(ui.container.textContent).toContain(
+      "Set up an SSH key before saving",
     );
+  });
+
+  it("installs a key for the unsaved endpoint and saves only the verified identity after an explicit save", async () => {
+    const editedConfig = { ...keyConfig, host: "192.0.2.10" };
+    const run = vi.fn().mockResolvedValue({
+      ...setupSuccess,
+      result: { ...setupSuccess.result, sshKeyConfig: editedConfig },
+    });
+    const ui = await render({ run });
+    await ui.fill("SSH host", "192.0.2.10");
+    await ui.click("Set up SSH key");
+    expect(run).toHaveBeenCalledExactlyOnceWith("hardware.ssh.setupKey", {
+      hardwareId: item.id,
+      expectedItemRevision: item.revision,
+      config: { ...item.config, host: "192.0.2.10" },
+      credentialRefId: "saved-password",
+      timeoutMs: 60000,
+    });
+    expect(ui.container.textContent).toContain(
+      "SSH key installed and login verified",
+    );
+    expect(ui.input("Identity file reference").value).toBe(
+      editedConfig.auth.path,
+    );
+    expect(ui.props().onSaved).not.toHaveBeenCalled();
+    await ui.submit();
+    expect(run.mock.calls[1]?.[0]).toBe("hardware.items.update");
+    expect(run.mock.calls[1]?.[1].patch.config).toEqual(editedConfig);
+  });
+
+  it("waits for setup completion and never accepts another endpoint or an unverified key result", async () => {
+    const pending = {
+      ...setupSuccess,
+      state: "running" as const,
+      result: undefined,
+    };
+    const run = vi.fn().mockResolvedValue(pending);
+    const ui = await render({ run });
+    await ui.click("Set up SSH key");
+    expect(ui.button("Setting up SSH key…").disabled).toBe(true);
+    await ui.update({
+      state: {
+        ...state,
+        receipts: [
+          {
+            ...setupSuccess,
+            result: {
+              ...setupSuccess.result,
+              sshKeyConfig: { ...keyConfig, host: "other.example" },
+            },
+          },
+        ],
+      },
+    });
+    expect(ui.container.textContent).not.toContain(
+      "SSH key installed and login verified",
+    );
+    expect(ui.button("Save hardware").disabled).toBe(true);
+    await ui.update({ state: { ...state, receipts: [setupSuccess] } });
+    expect(ui.container.textContent).toContain(
+      "SSH key installed and login verified",
+    );
+    expect(ui.button("Save hardware").disabled).toBe(false);
+  });
+
+  it.each(["failed", "unknown"] as const)(
+    "keeps password authentication unsaved after %s setup",
+    async (state) => {
+      const run = vi.fn().mockResolvedValue({
+        ...setupSuccess,
+        state,
+        error: {
+          code: "SETUP_FAILED",
+          message: "Inspect the installed key before another attempt.",
+        },
+      });
+      const ui = await render({ run });
+      await ui.click("Set up SSH key");
+      expect(ui.container.textContent).not.toContain(
+        "SSH key installed and login verified",
+      );
+      expect(ui.button("Save hardware").disabled).toBe(true);
+      expect(ui.container.textContent).toContain("Inspect the installed key");
+      await ui.submit();
+      expect(run).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([
+    { hardwareId: "other-camera" },
+    { draft: false },
+    { connectionCheck: { ...checked, itemRevision: item.revision + 1 } },
+    { connectionCheck: { ...checked, online: false } },
+    {
+      sshKeyConfig: {
+        ...keyConfig,
+        auth: { kind: "password", credentialRefId: "wrong" },
+      },
+    },
+    {
+      sshKeyConfig: {
+        ...keyConfig,
+        auth: { kind: "identity_file", path: "relative-key" },
+      },
+    },
+    { sshKeyConfig: { ...keyConfig, username: "another-user" } },
+  ])(
+    "keeps an unverified setup result out of the draft (%j)",
+    async (result) => {
+      const run = vi.fn().mockResolvedValue({
+        ...setupSuccess,
+        result: { ...setupSuccess.result, ...result },
+      });
+      const ui = await render({ run });
+      await ui.click("Set up SSH key");
+      expect(ui.button("Save hardware").disabled).toBe(true);
+      expect(ui.container.textContent).not.toContain(
+        "SSH key installed and login verified",
+      );
+    },
+  );
+
+  it("does not apply a setup result after a different item revision arrives", async () => {
+    const run = vi.fn().mockResolvedValue({
+      ...setupSuccess,
+      state: "running",
+      result: undefined,
+    });
+    const ui = await render({ run });
+    await ui.click("Set up SSH key");
+    await ui.update({
+      item: { ...item, revision: item.revision + 1 },
+      state: { ...state, receipts: [setupSuccess] },
+    });
+    expect(ui.container.textContent).not.toContain(
+      "SSH key installed and login verified",
+    );
+    expect(ui.button("Save hardware").disabled).toBe(true);
+  });
+
+  it.each(["retained", "failed"] as const)(
+    "shows %s password cleanup after saving the verified key",
+    async (state) => {
+      const run = vi
+        .fn()
+        .mockResolvedValueOnce(setupSuccess)
+        .mockResolvedValueOnce({
+          ...success,
+          result: {
+            passwordRetirement: {
+              state,
+              reason: "Another saved machine still uses this credential.",
+            },
+          },
+        });
+      const ui = await render({ run });
+      await ui.click("Set up SSH key");
+      await ui.submit();
+      expect(ui.props().onSaved).not.toHaveBeenCalled();
+      expect(
+        ui.container.querySelector('[role="dialog"]')?.textContent,
+      ).toContain("The hardware now uses the SSH key.");
+      expect(
+        ui.container.querySelector('[role="dialog"]')?.textContent,
+      ).toContain("Another saved machine still uses this credential.");
+      expect(
+        ui.container.querySelector('[role="dialog"]')?.textContent,
+      ).toContain(
+        state === "retained" ? "was retained" : "could not be removed",
+      );
+      await ui.click("Done");
+      expect(ui.props().onSaved).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("closes after a key save confirms removal of the previous password", async () => {
+    const run = vi
+      .fn()
+      .mockResolvedValueOnce(setupSuccess)
+      .mockResolvedValueOnce({
+        ...success,
+        result: { passwordRetirement: { state: "removed" } },
+      });
+    const ui = await render({ run });
+    await ui.click("Set up SSH key");
+    await ui.submit();
+    expect(ui.props().onSaved).toHaveBeenCalledOnce();
+    expect(ui.container.querySelector('[role="dialog"]')).toBeNull();
   });
 
   it("keeps an accepted receipt pending until a terminal observation arrives and invalidates a result after edits", async () => {
@@ -383,13 +582,24 @@ describe("SSH draft connection checks", () => {
     );
     expect(ui.input("Enable automatic SSH login checks").checked).toBe(true);
     expect(ui.input("SSH login check interval").value).toBe("60");
+    expect(
+      ui.container.querySelector<HTMLOptionElement>('option[value="password"]')!
+        .disabled,
+    ).toBe(true);
+    expect(ui.container.textContent).toContain(
+      "Save this hardware item before setting up a key with a one-time password.",
+    );
     expect(ui.run).not.toHaveBeenCalled();
   });
 
   it("saves explicit automatic interval changes and null disable without changing the default on an untouched save", async () => {
-    const ui = await render();
+    const agentItem = {
+      ...item,
+      config: { ...item.config, auth: { kind: "agent" } },
+    };
+    const ui = await render({ item: agentItem });
     await ui.submit();
-    expect(ui.run.mock.calls[0]?.[1].patch.config).toEqual(item.config);
+    expect(ui.run.mock.calls[0]?.[1].patch.config).toEqual(agentItem.config);
     await ui.fill("SSH login check interval", "120");
     await ui.submit();
     expect(ui.run.mock.calls[1]?.[1].patch.config.onlineCheckIntervalMs).toBe(
@@ -451,7 +661,7 @@ describe("SSH draft connection checks", () => {
 
   it.each([
     { operation: "testing", action: "hardware.connection.check" },
-    { operation: "saving", action: "hardware.items.update" },
+    { operation: "setup", action: "hardware.ssh.setupKey" },
   ])(
     "uses the latest parent admission after password storage before $operation",
     async ({ operation, action }) => {
@@ -469,7 +679,7 @@ describe("SSH draft connection checks", () => {
       const ui = await render();
       await ui.fill("SSH password", "deferred fixture only");
       if (operation === "testing") await ui.click("Test connection");
-      else await ui.submit();
+      else await ui.click("Set up SSH key");
       expect(ui.run).not.toHaveBeenCalled();
 
       const disconnectedRun = vi.fn().mockResolvedValue(undefined);

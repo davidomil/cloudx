@@ -9,6 +9,7 @@ import { DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES, DEFAULT_VOICE_AUDIO_UPLOAD_MAX_
 import { DEFAULT_ASR_TIMEOUT_MS } from "../asrClient.js";
 import { DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES } from "../documentation/DocumentationClient.js";
 import { buildServer, buildServices, type AppServices } from "../server.js";
+import { ConfigSecretStore } from "../configSecretStore.js";
 
 const fixtures: { root: string; app: FastifyInstance }[] = [];
 afterEach(async () => {
@@ -16,7 +17,7 @@ afterEach(async () => {
   for (const { app, root } of fixtures.splice(0)) { await app.close(); await fs.rm(root, { recursive: true, force: true }); }
 });
 
-async function fixture(beforeStart?: (services: AppServices) => Promise<void>): Promise<{ root: string; app: FastifyInstance; services: AppServices }> {
+async function fixture(beforeStart?: (services: AppServices, dataDir: string) => Promise<void>): Promise<{ root: string; app: FastifyInstance; services: AppServices }> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-hardware-composition-"));
   const config: AppConfig = {
     host: "127.0.0.1", port: 3001, trustedOrigins: ["http://127.0.0.1:3001", "http://localhost"], logLevel: "silent", allowedRoots: [root],
@@ -26,7 +27,7 @@ async function fixture(beforeStart?: (services: AppServices) => Promise<void>): 
     documentationUploadMaxBytes: DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES
   };
   const services = buildServices(config);
-  await beforeStart?.(services);
+  await beforeStart?.(services, config.dataDir);
   const app = await buildServer(config, services);
   fixtures.push({ root, app });
   return { root, app, services };
@@ -162,7 +163,7 @@ describe("Hardware production composition", () => {
     ]) {
       for (const request of [
         { method: "GET" as const, url: "/api/hardware/state" },
-        { method: "PUT" as const, url: `/api/hardware/ssh-passwords/ssh-password-${randomUUID()}`, payload: { password: "private-password-marker" } },
+        { method: "PUT" as const, url: `/api/hardware/ssh-passwords/ssh-registration-${randomUUID()}`, payload: { password: "private-password-marker" } },
         { method: "POST" as const, url: "/api/hardware/actions", payload: { action: "hardware.tags.create", input: { requestId: randomUUID(), label: "Forbidden" } } },
         { method: "POST" as const, url: "/api/hardware/agent", payload: { action: "hardware.items.list", tabId: "fake", executionId: "fake", input: {} } }
       ]) {
@@ -175,16 +176,21 @@ describe("Hardware production composition", () => {
     expect(after.tags).toEqual([]);
   });
 
-  it("uses one private password store for production routes and removes interrupted registration credentials on startup", async () => {
+  it("stages route passwords only in memory, preserves legacy login reads, and clears interrupted setup credentials on startup", async () => {
     const persistent = `ssh-password-${randomUUID()}`;
     const interrupted = `ssh-registration-${randomUUID()}`;
-    const { app, root, services } = await fixture(async services => {
-      await services.hardwarePasswords!.save(persistent, "private-login-marker");
+    const { app, root, services } = await fixture(async (services, dataDir) => {
+      await new ConfigSecretStore(dataDir).update({ global: {}, plugins: { hardware: {
+        [persistent]: "private-login-marker", [interrupted]: "private-registration-marker"
+      } } });
       await services.hardwarePasswords!.save(interrupted, "private-registration-marker");
     });
     expect(await services.hardwarePasswords!.resolve(persistent)).toBe("private-login-marker");
     await expect(services.hardwarePasswords!.resolve(interrupted)).rejects.toMatchObject({ code: "CREDENTIAL_UNAVAILABLE" });
-    const saved = `ssh-password-${randomUUID()}`;
+    const rejected = await app.inject({ method: "PUT", url: `/api/hardware/ssh-passwords/${persistent}`, payload: { password: "rejected-login-marker" } });
+    expect(rejected.statusCode, rejected.body).toBe(400);
+    expect(await services.hardwarePasswords!.resolve(persistent)).toBe("private-login-marker");
+    const saved = `ssh-registration-${randomUUID()}`;
     const response = await app.inject({ method: "PUT", url: `/api/hardware/ssh-passwords/${saved}`, payload: { password: "private-route-marker" } });
     expect(response.statusCode, response.body).toBe(200);
     expect(response.json()).toEqual({ credentialRefId: saved });
@@ -192,15 +198,23 @@ describe("Hardware production composition", () => {
     const created = await mutation(app, "hardware.items.create", {
       newGroupName: "Password lab",
       item: { name: "Password target", description: "Private authentication fixture", enabled: true, typeId: "hardware.ssh", configVersion: 1,
-        config: { host: "127.0.0.1", port: 22223, username: "tester", auth: { kind: "password", credentialRefId: saved }, connectTimeoutMs: 1000 },
+        config: { host: "127.0.0.1", port: 22223, username: "tester", auth: { kind: "password", credentialRefId: persistent }, connectTimeoutMs: 1000 },
         tagIds: [], notes: "No real network connection is opened by this test.", statuses: [], hooks: {} }
     });
     expect(created.receipt.state).toBe("succeeded");
     const item = created.receipt.result!.item as unknown as HardwareItem;
     const provider = services.plugins.get("hardware").hardwareTypes!.find(type => type.descriptor.id === "hardware.ssh")!;
     const received: string[] = [];
-    vi.spyOn(provider, "connect").mockImplementation(async (_config, context) => {
+    vi.spyOn(provider, "checkConnection").mockImplementation(async (_config, context) => {
       received.push(await context.resolveCredential(saved));
+      context.registerCleanup(async () => ({ state: "completed", value: null }));
+      return { state: "completed", value: { online: true } };
+    });
+    const checked = await mutation(app, "hardware.connection.check", { hardwareId: item.id, expectedItemRevision: item.revision,
+      config: { ...item.config, auth: { kind: "password", credentialRefId: saved } } });
+    expect(await settled(app, checked.receipt)).toMatchObject({ state: "succeeded", result: { draft: true, connectionCheck: { online: true } } });
+    vi.spyOn(provider, "connect").mockImplementation(async (_config, context) => {
+      received.push(await context.resolveCredential(persistent));
       const close = async () => ({ state: "completed" as const, value: null });
       context.registerCleanup(close);
       return { state: "completed", value: { close, invoke: async () => ({ state: "completed", value: {} }) } };
@@ -210,11 +224,14 @@ describe("Hardware production composition", () => {
     const claim = (await services.hardware!.snapshot({ kind: "user", userId: "local" })).reservations[0]!;
     const opened = await mutation(app, "hardware.access.open", { reservationId: claim.reservationId, generation: claim.generation });
     expect((await settled(app, opened.receipt)).state).toBe("succeeded");
-    expect(received).toEqual(["private-route-marker"]);
+    expect(received).toEqual(["private-route-marker", "private-login-marker"]);
     const state = await app.inject({ method: "GET", url: "/api/hardware/state" });
     expect(state.body).not.toContain("private-route-marker");
     expect((await app.inject({ method: "GET", url: "/api/config" })).body).not.toContain("private-route-marker");
     expect(await fs.readFile(path.join(root, ".cloudx", "hardware", "state.json"), "utf8")).not.toContain("private-route-marker");
+    const secrets = await fs.readFile(path.join(root, ".cloudx", "secrets", "config-secrets.json"), "utf8");
+    expect(secrets).toContain("private-login-marker");
+    for (const marker of ["private-route-marker", "private-registration-marker", "rejected-login-marker"]) expect(secrets).not.toContain(marker);
     expect((await fs.stat(path.join(root, ".cloudx", "secrets", "config-secrets.json"))).mode & 0o777).toBe(0o600);
   });
 
