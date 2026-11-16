@@ -10,7 +10,7 @@ export interface UiContributionRenderContext {
   attention?: boolean;
   config?: Record<string, ConfigValue>;
   uiScale?: number;
-  callHook?<T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input?: Record<string, unknown>, targetTabId?: string): Promise<T>;
+  callHook?<T extends Record<string, unknown> = Record<string, unknown>>(hookId: string, input?: Record<string, unknown>, targetTabId?: string, signal?: AbortSignal): Promise<T>;
 }
 
 export type UiContributionRenderer = (contribution: UiContributionDescriptor, context: UiContributionRenderContext) => ReactElement | null;

@@ -2,8 +2,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
+import { UsageScanScheduler } from "./UsageScanScheduler.js";
 import { AgentUsageLedger } from "./AgentUsageLedger.js";
 import { AgentUsageService } from "./AgentUsageService.js";
 import { ClaudeUsageReader } from "./ClaudeUsageReader.js";
@@ -17,6 +18,39 @@ const CHILD = "01a0d37e-68ab-7d00-b67b-f247568d358f";
 const CLAUDE_SESSION = "a5570c58-978a-4694-84f9-c67756be3acd";
 const T0 = Date.parse("2026-10-05T10:00:00.000Z");
 const at = (minutes: number) => new Date(T0 + minutes * 60_000).toISOString();
+
+const disposables: { dispose(): Promise<void> }[] = [];
+afterEach(async () => { await Promise.all(disposables.splice(0).map(value => value.dispose())); });
+
+function codexReader(home: () => string) {
+  const reader = new CodexUsageReader(home, { scheduler: new UsageScanScheduler({ intervalMs: 0 }) });
+  disposables.push(reader);
+  return reader;
+}
+
+function claudeReader(home: () => string) {
+  const reader = new ClaudeUsageReader(home, { scheduler: new UsageScanScheduler({ intervalMs: 0 }) });
+  disposables.push(reader);
+  return reader;
+}
+
+async function completeCodex(reader: CodexUsageReader, sessionId: string, since: number) {
+  await reader.snapshot(sessionId, since);
+  await reader.idle();
+  return (await reader.snapshot(sessionId, since)).records;
+}
+
+async function completeClaude(reader: ClaudeUsageReader, sessionId: string) {
+  await reader.snapshot(sessionId);
+  await reader.idle();
+  return (await reader.snapshot(sessionId)).records;
+}
+
+async function completeUsage(usage: AgentUsageService, request: Parameters<AgentUsageService["read"]>[0]) {
+  await usage.read(request);
+  await usage.idle();
+  return usage.read(request);
+}
 
 const lines = (entries: unknown[]) => `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`;
 
@@ -66,11 +100,11 @@ async function claudeHome() {
 
 describe("transcript readers", () => {
   it("counts each Codex response once and only in its own thread, with subagent threads", async () => {
-    const records = await new CodexUsageReader(() => "").records(ROOT, T0);
+    const records = await completeCodex(codexReader(() => ""), ROOT, T0);
     expect(records).toEqual([]);
     const home = await codexHome();
-    const reader = new CodexUsageReader(() => home);
-    const found = await reader.records(ROOT, T0);
+    const reader = codexReader(() => home);
+    const found = await completeCodex(reader, ROOT, T0);
     expect(found.map(record => [record.id, record.model, record.input, record.cachedInput]).sort()).toEqual([
       ["codex:resp-1", "gpt-6.1-sol", 200_000, 800_000],
       ["codex:resp-2", "gpt-5.6-luna", 2_000_000, 0],
@@ -87,7 +121,7 @@ describe("transcript readers", () => {
       { timestamp: at(0), type: "turn_context", payload: { model: "gpt-6.1-sol" } },
       codexUsage(ROOT, ROOT, "resp-write", 1, { input_tokens: 100_000, cached_input_tokens: 0, cache_write_input_tokens: 100_000, output_tokens: 0 })
     ]));
-    const [record] = await new CodexUsageReader(() => home).records(ROOT, T0);
+    const [record] = await completeCodex(codexReader(() => home), ROOT, T0);
     expect(record).toMatchObject({ input: 0, cachedInput: 0, cacheWrite: 100_000 });
     const price = await new AgentPricing(home).pricer();
     expect(price(record!)).toBeCloseTo(0.25, 10);
@@ -95,15 +129,15 @@ describe("transcript readers", () => {
 
   it("reads appended Codex records without rereading the file", async () => {
     const home = await codexHome();
-    const reader = new CodexUsageReader(() => home);
-    expect(await reader.records(ROOT, T0)).toHaveLength(3);
+    const reader = codexReader(() => home);
+    expect(await completeCodex(reader, ROOT, T0)).toHaveLength(3);
     const file = path.join(home, "sessions", "2026", "10", "05", `rollout-2026-10-05T10-00-00-${ROOT}.jsonl`);
     await fs.appendFile(file, lines([codexUsage(ROOT, ROOT, "resp-3", 40, { input_tokens: 10, output_tokens: 1 })]));
-    expect((await reader.records(ROOT, T0)).map(record => record.id)).toContain("codex:resp-3");
+    expect((await completeCodex(reader, ROOT, T0)).map(record => record.id)).toContain("codex:resp-3");
   });
 
   it("reads Claude messages and subagents with cache lifetimes and web searches", async () => {
-    const records = await new ClaudeUsageReader(await claudeHome().then(home => () => home)).records(CLAUDE_SESSION);
+    const records = await completeClaude(claudeReader(await claudeHome().then(home => () => home)), CLAUDE_SESSION);
     expect(records.map(record => record.id)).toEqual(["claude:msg-1", "claude:msg-1", "claude:msg-2"]);
     expect(records[0]).toMatchObject({ input: 1_000_000, cachedInput: 1_000_000, cacheWrite: 0, cacheWrite1h: 1_000_000, output: 100_000, webSearches: 2 });
   });
@@ -117,7 +151,7 @@ describe("AgentUsageService", () => {
     const codex = await codexHome();
     const claude = await claudeHome();
     const usage = new AgentUsageService(ledger, new AgentPricing(dataDir), {
-      codex: new CodexUsageReader(() => codex), claude: new ClaudeUsageReader(() => claude)
+      codex: codexReader(() => codex), claude: claudeReader(() => claude)
     });
     return { ledger, usage, dataDir, setNow: (minutes: number) => { now = T0 + minutes * 60_000; } };
   }
@@ -131,7 +165,7 @@ describe("AgentUsageService", () => {
     setNow(35);
     await ledger.close("tab-1");
 
-    const result = await usage.read({ tabIds: ["tab-1", "tab-2"], forgeWorkerIds: ["issue-7"] });
+    const result = await completeUsage(usage, { tabIds: ["tab-1", "tab-2"], forgeWorkerIds: ["issue-7"] });
     const codexTab = result.tabs["tab-1"]!;
     // resp-old (minute 1) is before the segment; resp-1 and resp-2 count once each.
     expect(codexTab.totals).toMatchObject({ input: 2_200_000, cachedInput: 800_000, output: 100_000, reasoning: 20_000, requests: 2 });
@@ -156,7 +190,7 @@ describe("AgentUsageService", () => {
     const { ledger, usage, dataDir } = await service();
     await ledger.open({ tabId: "tab-1" }, { providerId: "codex", accountKind: "api-key", sessionId: ROOT });
     await new AgentPricing(dataDir).updateOverrides({ "gpt-5.6-luna": { input: 0, cachedInput: 0, cacheWrite: 0, output: 0 } });
-    const priced = (await usage.read({ tabIds: ["tab-1"] })).tabs["tab-1"]!;
+    const priced = (await completeUsage(usage, { tabIds: ["tab-1"] })).tabs["tab-1"]!;
     expect(priced.costUsd).toBeCloseTo(2.46, 6);
     await expect(new AgentPricing(dataDir).updateOverrides({ "gpt-x": { input: -1 } })).rejects.toThrow("non-negative");
   });
@@ -166,21 +200,21 @@ describe("AgentUsageService", () => {
     setNow(0);
     await ledger.open({ tabId: "codex", windowId: "window-1" }, { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
     await ledger.open({ tabId: "claude", windowId: "window-1" }, { providerId: "claude", accountKind: "api-key", sessionId: CLAUDE_SESSION });
-    const before = (await usage.read({ windowIds: ["window-1"] })).windows["window-1"]!;
+    const before = (await completeUsage(usage, { windowIds: ["window-1"] })).windows["window-1"]!;
     setNow(35);
     await ledger.close("codex");
     await ledger.prune(new Set(["claude"]), undefined, new Set(["window-1"]));
-    expect((await usage.read({ windowIds: ["window-1"] })).windows["window-1"]).toEqual(before);
+    expect((await completeUsage(usage, { windowIds: ["window-1"] })).windows["window-1"]).toEqual(before);
     await ledger.close("claude");
     await ledger.prune(new Set(), undefined, new Set(["window-1"]));
-    expect((await usage.read({ windowIds: ["window-1"] })).windows["window-1"]).toEqual(before);
+    expect((await completeUsage(usage, { windowIds: ["window-1"] })).windows["window-1"]).toEqual(before);
 
     const restarted = new AgentUsageService(new AgentUsageLedger(dataDir), new AgentPricing(dataDir), {
-      codex: new CodexUsageReader(() => codex), claude: new ClaudeUsageReader(() => claude)
+      codex: codexReader(() => codex), claude: claudeReader(() => claude)
     });
     const codex = await codexHome();
     const claude = await claudeHome();
-    const result = await restarted.read({ windowIds: ["window-1", "unrelated"], tabIds: ["codex", "claude"] });
+    const result = await completeUsage(restarted, { windowIds: ["window-1", "unrelated"], tabIds: ["codex", "claude"] });
     expect(result.windows["window-1"]).toEqual(before);
     expect(result.total).toEqual(before);
     expect(result.windows.unrelated!.totals.requests).toBe(0);
@@ -196,7 +230,7 @@ describe("AgentUsageService", () => {
     setNow(25);
     await ledger.close("old");
     await ledger.open({ tabId: "new", windowId: "window-1" }, { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
-    const result = await usage.read({ windowIds: ["window-1"], tabIds: ["old", "new"], forgeWorkerIds: ["worker"] });
+    const result = await completeUsage(usage, { windowIds: ["window-1"], tabIds: ["old", "new"], forgeWorkerIds: ["worker"] });
     expect(result.windows["window-1"]!.totals.requests).toBe(2);
     expect(result.tabs.old!.totals.requests).toBe(1);
     expect(result.tabs.new!.totals.requests).toBe(1);
@@ -209,7 +243,7 @@ describe("AgentUsageService", () => {
     setNow(25);
     await ledger.synchronizeWindows(new Map([["moving", "window-2"]]));
     await ledger.synchronizeWindows(new Map([["moving", "window-2"]]));
-    const result = await usage.read({ windowIds: ["window-1", "window-2"] });
+    const result = await completeUsage(usage, { windowIds: ["window-1", "window-2"] });
     expect(result.windows["window-1"]!.totals.requests).toBe(1);
     expect(result.windows["window-2"]!.totals.requests).toBe(1);
     expect(await ledger.segments({ tabId: "moving" })).toHaveLength(2);
@@ -230,6 +264,7 @@ describe("AgentUsageService", () => {
     await ledger.open({ tabId: "closed", windowId: "window-1" }, { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
     setNow(35);
     await ledger.close("closed");
+    await completeUsage(usage, { windowIds: ["window-1"] });
     const hooks = new HookRegistry();
     const plugin = new AgentUsagePlugin(usage, ledger, new AgentPricing(dataDir), () => ({ tabIds: [], windowIds: ["window-1"], tabWindows: new Map() }));
     for (const hook of plugin.hooks) hooks.register(hook);

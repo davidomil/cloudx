@@ -1,5 +1,6 @@
 import {
   emptyAgentUsageTotals,
+  usageIndexing,
   type AgentAccountKind,
   type AgentCostBasis,
   type AgentUsageReadRequest,
@@ -12,7 +13,7 @@ import type { AgentUsageLedger, UsageSegment } from "./AgentUsageLedger.js";
 import type { ClaudeUsageReader } from "./ClaudeUsageReader.js";
 import type { CodexUsageReader } from "./CodexUsageReader.js";
 import type { AgentPricing } from "./pricing.js";
-import type { UsageRecord } from "./usageRecord.js";
+import type { UsageRecord, UsageSnapshot } from "./usageRecord.js";
 
 interface AttributedRecord {
   record: UsageRecord;
@@ -23,40 +24,78 @@ type Pricer = (record: UsageRecord) => number | undefined;
 
 // Totals the usage recorded inside each owner's ledger segments and prices it.
 export class AgentUsageService {
+  private readonly lifecycle = new AbortController();
+
   constructor(
     private readonly ledger: AgentUsageLedger,
     private readonly pricing: AgentPricing,
-    private readonly readers: { codex: Pick<CodexUsageReader, "records">; claude: Pick<ClaudeUsageReader, "records"> }
+    private readonly readers: { codex: Pick<CodexUsageReader, "snapshot" | "idle" | "dispose">; claude: Pick<ClaudeUsageReader, "snapshot" | "idle" | "dispose"> }
   ) {}
 
-  async read(request: AgentUsageReadRequest): Promise<AgentUsageReadResult> {
+  async read(request: AgentUsageReadRequest, signal?: AbortSignal): Promise<AgentUsageReadResult> {
+    const active = signal ? AbortSignal.any([signal, this.lifecycle.signal]) : this.lifecycle.signal;
+    active.throwIfAborted();
+    const owners: { kind: "tabs" | "windows" | "forgeWorkers"; id: string; segments: UsageSegment[] }[] = [];
+    for (const [kind, ids] of [["tabs", request.tabIds], ["windows", request.windowIds], ["forgeWorkers", request.forgeWorkerIds]] as const) {
+      for (const id of new Set(ids)) {
+        active.throwIfAborted();
+        const filter = kind === "tabs" ? { tabId: id } : kind === "windows" ? { windowId: id } : { forgeWorkerId: id };
+        owners.push({ kind, id, segments: await this.ledger.segments(filter) });
+      }
+    }
+    active.throwIfAborted();
     const price = await this.pricing.pricer();
-    const everything: AttributedRecord[] = [];
-    const summarizeOwner = async (segments: UsageSegment[]) => {
-      const records = await this.recordsIn(segments);
-      everything.push(...records);
-      return summarize(records, price);
+    const from = new Map<string, number>();
+    for (const owner of owners) for (const segment of owner.segments) {
+      const key = JSON.stringify([segment.providerId, segment.sessionId]);
+      from.set(key, Math.min(from.get(key) ?? segment.from, segment.from));
+    }
+    const snapshots = new Map<string, Promise<UsageSnapshot>>();
+    const recordsFor = (segment: UsageSegment) => {
+      const key = JSON.stringify([segment.providerId, segment.sessionId]);
+      let snapshot = snapshots.get(key);
+      if (!snapshot) {
+        snapshot = segment.providerId === "claude"
+          ? this.readers.claude.snapshot(segment.sessionId, active)
+          : this.readers.codex.snapshot(segment.sessionId, from.get(key)!, active);
+        snapshots.set(key, snapshot);
+      }
+      return snapshot;
     };
-    const tabs: Record<string, AgentUsageSummary> = {};
-    for (const tabId of request.tabIds ?? []) tabs[tabId] = await summarizeOwner(await this.ledger.segments({ tabId }));
-    const windows: Record<string, AgentUsageSummary> = {};
-    for (const windowId of request.windowIds ?? []) windows[windowId] = await summarizeOwner(await this.ledger.segments({ windowId }));
-    const forgeWorkers: Record<string, AgentUsageSummary> = {};
-    for (const forgeWorkerId of request.forgeWorkerIds ?? []) forgeWorkers[forgeWorkerId] = await summarizeOwner(await this.ledger.segments({ forgeWorkerId }));
+    const result: AgentUsageReadResult = { tabs: {}, windows: {}, forgeWorkers: {}, total: summarize([], price) };
+    const everything: AttributedRecord[] = [];
+    const summaries: AgentUsageSummary[] = [];
+    for (const owner of owners) {
+      const records: AttributedRecord[] = [];
+      const states: UsageSnapshot[] = [];
+      for (const segment of owner.segments) {
+        active.throwIfAborted();
+        const snapshot = await recordsFor(segment);
+        active.throwIfAborted();
+        states.push(snapshot);
+        for (const record of snapshot.records)
+          if (record.at >= segment.from && (segment.to === undefined || record.at < segment.to))
+            records.push({ record, accountKind: segment.accountKind });
+      }
+      const unique = uniqueRecords(records);
+      everything.push(...unique);
+      const summary = { ...summarize(unique, price), ...usageIndexing(states) };
+      result[owner.kind][owner.id] = summary;
+      summaries.push(summary);
+    }
+    active.throwIfAborted();
     // A Forge worker's tab and the worker share segments; count each response once.
-    return { tabs, windows, forgeWorkers, total: summarize(uniqueRecords(everything), price) };
+    result.total = { ...summarize(uniqueRecords(everything), price), ...usageIndexing(summaries) };
+    return result;
   }
 
-  private async recordsIn(segments: UsageSegment[]): Promise<AttributedRecord[]> {
-    const records: AttributedRecord[] = [];
-    for (const segment of segments) {
-      const all = segment.providerId === "claude"
-        ? await this.readers.claude.records(segment.sessionId)
-        : await this.readers.codex.records(segment.sessionId, segment.from);
-      for (const record of all)
-        if (record.at >= segment.from && (segment.to === undefined || record.at < segment.to)) records.push({ record, accountKind: segment.accountKind });
-    }
-    return uniqueRecords(records);
+  async idle(): Promise<void> {
+    await Promise.all([this.readers.codex.idle(), this.readers.claude.idle()]);
+  }
+
+  async dispose(): Promise<void> {
+    this.lifecycle.abort();
+    await Promise.all([this.readers.codex.dispose(), this.readers.claude.dispose()]);
   }
 }
 

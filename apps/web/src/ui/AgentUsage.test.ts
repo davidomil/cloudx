@@ -3,10 +3,11 @@
 import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { combineAgentUsage, emptyAgentUsageTotals, type AgentPricingState, type AgentUsageSummary } from "@cloudx/shared";
+import { combineAgentUsage, emptyAgentUsageTotals, type AgentPricingState, type AgentUsageReadRequest, type AgentUsageReadResult, type AgentUsageSummary } from "@cloudx/shared";
 
-import { UsageHoverCard, formatTokens, formatUsd, usageLine } from "./AgentUsage.js";
+import { UsageHoverCard, formatTokens, formatUsd, usageLine, useAgentUsage } from "./AgentUsage.js";
 import { AgentPricingPanel } from "./AgentPricingPanel.js";
+import type { UiContributionRenderContext } from "./uiContributions.js";
 
 let root: Root | undefined;
 beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); });
@@ -14,6 +15,7 @@ afterEach(async () => {
   await act(async () => root?.unmount());
   root = undefined;
   document.body.replaceChildren();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -31,6 +33,14 @@ async function render(element: ReturnType<typeof createElement>) {
 }
 
 describe("usage formatting", () => {
+  it("marks incomplete totals before and during backfill", () => {
+    const empty = { totals: emptyAgentUsageTotals(), byModel: [], costUsd: 0, unpricedModels: [] };
+    expect(usageLine({ ...empty, indexing: "backfilling" })).toBe("Backfilling usage…");
+    expect(usageLine({ ...empty, indexing: "error" })).toBe("Usage incomplete");
+    expect(usageLine({ ...summary(1, "api", "model", 100), indexing: "backfilling" })).toBe("$1.00 API · 1.1k tokens · Backfilling usage…");
+    expect(usageLine(empty)).toBe("No usage yet");
+  });
+
   it("formats dollars, tokens and the cost basis", () => {
     expect(formatUsd(0.004)).toBe("<$0.01");
     expect(formatUsd(12.345)).toBe("$12.35");
@@ -49,12 +59,90 @@ describe("usage formatting", () => {
   });
 });
 
+type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
+
+function UsageProbe({ callHook, request }: { callHook: CallHook; request?: AgentUsageReadRequest }) {
+  const usage = useAgentUsage(callHook, request, 100);
+  return createElement("p", null, usage ? usageLine(usage.total) : "Loading usage…");
+}
+
+function usageResult(cost: number): { usage: AgentUsageReadResult } {
+  return { usage: { tabs: {}, windows: {}, forgeWorkers: {}, total: summary(cost, "api", "model", 100) } };
+}
+
+function deferredUsage() {
+  let resolve!: (result: ReturnType<typeof usageResult>) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<ReturnType<typeof usageResult>>((accept, fail) => { resolve = accept; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+describe("useAgentUsage polling", () => {
+  it("waits for each read to settle before scheduling the next refresh", async () => {
+    vi.useFakeTimers();
+    const first = deferredUsage();
+    const second = deferredUsage();
+    const callHook = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise).mockResolvedValue(usageResult(3));
+    const container = await render(createElement(UsageProbe, { callHook: callHook as CallHook, request: { windowIds: ["window"] } }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(callHook).toHaveBeenCalledTimes(1);
+    await act(async () => first.resolve(usageResult(1)));
+    expect(container.textContent).toContain("$1.00 API");
+    await act(async () => { await vi.advanceTimersByTimeAsync(99); });
+    expect(callHook).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(callHook).toHaveBeenCalledTimes(2);
+    await act(async () => second.reject(new Error("Read interrupted")));
+    expect(container.textContent).toContain("$1.00 API");
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    expect(callHook).toHaveBeenCalledTimes(3);
+    expect(container.textContent).toContain("$3.00 API");
+  });
+
+  it("aborts obsolete owners and ignores their late responses", async () => {
+    vi.useFakeTimers();
+    const first = deferredUsage();
+    const second = deferredUsage();
+    const callHook = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    const container = await render(createElement(UsageProbe, { callHook: callHook as CallHook, request: { tabIds: ["first"] } }));
+    const firstSignal = callHook.mock.calls[0]![3] as AbortSignal;
+    await act(async () => root!.render(createElement(UsageProbe, { callHook: callHook as CallHook, request: { tabIds: ["second"] } })));
+    expect(firstSignal.aborted).toBe(true);
+    await act(async () => second.resolve(usageResult(2)));
+    await act(async () => first.resolve(usageResult(1)));
+    expect(container.textContent).toContain("$2.00 API");
+    expect(container.textContent).not.toContain("$1.00 API");
+    await act(async () => root!.render(createElement(UsageProbe, { callHook: callHook as CallHook })));
+    expect((callHook.mock.calls[1]![3] as AbortSignal).aborted).toBe(true);
+    expect(container.textContent).toBe("Loading usage…");
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(callHook).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears the previous owner's displayed total and aborts on unmount", async () => {
+    vi.useFakeTimers();
+    const pending = deferredUsage();
+    const callHook = vi.fn().mockResolvedValueOnce(usageResult(1)).mockReturnValue(pending.promise);
+    const container = await render(createElement(UsageProbe, { callHook: callHook as CallHook, request: { tabIds: ["first"] } }));
+    expect(container.textContent).toContain("$1.00 API");
+    await act(async () => root!.render(createElement(UsageProbe, { callHook: callHook as CallHook, request: { tabIds: ["second"] } })));
+    expect(container.textContent).toBe("Loading usage…");
+    const signal = callHook.mock.calls[1]![3] as AbortSignal;
+    await act(async () => root!.unmount());
+    root = undefined;
+    expect(signal.aborted).toBe(true);
+    await act(async () => pending.resolve(usageResult(2)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    expect(callHook).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("UsageHoverCard", () => {
   it("requests durable window usage and shows details even without open agent tabs", async () => {
     const total = summary(3, "mixed", "closed-tab-model", 10_000);
     const callHook = vi.fn(async () => ({ usage: { tabs: {}, windows: { window: total }, forgeWorkers: {}, total } }));
     const container = await render(createElement(UsageHoverCard, { target: { title: "Window", request: { windowIds: ["window"] }, left: 0, top: 0 }, callHook: callHook as never }));
-    expect(callHook).toHaveBeenCalledWith("agent-usage.read", { windowIds: ["window"] });
+    expect(callHook).toHaveBeenCalledWith("agent-usage.read", { windowIds: ["window"] }, undefined, expect.any(AbortSignal));
     expect(container.textContent).toContain("$3.00 API and API-equivalent");
     expect(container.textContent).toContain("Model requests");
   });
@@ -62,7 +150,7 @@ describe("UsageHoverCard", () => {
   it("reads usage for the hovered owner and shows details", async () => {
     const callHook = vi.fn(async () => ({ usage: { tabs: {}, forgeWorkers: {}, total: summary(0.42, "api", "claude-opus-5-5", 5_000) } }));
     const container = await render(createElement(UsageHoverCard, { target: { title: "Agent tab", request: { tabIds: ["tab-1"] }, left: 0, top: 0 }, callHook: callHook as never }));
-    expect(callHook).toHaveBeenCalledWith("agent-usage.read", { tabIds: ["tab-1"] });
+    expect(callHook).toHaveBeenCalledWith("agent-usage.read", { tabIds: ["tab-1"] }, undefined, expect.any(AbortSignal));
     expect(container.textContent).toContain("$0.42 API · 6.0k tokens");
     expect(container.querySelector('[role="tooltip"]')).not.toBeNull();
   });

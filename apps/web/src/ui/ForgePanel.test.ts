@@ -2872,6 +2872,14 @@ describe("ForgePanel", () => {
 });
 
 describe("ForgePanel usage", () => {
+  it("shows backfill status before a worker has any indexed usage", async () => {
+    const usage = { totals: { input: 0, cachedInput: 0, cacheWrite: 0, output: 0, reasoning: 0, webSearches: 0, requests: 0 }, byModel: [], costUsd: 0, unpricedModels: [], indexing: "backfilling" };
+    const testFixture = fixture({ workers: [worker] }, hook => hook === "agent-usage.read" ? { usage: { tabs: {}, windows: {}, forgeWorkers: { [worker.id]: usage }, total: usage } } : undefined);
+    const panel = await renderPanel(testFixture, { showUsage: true });
+    await vi.waitFor(() => expect(panel.textContent).toContain("Usage: Backfilling usage…"));
+    expect(panel.textContent).not.toContain("No usage yet");
+  });
+
   it("shows worker usage only when usage is enabled", async () => {
     const usage = { totals: { input: 1_000, cachedInput: 0, cacheWrite: 0, output: 500, reasoning: 0, webSearches: 0, requests: 2 }, byModel: [], costUsd: 1.25, costBasis: "api-equivalent", unpricedModels: [] };
     const testFixture = fixture({ workers: [worker] }, hook => hook === "agent-usage.read" ? { usage: { tabs: {}, forgeWorkers: { [worker.id]: usage }, total: usage } } : undefined);

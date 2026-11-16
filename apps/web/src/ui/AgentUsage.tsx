@@ -11,19 +11,26 @@ const CARD_WIDTH_PX = 300;
 // Reads usage for the request and refreshes it while the request is set.
 // Pass undefined to stop.
 export function useAgentUsage(callHook: CallHook | undefined, request: AgentUsageReadRequest | undefined, refreshMs = REFRESH_MS): AgentUsageReadResult | undefined {
-  const [result, setResult] = useState<AgentUsageReadResult>();
+  const [result, setResult] = useState<{ key: string; callHook: CallHook; usage: AgentUsageReadResult }>();
   const key = request ? JSON.stringify(request) : undefined;
   useEffect(() => {
     if (!callHook || !key) return;
-    let disposed = false;
-    const load = () => callHook<{ usage: AgentUsageReadResult }>(AGENT_USAGE_HOOKS.read, JSON.parse(key) as Record<string, unknown>)
-      .then(response => { if (!disposed) setResult(response.usage); })
-      .catch(() => undefined);
+    const controller = new AbortController();
+    let timer: number | undefined;
+    const load = async () => {
+      try {
+        const response = await callHook<{ usage: AgentUsageReadResult }>(AGENT_USAGE_HOOKS.read, JSON.parse(key) as Record<string, unknown>, undefined, controller.signal);
+        if (!controller.signal.aborted) setResult({ key, callHook, usage: response.usage });
+      } catch {
+        // Keep the last available total until the next scheduled refresh.
+      } finally {
+        if (!controller.signal.aborted) timer = window.setTimeout(() => void load(), refreshMs);
+      }
+    };
     void load();
-    const timer = window.setInterval(() => void load(), refreshMs);
-    return () => { disposed = true; window.clearInterval(timer); };
+    return () => { controller.abort(); window.clearTimeout(timer); };
   }, [callHook, key, refreshMs]);
-  return result;
+  return result?.key === key && result?.callHook === callHook ? result?.usage : undefined;
 }
 
 export function formatUsd(value: number): string {
@@ -45,9 +52,10 @@ const BASIS_LABEL = { api: "API", "api-equivalent": "API-equivalent", mixed: "AP
 
 // One-line summary, such as "$1.24 API-equivalent · 2.1M tokens".
 export function usageLine(summary: AgentUsageSummary): string {
-  if (!summary.totals.requests) return "No usage yet";
+  const indexing = summary.indexing === "backfilling" ? "Backfilling usage…" : summary.indexing === "error" ? "Usage incomplete" : undefined;
+  if (!summary.totals.requests) return indexing ?? "No usage yet";
   const cost = summary.costBasis ? `${formatUsd(summary.costUsd)} ${BASIS_LABEL[summary.costBasis]}` : "No price";
-  return `${cost} · ${formatTokens(totalTokens(summary.totals))} tokens`;
+  return `${cost} · ${formatTokens(totalTokens(summary.totals))} tokens${indexing ? ` · ${indexing}` : ""}`;
 }
 
 function UsageDetails({ title, summary }: { title: string; summary?: AgentUsageSummary }) {
