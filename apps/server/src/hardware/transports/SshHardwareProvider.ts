@@ -90,7 +90,7 @@ export class SshHardwareProvider implements HardwareTypeProvider<SshConfig> {
         catch { return false; }
       };
       const agent = this.agentSocket(config);
-      const home = this.options.environment?.HOME ?? os.homedir();
+      const home = os.userInfo().homedir;
       const identities = ["id_rsa", "id_ecdsa", "id_ecdsa_sk", "id_ed25519", "id_ed25519_sk", "id_xmss", "id_dsa"];
       if (!(agent && await available(agent, true)) && !(await Promise.all(identities.map(name => available(path.join(home, ".ssh", name), false)))).some(Boolean)) blockers.push("The server account has no accessible SSH agent or default identity file.");
     }

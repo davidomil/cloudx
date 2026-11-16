@@ -125,6 +125,93 @@ async function newSsh(
     await label(page, "Enable automatic SSH login checks").uncheck();
 }
 
+test("SSH legacy password metadata: annotate and disable an offline machine without key setup", async ({
+  page,
+}, info) => {
+  const credentialRefId = "ssh-password-22222222-2222-4333-8444-555555555555";
+  await new ConfigSecretStore(root).update({
+    global: {},
+    plugins: { hardware: { [credentialRefId]: "offline fixture password" } },
+  });
+  const seeded = await lab.mutate("hardware.items.update", {
+    hardwareId: lab.ssh.id,
+    expectedItemRevision: lab.ssh.revision,
+    patch: {
+      config: {
+        ...lab.ssh.config,
+        host: "offline.example",
+        auth: { kind: "password", credentialRefId },
+      },
+    },
+  });
+  expect(seeded.receipt.state).toBe("succeeded");
+  const original = (await lab.service.snapshot(operator)).items.find(
+    (entry) => entry.item.id === lab.ssh.id,
+  )!;
+  expect(original.availability).toBe("ineligible");
+  await refresh(page);
+  const actions: { action: string; input: Record<string, unknown> }[] = [];
+  let passwordWrites = 0;
+  page.on("request", (request) => {
+    if (
+      request.method() === "PUT" &&
+      request.url().includes("/api/hardware/ssh-passwords/")
+    )
+      passwordWrites++;
+    if (
+      request.method() === "POST" &&
+      request.url().endsWith("/api/hardware/actions")
+    )
+      actions.push(request.postDataJSON());
+  });
+  await button(page, "Select Atlas SSH").click();
+  await button(page, "Edit hardware").click();
+  await label(page, "Hardware description").fill(
+    "Offline; waiting for a repair",
+  );
+  await label(page, "Notes for agents").fill("Keep this machine powered off.");
+  await label(page, "Enabled for new reservations").uncheck();
+  await expect(button(page, "Save hardware")).toBeEnabled();
+  await label(page, "SSH host").fill("changed.example");
+  await expect(button(page, "Save hardware")).toBeDisabled();
+  await label(page, "SSH host").fill("offline.example");
+  await label(page, "SSH password").fill("replacement fixture password");
+  await expect(button(page, "Save hardware")).toBeDisabled();
+  await label(page, "SSH password").clear();
+  await expect(button(page, "Save hardware")).toBeEnabled();
+  await screenshot(page, info, "24-legacy-password-metadata", "SSH host");
+  await button(page, "Save hardware").click();
+  await expect(label(page, "Hardware description")).toHaveCount(0);
+  const saved = (await lab.service.snapshot(operator)).items.find(
+    (entry) => entry.item.id === lab.ssh.id,
+  )!.item;
+  expect(saved).toEqual({
+    ...original.item,
+    revision: original.item.revision + 1,
+    notesRevision: original.item.notesRevision + 1,
+    description: "Offline; waiting for a repair",
+    notes: "Keep this machine powered off.",
+    enabled: false,
+  });
+  const updates = actions.filter(
+    (entry) => entry.action === "hardware.items.update",
+  );
+  expect(updates).toHaveLength(1);
+  expect(updates[0]!.input.patch).toEqual({
+    name: original.item.name,
+    description: saved.description,
+    notes: saved.notes,
+    tagIds: original.item.tagIds,
+    enabled: false,
+  });
+  expect(lab.connectionChecks).toHaveLength(0);
+  expect(lab.keySetups).toHaveLength(0);
+  expect(passwordWrites).toBe(0);
+  expect(await sshPasswords.resolve(credentialRefId)).toBe(
+    "offline fixture password",
+  );
+});
+
 test("SSH connection checks: test an edited IP and replacement password without saving the machine", async ({
   page,
 }, info) => {

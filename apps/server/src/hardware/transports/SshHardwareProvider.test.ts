@@ -113,20 +113,26 @@ describe("SSH configuration and batch boundaries", () => {
     }
   });
 
-  it("allows the account's default disk identity without requiring an SSH agent", async () => {
+  it("uses the account's default disk identity even when SSH environment HOME points elsewhere", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ssh-default-identity-"));
+    const accountHome = path.join(root, "account");
+    const environmentHome = path.join(root, "environment");
+    const account = vi.spyOn(os, "userInfo").mockReturnValue({ ...os.userInfo(), homedir: accountHome });
+    const processHome = vi.spyOn(os, "homedir").mockReturnValue(environmentHome);
     try {
-      await fs.mkdir(path.join(root, ".ssh"), { mode: 0o700 });
-      await fs.writeFile(path.join(root, ".ssh/id_ed25519"), "private fixture", { mode: 0o600 });
-      const type = new SshHardwareProvider({ pathPolicy: new PathPolicy([root]), environment: { HOME: root } });
+      await fs.mkdir(path.join(accountHome, ".ssh"), { recursive: true, mode: 0o700 });
+      await fs.mkdir(path.join(environmentHome, ".ssh"), { recursive: true, mode: 0o700 });
+      await fs.writeFile(path.join(accountHome, ".ssh/id_ed25519"), "private fixture", { mode: 0o600 });
+      const type = new SshHardwareProvider({ pathPolicy: new PathPolicy([root]), environment: { HOME: environmentHome, SSH_AUTH_SOCK: "" } });
       const defaults = { ...config, knownHostsFile: undefined, auth: { kind: "agent" as const } };
       expect(await type.inspectEndpoint(defaults)).toMatchObject({ ready: true, blockers: [] });
       const explicit = { ...defaults, auth: { kind: "agent" as const, socketPath: path.join(root, "missing-agent") } };
       expect(await type.inspectEndpoint(explicit)).toMatchObject({ ready: false });
       expect(sshArguments(explicit)).toContain("IdentityFile=none");
-      await fs.rm(path.join(root, ".ssh/id_ed25519"));
+      await fs.rm(path.join(accountHome, ".ssh/id_ed25519"));
+      await fs.writeFile(path.join(environmentHome, ".ssh/id_ed25519"), "unrelated fixture", { mode: 0o600 });
       expect(await type.inspectEndpoint(defaults)).toMatchObject({ ready: false, blockers: [expect.stringContaining("SSH agent or default identity")] });
-    } finally { await fs.rm(root, { recursive: true, force: true }); }
+    } finally { account.mockRestore(); processHome.mockRestore(); await fs.rm(root, { recursive: true, force: true }); }
   });
 });
 

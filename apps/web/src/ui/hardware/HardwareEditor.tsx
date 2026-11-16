@@ -185,6 +185,27 @@ export function HardwareEditor({
   const passwordAuth =
     value.typeId === "hardware.ssh" &&
     (value.config.auth as JsonObject).kind === "password";
+  const metadataOnly =
+    held ||
+    (passwordAuth &&
+      item &&
+      !password &&
+      !String((value.config.auth as JsonObject).credentialRefId).startsWith(
+        "ssh-registration-",
+      ) &&
+      (
+        [
+          "typeId",
+          "configVersion",
+          "physicalResourceId",
+          "config",
+          "statuses",
+          "hooks",
+        ] as const
+      ).every(
+        (field) => JSON.stringify(value[field]) === JSON.stringify(item[field]),
+      ));
+  const keySetupRequired = passwordAuth && !metadataOnly;
   const setupPending =
     (testing ?? connectionTest?.kind) === "setup" && testPending;
   const keyConfig =
@@ -312,7 +333,7 @@ export function HardwareEditor({
   }
   async function save() {
     if (working.current || testPending || saving || busy || stale) return;
-    if (passwordAuth && !held) {
+    if (keySetupRequired) {
       setSaveError(
         "Set up an SSH key before saving these connection settings.",
       );
@@ -336,7 +357,7 @@ export function HardwareEditor({
           : undefined;
       const { physicalResourceId: _physicalResourceId, ...withoutGroup } =
         savedValue;
-      const patch = held
+      const patch = metadataOnly
         ? {
             name: value.name,
             description: value.description,
@@ -680,7 +701,8 @@ export function HardwareEditor({
                     <p className="hardware-muted">
                       Set up an SSH key before saving these connection settings.
                       Setup installs a dedicated public key and verifies
-                      key-only login.
+                      key-only login. You can save notes and descriptive fields
+                      while the saved connection settings stay unchanged.
                     </p>
                   ) : null}
                   {connectionTest ? (
@@ -793,7 +815,7 @@ export function HardwareEditor({
             testPending ||
             stale ||
             !state.types.length ||
-            (passwordAuth && !held)
+            keySetupRequired
           }
         >
           <Save size={15} />

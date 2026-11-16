@@ -5,10 +5,12 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   HardwareItem,
+  HardwareItemDraft,
   HardwareStateView,
   OperationReceipt,
 } from "@cloudx/shared";
-import { HardwareEditor } from "./HardwareEditor.js";
+import { editableHardware, HardwareEditor } from "./HardwareEditor.js";
+import { emptyScript } from "./HardwareControls.js";
 
 const roots: Root[] = [];
 beforeEach(() => {
@@ -178,6 +180,108 @@ async function render(
 }
 
 describe("SSH draft connection checks", () => {
+  it.each([
+    ["Hardware name", "name", "Offline camera"],
+    ["Hardware description", "description", "Waiting for a repair"],
+    ["Notes for agents", "notes", "Do not reboot this machine."],
+  ])(
+    "saves %s without contacting a legacy password machine",
+    async (label, field, value) => {
+      const ui = await render();
+      await ui.fill(label, value);
+      expect(ui.button("Save hardware").disabled).toBe(false);
+      await ui.click("Save hardware");
+      expect(ui.run).toHaveBeenCalledExactlyOnceWith("hardware.items.update", {
+        hardwareId: item.id,
+        expectedItemRevision: item.revision,
+        patch: {
+          name: item.name,
+          description: item.description,
+          notes: item.notes,
+          tagIds: item.tagIds,
+          enabled: item.enabled,
+          [field]: value,
+        },
+      });
+      expect(ui.props().onSaved).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("can disable and tag a legacy password machine without changing its settings", async () => {
+    const ui = await render({
+      state: {
+        ...state,
+        tags: [
+          { id: "repair", revision: 1, label: "Needs repair", description: "" },
+        ],
+      },
+    });
+    const checkboxes = ui.container.querySelectorAll<HTMLInputElement>(
+      'input[type="checkbox"]',
+    );
+    await act(async () => {
+      checkboxes[0]!.click();
+      checkboxes[1]!.click();
+    });
+    expect(ui.button("Save hardware").disabled).toBe(false);
+    await ui.submit();
+    expect(ui.run).toHaveBeenCalledExactlyOnceWith("hardware.items.update", {
+      hardwareId: item.id,
+      expectedItemRevision: item.revision,
+      patch: {
+        name: item.name,
+        description: item.description,
+        notes: item.notes,
+        tagIds: ["repair"],
+        enabled: false,
+      },
+    });
+  });
+
+  it.each<Partial<HardwareItemDraft>>([
+    { config: { ...item.config, host: "other.example" } },
+    {
+      config: {
+        ...item.config,
+        auth: { kind: "password", credentialRefId: "ssh-registration-new" },
+      },
+    },
+    { physicalResourceId: "another-rack" },
+    { configVersion: 2 },
+    {
+      statuses: [
+        {
+          revision: 1,
+          definitionId: "changed-status",
+          source: "manual",
+          value: false,
+        },
+      ],
+    },
+    { hooks: { beforeReserve: emptyScript() } },
+  ])(
+    "requires key setup before saving changed password settings (%j)",
+    async (changes) => {
+      const value = { ...editableHardware(item), ...changes };
+      const ui = await render({
+        drafts: new Map([
+          [item.id, { value, baseRevision: item.revision, newGroupName: "" }],
+        ]),
+      });
+      expect(ui.button("Save hardware").disabled).toBe(true);
+      await ui.submit();
+      expect(ui.run).not.toHaveBeenCalled();
+    },
+  );
+
+  it("requires key setup for a typed replacement password even when the saved config is unchanged", async () => {
+    const ui = await render();
+    await ui.fill("SSH password", "replacement fixture only");
+    expect(ui.button("Save hardware").disabled).toBe(true);
+    await ui.submit();
+    expect(ui.run).not.toHaveBeenCalled();
+  });
+
   it("tests an edited host with an ephemeral password and requires key setup before saving", async () => {
     const fetch = vi.fn(
       async (_url, options) =>
@@ -282,7 +386,12 @@ describe("SSH draft connection checks", () => {
     expect(ui.container.textContent).not.toContain(
       "SSH key installed and login verified",
     );
-    expect(ui.button("Save hardware").disabled).toBe(true);
+    expect(ui.button("Save hardware").disabled).toBe(false);
+    expect(
+      ui.container.querySelector<HTMLSelectElement>(
+        '[aria-label="SSH authentication"]',
+      )!.value,
+    ).toBe("password");
     await ui.update({ state: { ...state, receipts: [setupSuccess] } });
     expect(ui.container.textContent).toContain(
       "SSH key installed and login verified",
@@ -291,7 +400,7 @@ describe("SSH draft connection checks", () => {
   });
 
   it.each(["failed", "unknown"] as const)(
-    "keeps password authentication unsaved after %s setup",
+    "excludes unchanged password settings from metadata saves after %s setup",
     async (state) => {
       const run = vi.fn().mockResolvedValue({
         ...setupSuccess,
@@ -306,10 +415,11 @@ describe("SSH draft connection checks", () => {
       expect(ui.container.textContent).not.toContain(
         "SSH key installed and login verified",
       );
-      expect(ui.button("Save hardware").disabled).toBe(true);
+      expect(ui.button("Save hardware").disabled).toBe(false);
       expect(ui.container.textContent).toContain("Inspect the installed key");
       await ui.submit();
-      expect(run).toHaveBeenCalledTimes(1);
+      expect(run).toHaveBeenCalledTimes(2);
+      expect(run.mock.calls[1]?.[1].patch).not.toHaveProperty("config");
     },
   );
 
@@ -340,10 +450,12 @@ describe("SSH draft connection checks", () => {
       });
       const ui = await render({ run });
       await ui.click("Set up SSH key");
-      expect(ui.button("Save hardware").disabled).toBe(true);
+      expect(ui.button("Save hardware").disabled).toBe(false);
       expect(ui.container.textContent).not.toContain(
         "SSH key installed and login verified",
       );
+      await ui.submit();
+      expect(run.mock.calls[1]?.[1].patch).not.toHaveProperty("config");
     },
   );
 
