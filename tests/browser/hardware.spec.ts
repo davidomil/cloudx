@@ -108,7 +108,11 @@ const button = (page: Page, name: string) =>
 const label = (page: Page, name: string) =>
   page.getByLabel(name, { exact: true });
 
-async function newSsh(page: Page, name: string) {
+async function newSsh(
+  page: Page,
+  name: string,
+  { automaticChecks = false } = {},
+) {
   await button(page, "Add hardware").click();
   await label(page, "Hardware name").fill(name);
   await label(page, "Physical resource group").selectOption(
@@ -116,6 +120,309 @@ async function newSsh(page: Page, name: string) {
   );
   await label(page, "SSH host").fill("password.example");
   await label(page, "SSH username").fill("tester");
+  if (!automaticChecks)
+    await label(page, "Enable automatic SSH login checks").uncheck();
+}
+
+test("SSH connection checks: test an edited IP and replacement password without saving the machine", async ({
+  page,
+}, info) => {
+  const originalRef = "ssh-password-11111111-2222-4333-8444-555555555555";
+  await sshPasswords.save(originalRef, "original fixture password");
+  await lab.mutate("hardware.items.update", {
+    hardwareId: lab.ssh.id,
+    expectedItemRevision: lab.ssh.revision,
+    patch: {
+      config: {
+        ...lab.ssh.config,
+        auth: { kind: "password", credentialRefId: originalRef },
+      },
+    },
+  });
+  await refresh(page);
+  const actions: { action: string; input: Record<string, unknown> }[] = [];
+  page.on("request", (request) => {
+    if (
+      request.method() === "POST" &&
+      request.url().endsWith("/api/hardware/actions")
+    )
+      actions.push(request.postDataJSON());
+  });
+  await button(page, "Select Atlas SSH").click();
+  await button(page, "Edit hardware").click();
+  await expect(label(page, "SSH password")).toHaveValue("");
+  await label(page, "SSH host").fill("192.0.2.42");
+  await label(page, "SSH password").fill("replacement fixture password");
+  let release!: () => void;
+  lab.connectionCheckGate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    await button(page, "Test connection").click();
+    await expect.poll(() => lab.connectionChecks.length).toBe(1);
+    await expect(button(page, "Testing connection…")).toBeDisabled();
+    await expect(label(page, "SSH host")).toBeDisabled();
+    const tested = lab.connectionChecks[0]!;
+    expect(tested.host).toBe("192.0.2.42");
+    const testedRef = String(
+      (tested.auth as { credentialRefId: string }).credentialRefId,
+    );
+    expect(testedRef).not.toBe(originalRef);
+    expect(await sshPasswords.resolve(testedRef)).toBe(
+      "replacement fixture password",
+    );
+    const unchanged = (await lab.service.snapshot(operator)).items.find(
+      (value) => value.item.id === lab.ssh.id,
+    )!.item;
+    expect(unchanged.config.host).toBe("atlas.example");
+    expect(unchanged.config.auth).toEqual({
+      kind: "password",
+      credentialRefId: originalRef,
+    });
+    expect(
+      actions.filter((value) => value.action === "hardware.items.update"),
+    ).toHaveLength(0);
+    release();
+    await expect(label(page, "SSH connection test")).toContainText(
+      "Connection succeeded",
+    );
+    await expect(label(page, "SSH connection test")).toContainText(
+      "192.0.2.42",
+    );
+    await expect(label(page, "SSH password")).toHaveValue("");
+    await screenshot(
+      page,
+      info,
+      "11-ssh-draft-connection",
+      "SSH connection test",
+    );
+    await button(page, "Save hardware").click();
+    await expect(button(page, "Select Atlas SSH")).toBeVisible();
+    const saved = (await lab.service.snapshot(operator)).items.find(
+      (value) => value.item.id === lab.ssh.id,
+    )!.item;
+    expect(saved.config.host).toBe("192.0.2.42");
+    expect(
+      (saved.config.auth as { credentialRefId: string }).credentialRefId,
+    ).toBe(testedRef);
+    await button(page, "Select Atlas SSH").click();
+    await button(page, "Edit hardware").click();
+    await expect(label(page, "SSH password")).toHaveValue("");
+    await button(page, "Test connection").click();
+    await expect.poll(() => lab.connectionChecks.length).toBe(2);
+    expect(lab.connectionChecks[1]!.auth).toEqual(saved.config.auth);
+    expect(JSON.stringify(actions)).not.toContain("fixture password");
+    expect(JSON.stringify(await lab.service.snapshot(operator))).not.toContain(
+      "fixture password",
+    );
+  } finally {
+    release?.();
+  }
+});
+
+test("SSH connection checks: report authentication failure and invalidate the result after an edit", async ({
+  page,
+}, info) => {
+  lab.connectionCheckOutcome = {
+    state: "completed",
+    value: {
+      online: false,
+      error: {
+        code: "SSH_AUTH_FAILED",
+        message:
+          "SSH authentication was rejected. Check the username and password.",
+      },
+    },
+  };
+  await button(page, "Select Atlas SSH").click();
+  await button(page, "Edit hardware").click();
+  await button(page, "Test connection").click();
+  await expect(label(page, "SSH connection test")).toContainText(
+    "SSH authentication was rejected",
+  );
+  await expect(label(page, "SSH connection test")).toContainText(
+    "atlas.example",
+  );
+  await expect
+    .poll(async () => (await lab.service.snapshot(operator)).checkHolds.length)
+    .toBe(0);
+  await screenshot(
+    page,
+    info,
+    "12-ssh-authentication-failure",
+    "SSH connection test",
+  );
+  await label(page, "SSH host").fill("192.0.2.43");
+  await expect(label(page, "SSH connection test")).toContainText(
+    "Connection settings changed since this test",
+  );
+  await expect(label(page, "SSH connection test")).not.toContainText(
+    "SSH authentication was rejected",
+  );
+  lab.connectionCheckOutcome = { state: "completed", value: { online: true } };
+  await button(page, "Test connection").click();
+  await expect(label(page, "SSH connection test")).toContainText(
+    "Connection succeeded",
+  );
+  await expect(label(page, "SSH connection test")).toContainText("192.0.2.43");
+  expect(lab.connectionChecks).toHaveLength(2);
+});
+
+test("SSH connection checks: new machines default to periodic login and can disable it", async ({
+  page,
+}, info) => {
+  await newSsh(page, "Periodic SSH", { automaticChecks: true });
+  await expect(label(page, "Enable automatic SSH login checks")).toBeChecked();
+  await expect(label(page, "SSH login check interval")).toHaveValue("60");
+  await expect(button(page, "Test connection")).toBeDisabled();
+  await label(page, "Enable automatic SSH login checks").uncheck();
+  await button(page, "Save hardware").click();
+  await expect(button(page, "Select Periodic SSH")).toBeVisible();
+  const item = (await lab.service.snapshot(operator)).items.find(
+    (value) => value.item.name === "Periodic SSH",
+  )!.item;
+  expect(item.config.onlineCheckIntervalMs).toBeNull();
+  await button(page, "Select Periodic SSH").click();
+  await button(page, "Edit hardware").click();
+  await expect(
+    label(page, "Enable automatic SSH login checks"),
+  ).not.toBeChecked();
+  await label(page, "Enable automatic SSH login checks").check();
+  await label(page, "SSH login check interval").fill("2");
+  await button(page, "Save hardware").click();
+  await expect
+    .poll(
+      async () =>
+        (await lab.service.snapshot(operator)).items.find(
+          (value) => value.item.id === item.id,
+        )!.connectionCheck?.online,
+    )
+    .toBe(true);
+  await refresh(page);
+  await expect(
+    label(page, "SSH login status").filter({ hasText: "Online" }).first(),
+  ).toBeVisible();
+  await button(page, "Select Periodic SSH").click();
+  await screenshot(page, info, "13-ssh-periodic-status");
+});
+
+test("SSH connection checks: a held editor opens the exact hold instead of bypassing its owner", async ({
+  page,
+}) => {
+  await lab.mutate(
+    "hardware.reserve",
+    {
+      hardwareId: lab.ssh.id,
+      expectedItemRevision: lab.ssh.revision,
+      purpose: "Other tab is using this machine",
+    },
+    worker,
+  );
+  const claim = (await lab.service.snapshot(operator)).reservations[0]!;
+  await refresh(page);
+  await button(page, "Select Atlas SSH").click();
+  await button(page, "Edit hardware").click();
+  await expect(label(page, "SSH host")).toBeDisabled();
+  await expect(button(page, "Test connection")).toBeDisabled();
+  await button(page, "Inspect hold").click();
+  await expect(
+    page.getByRole("region", { name: "Hold details", exact: true }),
+  ).toContainText(claim.reservationId);
+  expect(lab.connectionChecks).toHaveLength(0);
+  expect((await lab.service.snapshot(operator)).reservations[0]!.owner).toEqual(
+    worker,
+  );
+});
+
+test("SSH connection checks: a lost response inspects the original test without replay", async ({
+  page,
+}) => {
+  let dispatched = 0;
+  await page.route("**/api/hardware/actions", async (route) => {
+    const body = route.request().postDataJSON();
+    if (body.action !== "hardware.connection.check") return route.continue();
+    dispatched++;
+    const response = await route.fetch({
+      url: route.request().url().replace("hardware.test", "127.0.0.1"),
+    });
+    const result = await response.json();
+    await lab.settled(result.result.receipt);
+    await route.abort("connectionfailed");
+  });
+  await button(page, "Select Atlas SSH").click();
+  await button(page, "Edit hardware").click();
+  await button(page, "Test connection").click();
+  await expect(page.getByRole("alert").first()).toContainText(
+    "OUTCOME_UNKNOWN",
+  );
+  await button(page, "Inspect original receipt").click();
+  await expect(
+    page.getByRole("article", { name: "Operation receipt" }),
+  ).toContainText("succeeded");
+  await button(page, "Reconnect").click();
+  expect(dispatched).toBe(1);
+  expect(lab.connectionChecks).toHaveLength(1);
+});
+
+for (const actionButton of ["Test connection", "Save hardware"]) {
+  test(`SSH connection checks: ${actionButton} cannot dispatch after disconnect during password storage`, async ({
+    page,
+  }) => {
+    const actions: string[] = [];
+    page.on("request", (request) => {
+      if (
+        request.method() === "POST" &&
+        request.url().endsWith("/api/hardware/actions")
+      )
+        actions.push(request.postDataJSON().action);
+    });
+    let release!: () => void;
+    const passwordGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let writing = false;
+    await page.route("**/api/hardware/ssh-passwords/*", async (route) => {
+      writing = true;
+      await passwordGate;
+      await route.continue();
+    });
+    await button(page, "Select Atlas SSH").click();
+    await button(page, "Edit hardware").click();
+    await label(page, "SSH authentication").selectOption("password");
+    await label(page, "SSH password").fill("deferred fixture password");
+    try {
+      await button(page, actionButton).click();
+      await expect.poll(() => writing).toBe(true);
+      await page.route("**/api/hardware/state", (route) =>
+        route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({
+            code: "SERVICE_UNAVAILABLE",
+            message: "Fixture disconnected while storing the password.",
+          }),
+        }),
+      );
+      await expect(button(page, "Reconnect")).toBeEnabled();
+      release();
+      await expect(label(page, "SSH password")).toHaveValue("");
+      await expect
+        .poll(() =>
+          button(page, "Back to inventory").evaluate(
+            (element) => (element as HTMLButtonElement).disabled,
+          ),
+        )
+        .toBe(false);
+      expect(actions).toEqual([]);
+      expect(lab.connectionChecks).toHaveLength(0);
+      const item = (await lab.service.snapshot(operator)).items.find(
+        (value) => value.item.id === lab.ssh.id,
+      )!.item;
+      expect(item.config.auth).toEqual({ kind: "agent" });
+    } finally {
+      release?.();
+    }
+  });
 }
 
 test("SSH authentication: default agent needs no socket or known-hosts path", async ({
@@ -1778,6 +2085,7 @@ test("stale item drafts stay on their original revision and held identity fields
   await refresh(page);
   await expect(label(page, "Hardware name")).toHaveValue("Draft name");
   await expect(button(page, "Save hardware")).toBeDisabled();
+  await expect(button(page, "Test connection")).toBeDisabled();
   await button(page, "Discard draft and load current item").click();
   await expect(label(page, "Notes for agents")).toHaveValue(
     "Changed elsewhere",
@@ -1792,6 +2100,7 @@ test("stale item drafts stay on their original revision and held identity fields
   });
   await refresh(page);
   await expect(label(page, "SSH host")).toBeDisabled();
+  await expect(button(page, "Test connection")).toBeDisabled();
   await expect(label(page, "Physical resource group")).toBeDisabled();
   await expect(button(page, "Delete hardware")).toBeDisabled();
   await label(page, "Notes for agents").fill("Changed while reserved");

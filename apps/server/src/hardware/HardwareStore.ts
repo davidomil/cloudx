@@ -143,7 +143,13 @@ export function validateHardwareState(value: unknown): HardwareStoredState {
       if (hold.lastOwnerObservedAt !== undefined) timestamp(hold.lastOwnerObservedAt);
     } else {
       timestamp(hold.startedAt);
-      requireHardware(hold.kind === "system_check" && ["checking", "recovery_required"].includes(hold.state) && Array.isArray(hold.bindingRevisions) && hold.bindingRevisions.length > 0 && hold.bindingRevisions.length <= 128, "STORE_UNAVAILABLE", "Invalid checking hold.");
+      const connection = hold.connectionCheck === undefined ? undefined : hardwareRecord(hold.connectionCheck, "Connection-check identity");
+      if (connection) {
+        requireHardware(Object.keys(connection).every(key => ["itemRevision", "diagnostics"].includes(key)) && Object.hasOwn(connection, "itemRevision"), "STORE_UNAVAILABLE", "Invalid connection-check identity.");
+        hardwareInteger(connection.itemRevision, "Connection-check item revision");
+        if (connection.diagnostics !== undefined) { hardwareRecord(connection.diagnostics, "Connection-check diagnostics"); validateHardwareJson(connection.diagnostics); requireHardware(Buffer.byteLength(JSON.stringify(connection.diagnostics)) <= 64 * 1024, "STORE_UNAVAILABLE", "Connection-check diagnostics exceed their bound."); }
+      }
+      requireHardware(hold.kind === "system_check" && ["checking", "recovery_required"].includes(hold.state) && Array.isArray(hold.bindingRevisions) && hold.bindingRevisions.length <= 128 && (connection ? hold.bindingRevisions.length === 0 && item.typeId === "hardware.ssh" : hold.bindingRevisions.length > 0), "STORE_UNAVAILABLE", "Invalid checking hold.");
       for (const binding of hold.bindingRevisions) { hardwareId(binding.definitionId); hardwareInteger(binding.revision, "Checking binding revision"); }
     }
   }

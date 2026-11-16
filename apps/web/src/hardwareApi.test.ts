@@ -94,7 +94,71 @@ const snapshot = {
   readiness: { state: "ready" },
 };
 
+const connectionSnapshot = (connectionCheck: unknown) => ({
+  ...snapshot,
+  items: [
+    {
+      item: {
+        id: "ssh",
+        revision: 1,
+        notesRevision: 1,
+        name: "SSH",
+        description: "",
+        enabled: true,
+        physicalResourceId: "rack",
+        typeId: "hardware.ssh",
+        configVersion: 1,
+        config: {},
+        tagIds: [],
+        notes: "",
+        statuses: [],
+        hooks: {},
+      },
+      observations: [],
+      reservation: null,
+      availability: "available",
+      blockers: [],
+      connectionCheck,
+    },
+  ],
+});
+const checkedConnection = {
+  online: false,
+  error: { code: "SSH_AUTH_FAILED", message: "Authentication rejected." },
+  itemRevision: 1,
+  checkedAt: "2026-11-15T22:00:00.000Z",
+  expiresAt: "2026-11-15T22:02:00.000Z",
+};
+
 describe("Hardware browser transport", () => {
+  it("keeps a measured SSH login failure distinct from reservation availability", async () => {
+    const state = connectionSnapshot(checkedConnection);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response(state)));
+    await expect(getHardwareState()).resolves.toEqual(state);
+  });
+
+  it.each([
+    { ...checkedConnection, online: "false" },
+    { ...checkedConnection, itemRevision: 0 },
+    { ...checkedConnection, checkedAt: "yesterday" },
+    { ...checkedConnection, expiresAt: "2026-11-15T21:00:00.000Z" },
+    { ...checkedConnection, error: { code: "bad", message: 42 } },
+    { ...checkedConnection, diagnostics: [] },
+  ])(
+    "rejects a malformed SSH observation before rendering online status %#",
+    async (connectionCheck) => {
+      vi.stubGlobal(
+        "fetch",
+        vi
+          .fn()
+          .mockResolvedValue(response(connectionSnapshot(connectionCheck))),
+      );
+      await expect(getHardwareState()).rejects.toMatchObject({
+        code: "INVALID_RESPONSE",
+      });
+    },
+  );
+
   it("reads a direct state view without caching and rejects a broken inventory", async () => {
     const fetch = vi
       .fn()

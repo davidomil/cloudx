@@ -12,6 +12,7 @@ import type { HardwareMutationResult, JsonObject, OperationReceipt, SshConfig } 
 import { PathPolicy } from "../../pathPolicy.js";
 import { HardwareService } from "../HardwareService.js";
 import { SshHardwareProvider, serializeSftpPath, sshArguments } from "./SshHardwareProvider.js";
+import { BoundedProcessSet } from "./BoundedProcess.js";
 import { transportTestContext } from "./TransportTestContext.js";
 
 const exec = promisify(execFile);
@@ -56,6 +57,17 @@ describe("SSH configuration and batch boundaries", () => {
     expect(() => provider.parseConfig({ ...defaults, auth: { kind: "password", value: "plaintext" } })).toThrow();
   });
 
+  it("accepts the default periodic SSH check, a bounded interval, or an explicit disabled check", () => {
+    expect(provider.describeAccess(config).details.onlineCheckIntervalMs).toBe(60_000);
+    for (const onlineCheckIntervalMs of [null, 1000, 60_000, 86_400_000]) {
+      const parsed = provider.parseConfig({ ...config, onlineCheckIntervalMs });
+      expect(parsed.onlineCheckIntervalMs).toBe(onlineCheckIntervalMs);
+      expect(provider.describeAccess(parsed).details.onlineCheckIntervalMs).toBe(onlineCheckIntervalMs);
+    }
+    for (const onlineCheckIntervalMs of [0, 999, 86_400_001, 1000.5, "60000", false])
+      expect(() => provider.parseConfig({ ...config, onlineCheckIntervalMs })).toThrow();
+  });
+
   it("has the expected effective host OpenSSH configuration without opening a connection", async () => {
     const effective = await exec("/usr/bin/ssh", [...sshArguments(config), "-G", "--", config.host]);
     expect(effective.stdout).toContain("batchmode yes\n");
@@ -95,6 +107,138 @@ describe("SSH configuration and batch boundaries", () => {
       await new Promise<void>((resolve, reject) => agent.close(error => error ? reject(error) : resolve()));
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("SSH login connection checks", () => {
+  let directory: string;
+  let capture: string;
+  let executable: string;
+  let provider: SshHardwareProvider;
+  const config: SshConfig = { host: "online.test", port: 22, username: "tester", auth: { kind: "password", credentialRefId: "check-password" }, connectTimeoutMs: 1000 };
+  const context = (signal = new AbortController().signal) => ({ ...transportTestContext(signal), resolveCredential: async () => "private-password" });
+
+  beforeAll(async () => {
+    directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-ssh-check-"));
+    capture = path.join(directory, "capture.json");
+    executable = path.join(directory, "ssh");
+    await fs.writeFile(executable, `#!${process.execPath}\n` + String.raw`
+const fs=require('node:fs');
+const {execFileSync}=require('node:child_process');
+let input='';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data',chunk=>input+=chunk);
+process.stdin.on('end',()=>{
+  const host=process.argv.at(-2);
+  const answer=execFileSync(process.env.SSH_ASKPASS,["tester@"+host+"'s password: "],{env:process.env}).toString().trim();
+  fs.writeFileSync(process.env.CLOUDX_CHECK_CAPTURE,JSON.stringify({argv:process.argv.slice(2),environment:process.env,input,pid:process.pid}));
+  if(host==='waiting.test') { process.stdout.write('probe-started'); setInterval(()=>{},1000); return; }
+  if(host==='bounded.test') { process.stdout.write(answer+'\0'.repeat(100000)); process.exitCode=255; return; }
+  const failures={
+    'auth.test': 'tester@auth.test: Permission denied (password).',
+    'hostkey.test': 'Host key verification failed.',
+    'network.test': 'ssh: connect to host network.test port 22: Connection refused',
+    'blocked.example': 'ssh: connect to host blocked.example port 22: Permission denied',
+    'dns.test': 'ssh: Could not resolve hostname dns.test: Name or service not known',
+    'command.test': 'Login command not found',
+    'permission.test': 'Login command: Permission denied'
+  };
+  if(failures[host]) { process.stdout.write(answer); process.stderr.write(failures[host]); process.exitCode=host==='command.test'?127:host==='permission.test'?126:255; }
+});
+`.replace("process.env.CLOUDX_CHECK_CAPTURE", JSON.stringify(capture)), { mode: 0o700 });
+    provider = new SshHardwareProvider({ pathPolicy: new PathPolicy([directory]), sshExecutable: executable, environment: {} });
+  });
+  afterAll(async () => { vi.restoreAllMocks(); await fs.rm(directory, { recursive: true, force: true }); });
+
+  const check = async (host = config.host, checkContext = context(), interval?: number) => {
+    return provider.checkConnection({ ...config, host, ...(interval === undefined ? {} : { connectTimeoutMs: interval }) }, checkContext);
+  };
+
+  it("uses a fixed login command and closes its private password channel before reporting online", async () => {
+    const result = await check();
+    expect(result).toMatchObject({ state: "completed", value: { online: true, diagnostics: { exitCode: 0, interrupted: false } } });
+    const captured = JSON.parse(await fs.readFile(capture, "utf8"));
+    expect(captured.input).toBe("");
+    expect(captured.argv.at(-1)).toBe("exit 0");
+    expect(captured.argv).toEqual(expect.arrayContaining(["ConnectionAttempts=1", "StrictHostKeyChecking=accept-new", "ControlMaster=no", "PasswordAuthentication=yes", "KbdInteractiveAuthentication=no"]));
+    expect(JSON.stringify(captured)).not.toContain("private-password");
+    await expect(fs.stat(captured.environment.CLOUDX_SSH_ASKPASS_SOCKET)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(captured.environment.SSH_ASKPASS)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each([
+    ["auth.test", "SSH_AUTH_FAILED", "Permission denied"], ["hostkey.test", "SSH_HOST_KEY_FAILED", "Host key verification failed"],
+    ["network.test", "SSH_NETWORK_FAILED", "Connection refused"], ["dns.test", "SSH_NETWORK_FAILED", "Could not resolve hostname"],
+    ["command.test", "SSH_CHECK_FAILED", "not found"], ["permission.test", "SSH_CHECK_FAILED", "Permission denied"]
+  ])("reports %s as a completed negative check with bounded redacted diagnostics", async (host, code, message) => {
+    const result = await check(host);
+    expect(result).toMatchObject({ state: "completed", value: { online: false, error: { code }, diagnostics: { stdout: "[redacted]", stderr: expect.stringContaining(message), interrupted: false } } });
+    expect(JSON.stringify(result)).not.toContain("private-password");
+  });
+
+  it("reports a socket permission error as a network failure after confirmed cleanup", async () => {
+    const result = await check("blocked.example");
+    expect(result).toMatchObject({ state: "completed", value: { online: false, error: { code: "SSH_NETWORK_FAILED" }, diagnostics: { exitCode: 255, stdout: "[redacted]", stderr: "ssh: connect to host blocked.example port 22: Permission denied", interrupted: false } } });
+    const captured = JSON.parse(await fs.readFile(capture, "utf8"));
+    expect(() => process.kill(captured.pid, 0)).toThrow();
+    await expect(fs.stat(captured.environment.CLOUDX_SSH_ASKPASS_SOCKET)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(captured.environment.SSH_ASKPASS)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(JSON.stringify(result)).not.toContain("private-password");
+  });
+
+  it("bounds diagnostic output independently of how much the SSH peer writes", async () => {
+    const result = await check("bounded.test");
+    expect(result).toMatchObject({ state: "completed", value: { online: false, diagnostics: { truncated: true } } });
+    if (result.state !== "completed") throw new Error(JSON.stringify(result));
+    const diagnostics = result.value.diagnostics!;
+    expect(Buffer.byteLength(diagnostics.stdout as string) + Buffer.byteLength(diagnostics.stderr as string)).toBeLessThanOrEqual(64 * 1024);
+    expect(JSON.stringify(result)).not.toContain("private-password");
+  });
+
+  it.each(["cancelled", "deadline"])("reports a %s fixed probe only after its local process has closed", async mode => {
+    await fs.rm(capture, { force: true });
+    const controller = new AbortController();
+    const checking = check("waiting.test", context(controller.signal), mode === "deadline" ? 1 : 1000);
+    await vi.waitFor(async () => expect(JSON.parse(await fs.readFile(capture, "utf8")).pid).toBeGreaterThan(0));
+    const captured = JSON.parse(await fs.readFile(capture, "utf8"));
+    if (mode === "cancelled") controller.abort();
+    await expect(checking).resolves.toMatchObject({ state: "completed", value: { online: false, error: { code: mode === "cancelled" ? "CANCELLED" : "TIMEOUT" }, diagnostics: { interrupted: true } } });
+    expect(() => process.kill(captured.pid, 0)).toThrow();
+    await expect(fs.stat(captured.environment.CLOUDX_SSH_ASKPASS_SOCKET)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("registers cancellation cleanup before credentials resolve and never spawns after cancellation", async () => {
+    await fs.rm(capture, { force: true });
+    let supply!: (password: string) => void, entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const checkContext = { ...context(), resolveCredential: () => { expect(checkContext.cleanups).toHaveLength(1); entered(); return new Promise<string>(resolve => { supply = resolve; }); } };
+    const checking = check(config.host, checkContext);
+    await started;
+    const closing = checkContext.cleanups[0]!(signal());
+    supply("private-password");
+    await expect(checking).resolves.toMatchObject({ state: "completed", value: { online: false, error: { code: "CANCELLED" } } });
+    await expect(closing).resolves.toMatchObject({ state: "completed" });
+    await expect(fs.stat(capture)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("returns unknown only when native cleanup cannot be confirmed", async () => {
+    const close = vi.spyOn(BoundedProcessSet.prototype, "close").mockResolvedValue({ state: "unknown", error: { code: "CLEANUP_UNKNOWN", message: "Controlled native cleanup failure." } });
+    try { await expect(check()).resolves.toMatchObject({ state: "unknown", error: { code: "SSH_CHECK_CLEANUP_UNKNOWN" }, diagnostics: { exitCode: 0 } }); }
+    finally { close.mockRestore(); }
+  });
+
+  it("keeps missing credentials and a pre-cancelled check out of the native process", async () => {
+    await fs.rm(capture, { force: true });
+    await expect(check(config.host, { ...context(), resolveCredential: async () => { throw new Error("private-password"); } })).resolves.toMatchObject({ state: "completed", value: { online: false, error: { code: "CREDENTIAL_UNAVAILABLE" } } });
+    await expect(check(config.host, context(AbortSignal.abort()))).resolves.toMatchObject({ state: "completed", value: { online: false, error: { code: "CANCELLED" } } });
+    await expect(fs.stat(capture)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("reports local endpoint and spawn failures as completed negative checks", async () => {
+    const unavailable = new SshHardwareProvider({ pathPolicy: new PathPolicy([directory]), sshExecutable: path.join(directory, "missing-ssh") });
+    await expect(unavailable.checkConnection(config, context())).resolves.toMatchObject({ state: "completed", value: { online: false, error: { code: "ENDPOINT_UNAVAILABLE" } } });
+    const notExecutable = new SshHardwareProvider({ pathPolicy: new PathPolicy([directory]), sshExecutable: directory });
+    await expect(notExecutable.checkConnection(config, context())).resolves.toMatchObject({ state: "completed", value: { online: false, error: { code: "SSH_NOT_STARTED" }, diagnostics: { state: "not_started" } } });
   });
 });
 
@@ -258,6 +402,18 @@ describe.skipIf(!existsSync("/usr/sbin/sshd") || !existsSync("/usr/lib/openssh/s
     const marker = path.join(directory, "path is data; touch SHOULD_NOT_EXIST");
     const escaped = marker.replace(/'/g, "'\\''");
     await expect(connection.invoke("ssh.exec", { script: `printf '%s' '${escaped}'`, timeoutMs: 3000, maxOutputBytes: 1024 }, signal())).resolves.toMatchObject({ state: "completed", value: { stdout: marker } });
+  });
+
+  it("checks native SSH login and reports authentication, host-key, and network failures without an effect hold", async () => {
+    await expect(provider.checkConnection(config, transportTestContext())).resolves.toMatchObject({ state: "completed", value: { online: true, diagnostics: { exitCode: 0 } } });
+    const untrustedKey = path.join(directory, "untrusted-key");
+    await exec("/usr/bin/ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", untrustedKey]);
+    await expect(provider.checkConnection({ ...config, auth: { kind: "identity_file", path: untrustedKey } }, transportTestContext())).resolves.toMatchObject({ state: "completed", value: { online: false, error: { code: "SSH_AUTH_FAILED" }, diagnostics: { exitCode: 255, stderr: expect.stringContaining("Permission denied") } } });
+    const publicKey = (await fs.readFile(`${untrustedKey}.pub`, "utf8")).trim().split(" ").slice(0, 2).join(" ");
+    const changedHosts = path.join(directory, "changed-hosts");
+    await fs.writeFile(changedHosts, `[${config.host}]:${config.port} ${publicKey}\n`);
+    await expect(provider.checkConnection({ ...config, knownHostsFile: changedHosts }, transportTestContext())).resolves.toMatchObject({ state: "completed", value: { online: false, error: { code: "SSH_HOST_KEY_FAILED" }, diagnostics: { exitCode: 255 } } });
+    await expect(provider.checkConnection({ ...config, port: await unusedPort() }, transportTestContext())).resolves.toMatchObject({ state: "completed", value: { online: false, error: { code: "SSH_NETWORK_FAILED" }, diagnostics: { exitCode: 255 } } });
   });
 
   it("bounds combined stdout and stderr while draining both streams", async () => {

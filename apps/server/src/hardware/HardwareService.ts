@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import type { HardwareAccessContext, HardwareConnection, HardwareTypeProvider } from "@cloudx/plugin-api";
-import { hardwareId, hardwareInteger, hardwareRecord, hardwareText, isRecord, parseHardwareItem, parseHardwareOwner, validateHardwareJson, validateHardwareStatusValue, type BashScript, type CapabilityTag, type HardwareEndpointInspection, type HardwareFilter, type HardwareItem, type HardwareMutationResult, type HardwareOwner, type HardwareReservation, type HardwareReservationRecord, type HardwareRetentionSettings, type HardwareStateView, type HardwareSummary, type JsonObject, type OperationReceipt, type PhysicalResource, type ProviderOutcome, type ReservationRef, type StatusDefinition, type StatusObservation } from "@cloudx/shared";
+import { DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS, hardwareId, hardwareInteger, hardwareRecord, hardwareText, isRecord, parseHardwareConnectionObservation, parseHardwareItem, parseHardwareOwner, validateHardwareJson, validateHardwareStatusValue, type BashScript, type CapabilityTag, type HardwareConnectionObservation, type HardwareConnectionResult, type HardwareEndpointInspection, type HardwareFilter, type HardwareItem, type HardwareMutationResult, type HardwareOwner, type HardwareReservation, type HardwareReservationRecord, type HardwareRetentionSettings, type HardwareStateView, type HardwareSummary, type JsonObject, type OperationReceipt, type PhysicalResource, type ProviderOutcome, type ReservationRef, type SshConfig, type StatusDefinition, type StatusObservation } from "@cloudx/shared";
 import type { PathPolicy } from "../pathPolicy.js";
 import { HardwareError, hardwareInput, requireHardware } from "./HardwareError.js";
 import { HardwareScriptRunner, type HardwareScriptResult } from "./HardwareScriptRunner.js";
@@ -25,6 +25,9 @@ interface Endpoint { provider?: HardwareTypeProvider<unknown>; config?: unknown;
 interface Inventory { endpoints: Map<string, Endpoint>; groupKeys: Map<string, string[]>; conflictingGroups: Set<string> }
 interface Task { ref?: ReservationRef; hardwareId: string; controller: AbortController; promise: Promise<void> }
 interface Access { generation: number; connection?: HardwareConnection; cleanup: Array<(signal: AbortSignal) => Promise<ProviderOutcome<null>>> }
+interface ConnectionCheckWork { runId: string; generation: number; item: HardwareItem; candidate: HardwareItem; resourceKeys: string[]; draft: boolean; scheduled: boolean }
+interface ConnectionCheckRun { cleanup: Access["cleanup"]; outcome?: ProviderOutcome<HardwareConnectionResult> }
+type ScheduledCheck = { item: HardwareItem; resourceKeys: string[]; observedAt: number } & ({ kind: "connection" } | { kind: "statuses"; statusIds: string[] });
 interface RevokedCleanup {
   runId: string; hardwareId: string; priorRef?: ReservationRef; currentRef?: ReservationRef; checkRunId?: string;
   generation: number; priorUncertainty: boolean; priorOperationIds: string[]; hook?: BashScript; priorReleaseRunId?: string;
@@ -50,6 +53,8 @@ export class HardwareService {
   private readonly tasks = new Map<string, Task>();
   private readonly lanes = new Map<string, Promise<void>>();
   private readonly access = new Map<string, Access>();
+  private readonly connectionChecks = new Map<string, HardwareConnectionObservation>();
+  private readonly connectionRuns = new Map<string, ConnectionCheckRun>();
   private ready = false;
   private stopping = false;
   private unavailableReason?: string;
@@ -145,6 +150,7 @@ export class HardwareService {
     if (action === "hardware.release") return this.release(input, owner);
     if (action === "hardware.forceRelease") return this.override(input, owner);
     if (action === "hardware.statuses.refresh") return this.refresh(input, owner);
+    if (action === "hardware.connection.check") return this.checkConnection(input, owner);
     if (action === "hardware.ssh.registerKey") return this.registerSshKey(input, owner);
     if (["hardware.access.open", "hardware.access.invoke", "hardware.access.close"].includes(action)) return this.accessAction(action, input, owner);
     if (/^hardware\.(items|tags|groups|statuses)\.(create|update|delete|set)$/.test(action)) return this.manage(action, input, owner);
@@ -396,7 +402,8 @@ export class HardwareService {
         }
       } else if (work.checkRunId) {
         const check = this.state.receipts.find(record => record.receipt.runId === work.checkRunId)?.receipt;
-        unresolved ||= !check || ["running", "unknown"].includes(check.state);
+        const connection = this.connectionRuns.get(work.checkRunId);
+        unresolved ||= connection ? !connection.outcome || connection.outcome.state === "unknown" : !check || ["running", "unknown"].includes(check.state);
       }
       const accepted = !unresolved || policy.kind === "operator" && policy.acceptUnresolvedExternalActivity;
       const value: JsonObject = policy.kind === "operator" ? { released: true, unresolvedActivityAccepted: unresolved, reason: policy.reason } : { released: true, nativeTabClosed: true, reason: policy.reason };
@@ -411,6 +418,7 @@ export class HardwareService {
         if (work.checkRunId) { const check = next.checkHolds.find(record => record.runId === work.checkRunId && record.generation === work.generation); if (check) { if (accepted) next.checkHolds = next.checkHolds.filter(record => record !== check); else { check.state = "recovery_required"; check.revision++; check.recoveryReason = "Operator acknowledgement of unresolved checking activity is required."; } } }
         this.addHistory(next, policy.kind === "operator" ? accepted ? "override_released" : "override_held" : accepted ? "native_tab_released" : "native_tab_held", policy.reason, owner, held, work.hardwareId);
       });
+      if (work.checkRunId && !this.state.checkHolds.some(hold => hold.runId === work.checkRunId)) this.connectionRuns.delete(work.checkRunId);
     });
   }
 
@@ -500,6 +508,111 @@ export class HardwareService {
       });
     }); }
     return result;
+  }
+
+  private async checkConnection(input: Record<string, unknown>, owner: HardwareOwner, scheduled = false): Promise<HardwareMutationResult | undefined> {
+    requireHardware(owner.kind === "user", "FORBIDDEN", "Connection tests belong to the user.");
+    fields(input, ["requestId", "hardwareId", "expectedItemRevision", "config"]);
+    let dispatch: ConnectionCheckWork | undefined;
+    const result = await this.change(async next => {
+      if (scheduled) requireHardware(this.capacity.canSchedule(next), "CAPACITY_EXCEEDED", "Hardware has no ordinary capacity for another connection check.");
+      const admitted = scheduled ? undefined : this.admit(next, "hardware.connection.check", input, owner);
+      if (admitted?.existing) return { receipt: admitted.record.receipt };
+      const item = this.requireItem(next, hardwareInput(() => hardwareId(input.hardwareId)));
+      this.requireRevision(item.revision, input.expectedItemRevision);
+      requireHardware(!scheduled || item.enabled, "INVALID_PHASE", "Disabled hardware cannot be checked automatically.");
+      const candidate = clone(item);
+      if (input.config !== undefined) candidate.config = clone(hardwareInput(() => hardwareRecord(input.config))) as JsonObject;
+      const provider = this.provider(candidate);
+      requireHardware(item.typeId === "hardware.ssh" && typeof provider.checkConnection === "function", "INVALID_INPUT", "This hardware provider does not support SSH connection checks.");
+      const current = await this.inspectInventory(next), prospectiveState = clone(next);
+      prospectiveState.items[prospectiveState.items.findIndex(record => record.id === item.id)] = candidate;
+      const prospective = await this.inspectInventory(prospectiveState);
+      requireHardware(!current.conflictingGroups.has(item.physicalResourceId) && !prospective.conflictingGroups.has(item.physicalResourceId), "ENDPOINT_CONFLICT", "Correct the cross-group endpoint conflict before testing this connection.");
+      requireHardware(prospective.endpoints.get(item.id)!.inspection.ready, "STATUS_NOT_READY", "The selected SSH connection has unavailable local prerequisites.");
+      const resourceKeys = [...new Set([...current.groupKeys.get(item.physicalResourceId)!, ...prospective.groupKeys.get(item.physicalResourceId)!])].sort();
+      this.requireNoHold(next, resourceKeys);
+      const runId = admitted?.record.receipt.runId ?? `connection-${randomUUID()}`, generation = next.nextGeneration++;
+      next.checkHolds.push({ kind: "system_check", runId, revision: 1, generation, hardwareId: item.id, resourceKeys, state: "checking", bindingRevisions: [], connectionCheck: { itemRevision: item.revision }, startedAt: now() });
+      if (scheduled) requireHardware(this.capacity.canSchedule(next), "CAPACITY_EXCEEDED", "Hardware has no ordinary capacity for this connection-check hold and its cleanup.");
+      dispatch = { runId, generation, item: clone(item), candidate, resourceKeys, draft: canonical(candidate.config) !== canonical(item.config), scheduled };
+      return admitted ? { receipt: admitted.record.receipt } : undefined;
+    });
+    if (dispatch) this.startConnectionCheck(dispatch);
+    return result;
+  }
+
+  private currentConnectionCheck(work: ConnectionCheckWork): void {
+    this.store.assertHeld();
+    requireHardware(this.state.checkHolds.some(hold => hold.runId === work.runId && hold.generation === work.generation && hold.state === "checking"), "STALE_RESERVATION", "The connection-check generation was revoked.");
+  }
+
+  private startConnectionCheck(work: ConnectionCheckWork): void {
+    const run: ConnectionCheckRun = { cleanup: [] };
+    this.connectionRuns.set(work.runId, run);
+    this.launch(work.item.id, work.runId, undefined, async signal => {
+      this.currentConnectionCheck(work);
+      const item = this.requireItem(this.state, work.item.id);
+      this.requireRevision(item.revision, work.item.revision);
+      const prospective = clone(this.state);
+      prospective.items[prospective.items.findIndex(record => record.id === item.id)] = work.candidate;
+      const inventory = await this.inspectInventory(prospective);
+      signal.throwIfAborted(); this.currentConnectionCheck(work);
+      requireHardware(inventory.endpoints.get(item.id)!.inspection.ready && !inventory.conflictingGroups.has(item.physicalResourceId) && inventory.groupKeys.get(item.physicalResourceId)!.every(key => work.resourceKeys.includes(key)), "INVALID_INPUT", "The SSH endpoint identity or prerequisites changed before dispatch.");
+      const provider = this.provider(work.candidate), config = provider.parseConfig(work.candidate.config);
+      const timeoutMs = (work.candidate.config as unknown as SshConfig).connectTimeoutMs + 5000;
+      let outcome = await bounded<HardwareConnectionResult>(signal, timeoutMs, childSignal => provider.checkConnection!(config, {
+        signal: childSignal,
+        resolveCredential: async id => { requireHardware(this.options.resolveCredential, "CREDENTIAL_UNAVAILABLE", "The configured hardware credential cannot be resolved."); return this.options.resolveCredential(id); },
+        registerCleanup: close => { this.currentConnectionCheck(work); childSignal.throwIfAborted(); run.cleanup.push(close); },
+      }), 2500);
+      if (outcome.state === "completed") {
+        try {
+          const value = hardwareRecord(outcome.value);
+          fields(value, ["online", "error", "diagnostics"], "INVALID_PROVIDER_OUTPUT");
+          validateHardwareJson(value);
+          const at = now(); parseHardwareConnectionObservation({ ...value, itemRevision: work.item.revision, checkedAt: at, expiresAt: at });
+        } catch { outcome = { state: "unknown", error: { code: "INVALID_PROVIDER_OUTPUT", message: "The SSH provider returned an invalid connection result after dispatch." } }; }
+      }
+      const noDispatch = outcome.state === "failed" && outcome.effects === "none";
+      let cleanupConfirmed = noDispatch && !run.cleanup.length;
+      if (run.cleanup.length) {
+        cleanupConfirmed = true;
+        for (const close of run.cleanup) if ((await bounded(new AbortController().signal, 10_000, close)).state !== "completed") cleanupConfirmed = false;
+      }
+      if (!cleanupConfirmed) {
+        const diagnostics = outcome.state === "completed" ? outcome.value.diagnostics : outcome.diagnostics;
+        outcome = { state: "unknown", error: { code: "CLEANUP_UNCONFIRMED", message: "The SSH connection check could not confirm that its managed processes ended." }, ...(diagnostics ? { diagnostics } : {}) };
+      }
+      await this.finishConnectionCheck(work, run, outcome);
+    }, outcome => this.finishConnectionCheck(work, run, outcome));
+  }
+
+  private async finishConnectionCheck(work: ConnectionCheckWork, run: ConnectionCheckRun, outcome: ProviderOutcome<HardwareConnectionResult>): Promise<void> {
+    run.outcome = outcome;
+    const at = Date.now(), interval = (work.item.config as unknown as SshConfig).onlineCheckIntervalMs;
+    const maxAge = interval === null ? 60_000 : Math.max(60_000, 2 * (interval ?? DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS));
+    const result = outcome.state === "completed" ? outcome.value : { online: false, error: outcome.error, ...(outcome.diagnostics ? { diagnostics: outcome.diagnostics } : {}) };
+    const observation = parseHardwareConnectionObservation({ ...result, ...(result.diagnostics ? { diagnostics: connectionDiagnostics(result.diagnostics) } : {}), itemRevision: work.item.revision, checkedAt: new Date(at).toISOString(), expiresAt: new Date(at + maxAge).toISOString() });
+    let publish = false;
+    const update = (next: HardwareStoredState, receipt?: OperationReceipt) => {
+      if (receipt) receipt.result = json({ hardwareId: work.item.id, connectionCheck: observation, draft: work.draft });
+      const hold = next.checkHolds.find(hold => hold.runId === work.runId);
+      if (work.scheduled && outcome.state === "unknown" && observation.diagnostics && hold?.connectionCheck) hold.connectionCheck.diagnostics = clone(observation.diagnostics);
+      if (!hold || hold.generation !== work.generation) return;
+      if (outcome.state === "unknown") { hold.state = "recovery_required"; hold.revision++; hold.recoveryReason = outcome.error.message; }
+      else next.checkHolds = next.checkHolds.filter(record => record !== hold);
+      publish = !work.draft;
+    };
+    if (work.scheduled) await this.change(next => update(next), true);
+    else await this.finish(work.runId, undefined, outcome.state === "completed" ? { state: "completed", value: json(outcome.value) } : outcome, (next, _claim, receipt) => update(next, receipt));
+    const current = this.state.items.find(item => item.id === work.item.id);
+    if (publish && current?.revision === work.item.revision && canonical(current.config) === canonical(work.candidate.config)) {
+      const { diagnostics: _diagnostics, ...compact } = observation;
+      this.connectionChecks.set(work.item.id, compact);
+      this.notifyChange();
+    }
+    if (!this.state.checkHolds.some(hold => hold.runId === work.runId)) this.connectionRuns.delete(work.runId);
   }
 
   private async accessAction(action: string, input: Record<string, unknown>, owner: HardwareOwner, internal = false): Promise<HardwareMutationResult> {
@@ -810,6 +923,7 @@ export class HardwareService {
         throw error;
       }
       this.state = next;
+      if (this.connectionChecks.size) { const ids = new Set(next.items.map(item => item.id)); for (const id of this.connectionChecks.keys()) if (!ids.has(id)) this.connectionChecks.delete(id); }
       this.notifyChange();
       return clone(result);
     });
@@ -975,7 +1089,8 @@ export class HardwareService {
     }
     if (reservation) blockers.push(`Physical resource held: ${reservation.state}`);
     if (checkHold) blockers.push(`Physical resource held: ${checkHold.state}`);
-    return { item, observations, reservation: reservation ? publicClaim(reservation) : null, availability: reservation || checkHold ? "held" : blockers.length ? "ineligible" : "available", blockers, ...(checkHold ? { checkHold } : {}) };
+    const connectionCheck = this.connectionChecks.get(item.id);
+    return { item, observations, reservation: reservation ? publicClaim(reservation) : null, availability: reservation || checkHold ? "held" : blockers.length ? "ineligible" : "available", blockers, ...(checkHold ? { checkHold } : {}), ...(connectionCheck?.itemRevision === item.revision ? { connectionCheck: clone(connectionCheck) } : {}) };
   }
 
   private async list(action: string, input: Record<string, unknown>, owner: HardwareOwner): Promise<unknown> {
@@ -1056,7 +1171,7 @@ export class HardwareService {
   private cancelTasks(ref: ReservationRef): void {
     for (const task of this.tasks.values()) if (task.ref && sameRef(task.ref, ref)) task.controller.abort(new Error("The reservation no longer permits this operation."));
   }
-  private launch(hardwareIdValue: string, runId: string, ref: ReservationRef | undefined, run: (signal: AbortSignal) => Promise<void>): void {
+  private launch(hardwareIdValue: string, runId: string, ref: ReservationRef | undefined, run: (signal: AbortSignal) => Promise<void>, onFailure?: (outcome: Exclude<ProviderOutcome<never>, { state: "completed" }>) => Promise<void>): void {
     const controller = new AbortController();
     const claim = ref && this.state.reservations.find(claim => sameRef(claim, ref));
     const group = claim?.acquiredItem.physicalResourceId ?? this.state.items.find(item => item.id === hardwareIdValue)?.physicalResourceId ?? hardwareIdValue;
@@ -1067,9 +1182,9 @@ export class HardwareService {
       started = true;
       await run(controller.signal);
     }).catch(async error => {
-      const knownNoDispatch = !started || error instanceof HardwareError && ["INVALID_PHASE", "STALE_RESERVATION", "OWNER_CHANGED", "INVALID_INPUT", "CREDENTIAL_UNAVAILABLE", "PROVIDER_UNAVAILABLE"].includes(error.code);
-      const outcome: ProviderOutcome<JsonObject> = knownNoDispatch ? failure(error instanceof HardwareError ? error.code : "CANCELLED", "The operation was cancelled or rejected before dispatch.") : { state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "The admitted operation ended without a confirmed result. Inspect this held resource." } };
-      try { await this.finish(runId, ref, outcome, (next, held) => {
+      const knownNoDispatch = !started || error instanceof HardwareError && ["INVALID_PHASE", "STALE_RESERVATION", "OWNER_CHANGED", "INVALID_INPUT", "CREDENTIAL_UNAVAILABLE", "PROVIDER_UNAVAILABLE", ...(onFailure ? ["REVISION_CONFLICT"] : [])].includes(error.code);
+      const outcome: Exclude<ProviderOutcome<never>, { state: "completed" }> = knownNoDispatch ? { state: "failed", effects: "none", error: { code: error instanceof HardwareError ? error.code : "CANCELLED", message: "The operation was cancelled or rejected before dispatch." } } : { state: "unknown", error: { code: "OUTCOME_UNKNOWN", message: "The admitted operation ended without a confirmed result. Inspect this held resource." } };
+      try { if (onFailure) { await onFailure(outcome); return; } await this.finish(runId, ref, outcome, (next, held) => {
         if (held?.state === "preparing") this.recover(held, "Preparation did not produce a confirmed successful outcome.", "hook");
         const check = next.checkHolds.find(check => check.runId === runId);
         if (check) { if (knownNoDispatch) next.checkHolds = next.checkHolds.filter(hold => hold !== check); else { check.state = "recovery_required"; check.revision++; check.recoveryReason = "The checking process has an uncertain outcome."; } }
@@ -1138,12 +1253,35 @@ export class HardwareService {
       }
       if (!this.capacity.canSchedule(this.state)) return;
       const state = clone(this.state), inventory = await this.inspectInventory(state);
+      const checks: ScheduledCheck[] = [];
       for (const item of state.items) {
         const keys = inventory.groupKeys.get(item.physicalResourceId)!;
         if (!item.enabled || !inventory.endpoints.get(item.id)?.inspection.ready || inventory.conflictingGroups.has(item.physicalResourceId) || [...state.reservations, ...state.checkHolds].some(hold => hold.resourceKeys.some(key => keys.includes(key)))) continue;
-        const due = item.statuses.filter(binding => binding.source === "command" && binding.intervalMs !== null && (!state.observations[item.id]?.some(observation => observation.definitionId === binding.definitionId && observation.bindingRevision === binding.revision && Date.parse(observation.observedAt) + binding.intervalMs! > Date.now()))).map(binding => binding.definitionId);
-        if (!due.length) continue;
-        try { await this.refresh({ requestId: `scheduled-${randomUUID()}`, hardwareId: item.id, statusIds: due }, { kind: "user", userId: "local" }); }
+        const due = item.statuses.filter(binding => binding.source === "command" && binding.intervalMs !== null && (!state.observations[item.id]?.some(observation => observation.definitionId === binding.definitionId && observation.bindingRevision === binding.revision && Date.parse(observation.observedAt) + binding.intervalMs! > Date.now())));
+        const interval = item.typeId === "hardware.ssh" ? (item.config as unknown as SshConfig).onlineCheckIntervalMs : null;
+        const connection = this.connectionChecks.get(item.id);
+        const connectionDue = interval !== null && inventory.endpoints.get(item.id)?.provider?.checkConnection && (!connection || connection.itemRevision !== item.revision || Date.parse(connection.checkedAt) + (interval ?? DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS) <= Date.now());
+        const lastStatusCheck = Math.min(...due.map(binding => {
+          const observation = state.observations[item.id]?.find(observation => observation.definitionId === binding.definitionId && observation.bindingRevision === binding.revision);
+          return observation ? Date.parse(observation.observedAt) : -Infinity;
+        }));
+        const lastConnectionCheck = connection?.itemRevision === item.revision ? Date.parse(connection.checkedAt) : -Infinity;
+        if (connectionDue) checks.push({ kind: "connection", item, resourceKeys: keys, observedAt: lastConnectionCheck });
+        if (due.length) checks.push({ kind: "statuses", item, resourceKeys: keys, observedAt: lastStatusCheck, statusIds: due.map(binding => binding.definitionId) });
+      }
+      checks.sort((a, b) => {
+        if (a.observedAt !== b.observedAt) return a.observedAt < b.observedAt ? -1 : 1;
+        if (a.kind !== b.kind) return a.kind === "connection" ? -1 : 1;
+        return a.item.id.localeCompare(b.item.id);
+      });
+      const admittedKeys = new Set<string>();
+      for (const check of checks) {
+        if (check.resourceKeys.some(key => admittedKeys.has(key))) continue;
+        try {
+          if (check.kind === "connection") await this.checkConnection({ hardwareId: check.item.id, expectedItemRevision: check.item.revision }, { kind: "user", userId: "local" }, true);
+          else await this.refresh({ requestId: `scheduled-${randomUUID()}`, hardwareId: check.item.id, statusIds: check.statusIds }, { kind: "user", userId: "local" });
+          for (const key of check.resourceKeys) admittedKeys.add(key);
+        }
         catch (error) { if (!(error instanceof HardwareError) || !["RESERVATION_CONFLICT", "CHECK_IN_PROGRESS", "RECOVERY_REQUIRED", "CAPACITY_EXCEEDED"].includes(error.code)) throw error; }
       }
     } finally { this.scheduling = false; }
@@ -1171,6 +1309,10 @@ function scriptDiagnostics(result: HardwareScriptResult, limit = 64 * 1024): Jso
   const stdout = Buffer.from(result.stdout).subarray(0, limit).toString("utf8");
   const stderr = Buffer.from(result.stderr).subarray(0, Math.max(0, limit - Buffer.byteLength(stdout))).toString("utf8");
   return json({ ...result, stdout, stderr, diagnosticsTruncated: stdout !== result.stdout || stderr !== result.stderr });
+}
+function connectionDiagnostics(value: JsonObject): JsonObject {
+  const text = JSON.stringify(value);
+  return Buffer.byteLength(text) <= 64 * 1024 ? clone(value) : { truncated: true, preview: Buffer.from(text).subarray(0, 16 * 1024).toString("utf8") };
 }
 async function bounded<T>(parent: AbortSignal, timeoutMs: number, work: (signal: AbortSignal) => Promise<ProviderOutcome<T>>, diagnosticSettlementMs = 0): Promise<ProviderOutcome<T>> {
   if (parent.aborted) return { state: "failed", effects: "none", error: { code: "CANCELLED", message: "Operation cancelled before dispatch." } };

@@ -1,4 +1,4 @@
-import type { HardwareAccessDescription, HardwareEndpointInspection, HardwareReservation, HardwareTypeDescriptor, JsonObject, ProviderOutcome } from "@cloudx/shared";
+import type { HardwareAccessDescription, HardwareConnectionResult, HardwareEndpointInspection, HardwareReservation, HardwareTypeDescriptor, JsonObject, ProviderOutcome } from "@cloudx/shared";
 
 export interface HardwareAccessContext {
   reservation: HardwareReservation;
@@ -13,11 +13,14 @@ export interface HardwareConnection {
   close(signal: AbortSignal): Promise<ProviderOutcome<null>>;
 }
 
+export type HardwareConnectionCheckContext = Pick<HardwareAccessContext, "signal" | "resolveCredential" | "registerCleanup">;
+
 export interface HardwareTypeProvider<Config> {
   readonly descriptor: HardwareTypeDescriptor;
   parseConfig(value: unknown): Config;
   inspectEndpoint(config: Config): Promise<HardwareEndpointInspection>;
   describeAccess(config: Config): HardwareAccessDescription;
   connect(config: Config, context: HardwareAccessContext): Promise<ProviderOutcome<HardwareConnection>>;
+  checkConnection?(config: Config, context: HardwareConnectionCheckContext): Promise<ProviderOutcome<HardwareConnectionResult>>;
   registerKey?(config: Config, input: JsonObject, context: HardwareAccessContext): Promise<ProviderOutcome<JsonObject>>;
 }

@@ -1,5 +1,6 @@
 import {
   isRecord,
+  parseHardwareConnectionObservation,
   parseHardwareItem,
   parseHardwareOwner,
   type HardwareMutationResult,
@@ -116,6 +117,8 @@ export async function getHardwareState(
       )
         throw new Error("Invalid item summary");
       parseHardwareItem(summary.item);
+      if (summary.connectionCheck !== undefined)
+        parseHardwareConnectionObservation(summary.connectionCheck);
     }
   } catch {
     throw new HardwareApiError(

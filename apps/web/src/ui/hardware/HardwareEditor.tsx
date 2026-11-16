@@ -1,11 +1,17 @@
-import { useEffect, useState } from "react";
-import { ArrowLeft, Plus, Save, Trash2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowLeft, Info, Plus, RefreshCw, Save, Trash2 } from "lucide-react";
+import {
+  DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS,
+  parseHardwareConnectionObservation,
+} from "@cloudx/shared";
 import type {
+  HardwareConnectionObservation,
   HardwareItem,
   HardwareItemDraft,
   HardwareStateView,
   HardwareSummary,
   JsonObject,
+  OperationReceipt,
   StatusBinding,
 } from "@cloudx/shared";
 import { ControlButton } from "../Control.js";
@@ -75,6 +81,7 @@ export function HardwareEditor({
   run,
   onClose,
   onSaved,
+  onInspectHold,
 }: {
   state: HardwareStateView;
   item?: HardwareItem;
@@ -84,6 +91,7 @@ export function HardwareEditor({
   run: HardwareRun;
   onClose: () => void;
   onSaved: () => void;
+  onInspectHold?: (id: string) => void;
 }) {
   const key = item?.id ?? "new";
   const [draft, setDraft] = useState<ItemEditDraft>(
@@ -99,6 +107,22 @@ export function HardwareEditor({
   const [passwordReference, setPasswordReference] = useState<string>();
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string>();
+  const [testing, setTesting] = useState(false);
+  const [connectionTest, setConnectionTest] = useState<{
+    receipt: OperationReceipt;
+    hardwareId: string;
+    config: string;
+    endpoint: string;
+    revision: number;
+  }>();
+  const working = useRef(false);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
   const { value } = draft;
   useEffect(() => {
     setPassword("");
@@ -109,40 +133,140 @@ export function HardwareEditor({
     drafts.set(key, draft);
   }, [draft, drafts, key]);
   const stale = Boolean(item && item.revision !== draft.baseRevision);
+  const latest = useRef({ item, held, stale, busy, run });
+  latest.current = { item, held, stale, busy, run };
+  const summary = state.items.find((entry) => entry.item.id === item?.id);
+  const hold = summary?.checkHold ?? summary?.reservation;
+  const testReceipt =
+    connectionTest?.receipt.state === "running"
+      ? (state.receipts.find(
+          (receipt) => receipt.requestId === connectionTest.receipt.requestId,
+        ) ?? connectionTest.receipt)
+      : connectionTest?.receipt;
+  const testPending = testing || testReceipt?.state === "running";
+  const testCurrent =
+    connectionTest?.hardwareId === item?.id &&
+    connectionTest?.config === JSON.stringify(value.config) &&
+    !password &&
+    !stale;
+  let testResult: HardwareConnectionObservation | undefined;
+  if (testReceipt?.state === "succeeded") {
+    try {
+      testResult = parseHardwareConnectionObservation(
+        testReceipt.result?.connectionCheck,
+      );
+    } catch {
+      /* The result remains visibly unconfirmed. */
+    }
+  }
+  const confirmedTestResult =
+    testResult &&
+    testReceipt?.result?.hardwareId === connectionTest?.hardwareId &&
+    testResult.itemRevision === connectionTest?.revision
+      ? testResult
+      : undefined;
   const edit = (patch: Partial<HardwareItemDraft>) =>
     setDraft({ ...draft, value: { ...value, ...patch } });
+  async function preparePassword(): Promise<HardwareItemDraft> {
+    if (
+      value.typeId !== "hardware.ssh" ||
+      (value.config.auth as JsonObject).kind !== "password"
+    )
+      return value;
+    if (!password) {
+      if (!(value.config.auth as JsonObject).credentialRefId)
+        throw new Error(
+          "Enter an SSH password before testing or saving password authentication.",
+        );
+      return value;
+    }
+    const credentialRefId =
+      passwordReference ?? `ssh-password-${hardwareRequestId()}`;
+    setPasswordReference(credentialRefId);
+    await saveHardwareSshPassword(credentialRefId, password);
+    const prepared = {
+      ...value,
+      config: { ...value.config, auth: { kind: "password", credentialRefId } },
+    };
+    if (alive.current) {
+      setPassword("");
+      setPasswordReference(undefined);
+      setDraft((current) => ({
+        ...current,
+        value: { ...current.value, config: prepared.config },
+      }));
+    }
+    return prepared;
+  }
+  async function testConnection() {
+    if (
+      working.current ||
+      testPending ||
+      busy ||
+      held ||
+      stale ||
+      !item ||
+      item.typeId !== "hardware.ssh"
+    )
+      return;
+    working.current = true;
+    setTesting(true);
+    setSaveError(undefined);
+    setConnectionTest(undefined);
+    try {
+      const capturedItem = item;
+      const prepared = await preparePassword();
+      if (!alive.current) return;
+      if (
+        latest.current.held ||
+        latest.current.stale ||
+        latest.current.busy ||
+        latest.current.item?.id !== capturedItem.id ||
+        latest.current.item.revision !== draft.baseRevision
+      ) {
+        setSaveError(
+          "The item changed or became held. Inspect the current hardware before testing its connection.",
+        );
+        return;
+      }
+      const receipt = await latest.current.run("hardware.connection.check", {
+        hardwareId: capturedItem.id,
+        expectedItemRevision: draft.baseRevision,
+        config: prepared.config,
+      });
+      if (receipt && alive.current)
+        setConnectionTest({
+          receipt,
+          hardwareId: capturedItem.id,
+          config: JSON.stringify(prepared.config),
+          endpoint: `${prepared.config.username}@${prepared.config.host}:${prepared.config.port}`,
+          revision: draft.baseRevision,
+        });
+    } catch (cause) {
+      if (alive.current)
+        setSaveError(
+          cause instanceof Error
+            ? cause.message
+            : "The SSH connection could not be tested.",
+        );
+    } finally {
+      working.current = false;
+      if (alive.current) setTesting(false);
+    }
+  }
   async function save() {
-    if (saving || busy || stale) return;
+    if (working.current || testPending || saving || busy || stale) return;
+    working.current = true;
     setSaving(true);
     setSaveError(undefined);
     try {
-      let savedValue = value;
-      if (
-        !held &&
-        value.typeId === "hardware.ssh" &&
-        (value.config.auth as JsonObject).kind === "password"
-      ) {
-        if (password) {
-          const credentialRefId =
-            passwordReference ?? `ssh-password-${hardwareRequestId()}`;
-          setPasswordReference(credentialRefId);
-          await saveHardwareSshPassword(credentialRefId, password);
-          setPassword("");
-          setPasswordReference(undefined);
-          savedValue = {
-            ...value,
-            config: {
-              ...value.config,
-              auth: { kind: "password", credentialRefId },
-            },
-          };
-          setDraft({ ...draft, value: savedValue });
-        } else if (!(value.config.auth as JsonObject).credentialRefId) {
-          setSaveError(
-            "Enter an SSH password before saving password authentication.",
-          );
-          return;
-        }
+      const savedValue = held ? value : await preparePassword();
+      if (!alive.current) return;
+      if (latest.current.stale || (!held && latest.current.held)) {
+        setSaveError(
+          "The item changed or became held. Your draft is retained; inspect the current hardware before saving.",
+        );
+        return;
       }
       const newGroupName =
         !held && !savedValue.physicalResourceId
@@ -161,7 +285,7 @@ export function HardwareEditor({
         : newGroupName !== undefined
           ? withoutGroup
           : savedValue;
-      const receipt = await run(
+      const receipt = await latest.current.run(
         item ? "hardware.items.update" : "hardware.items.create",
         item
           ? {
@@ -177,18 +301,20 @@ export function HardwareEditor({
                 : { newGroupName: draft.newGroupName }),
             },
       );
-      if (receipt?.state === "succeeded") {
+      if (receipt?.state === "succeeded" && alive.current) {
         drafts.delete(key);
         onSaved();
       }
     } catch (cause) {
-      setSaveError(
-        cause instanceof Error
-          ? cause.message
-          : "The SSH password could not be saved.",
-      );
+      if (alive.current)
+        setSaveError(
+          cause instanceof Error
+            ? cause.message
+            : "The SSH password could not be saved.",
+        );
     } finally {
-      setSaving(false);
+      working.current = false;
+      if (alive.current) setSaving(false);
     }
   }
   return (
@@ -201,7 +327,11 @@ export function HardwareEditor({
     >
       <header className="hardware-view-heading">
         <div>
-          <ControlButton size="compact" disabled={saving} onClick={onClose}>
+          <ControlButton
+            size="compact"
+            disabled={saving || testPending}
+            onClick={onClose}
+          >
             <ArrowLeft size={14} />
             Back to inventory
           </ControlButton>
@@ -216,10 +346,12 @@ export function HardwareEditor({
           This item changed while you were editing. Your draft is retained.
           <ControlButton
             size="compact"
+            disabled={saving || testPending}
             onClick={() => {
               setPassword("");
               setPasswordReference(undefined);
               setSaveError(undefined);
+              setConnectionTest(undefined);
               setDraft({
                 value: editableHardware(item!),
                 baseRevision: item!.revision,
@@ -232,17 +364,39 @@ export function HardwareEditor({
         </div>
       ) : null}
       {held ? (
-        <p className="hardware-banner">
-          Connection, group, statuses, and hooks are locked while this resource
-          is held. Notes and descriptive fields remain editable.
-        </p>
+        <div className="hardware-banner warning" role="status">
+          <div>
+            Connection, group, statuses, and hooks are locked while this
+            resource is held. Notes and descriptive fields remain editable.
+            {hold ? (
+              <small>
+                {hold.state.replaceAll("_", " ")}
+                {hold.recoveryReason ? `: ${hold.recoveryReason}` : ""}
+              </small>
+            ) : null}
+          </div>
+          {hold && onInspectHold ? (
+            <ControlButton
+              size="compact"
+              onClick={() =>
+                onInspectHold("runId" in hold ? hold.runId : hold.reservationId)
+              }
+            >
+              <Info size={14} />
+              Inspect hold
+            </ControlButton>
+          ) : null}
+        </div>
       ) : null}
       {saveError ? (
         <p role="alert" className="hardware-banner danger">
           {saveError}
         </p>
       ) : null}
-      <fieldset disabled={busy || saving} className="hardware-columns">
+      <fieldset
+        disabled={busy || saving || testPending}
+        className="hardware-columns"
+      >
         <div>
           <section className="hardware-card">
             <h3>Basics</h3>
@@ -405,9 +559,80 @@ export function HardwareEditor({
                   setSaveError(undefined);
                 }}
               />
-              <p className="hardware-muted">
-                No SSH connection opens while editing.
-              </p>
+              {value.typeId === "hardware.ssh" ? (
+                <>
+                  <div className="hardware-inline hardware-connection-actions">
+                    <ControlButton
+                      disabled={
+                        held ||
+                        stale ||
+                        busy ||
+                        saving ||
+                        testPending ||
+                        item?.typeId !== "hardware.ssh"
+                      }
+                      onClick={() => void testConnection()}
+                    >
+                      <RefreshCw size={14} />
+                      {testPending ? "Testing connection…" : "Test connection"}
+                    </ControlButton>
+                  </div>
+                  <p className="hardware-muted">
+                    {item?.typeId === "hardware.ssh"
+                      ? "Testing signs in with these settings and closes the connection. It does not save the hardware item. Replacement passwords are stored privately when testing or saving."
+                      : "Save this hardware item before testing its connection."}
+                  </p>
+                  {connectionTest ? (
+                    <section
+                      className="hardware-connection-result"
+                      aria-label="SSH connection test"
+                      role="status"
+                    >
+                      <strong>{connectionTest.endpoint}</strong>
+                      {!testCurrent ? (
+                        <p>
+                          Connection settings changed since this test. Test
+                          again to check the current draft.
+                        </p>
+                      ) : testPending ? (
+                        <p>Testing connection…</p>
+                      ) : confirmedTestResult ? (
+                        <>
+                          <p
+                            className={
+                              confirmedTestResult.online
+                                ? "positive"
+                                : "warning"
+                            }
+                          >
+                            {confirmedTestResult.online
+                              ? "Connection succeeded"
+                              : "SSH login failed"}
+                          </p>
+                          {confirmedTestResult.error ? (
+                            <p>
+                              {confirmedTestResult.error.code}:{" "}
+                              {confirmedTestResult.error.message}
+                            </p>
+                          ) : null}
+                          <small>
+                            Checked{" "}
+                            {new Date(
+                              confirmedTestResult.checkedAt,
+                            ).toLocaleString()}{" "}
+                            · Draft settings; hardware item unchanged.
+                          </small>
+                        </>
+                      ) : (
+                        <p>
+                          {testReceipt?.error?.message ??
+                            "No confirmed connection result is available. Inspect the operation receipt."}
+                        </p>
+                      )}
+                    </section>
+                  ) : null}
+                </>
+              ) : null}
             </section>
             <StatusBindings
               state={state}
@@ -422,7 +647,7 @@ export function HardwareEditor({
         {item ? (
           <ControlButton
             tone="danger"
-            disabled={busy || held || stale}
+            disabled={busy || saving || testPending || held || stale}
             title={
               held
                 ? "Release the resource before deleting hardware."
@@ -439,14 +664,16 @@ export function HardwareEditor({
             drafts.delete(key);
             onClose();
           }}
-          disabled={busy || saving}
+          disabled={busy || saving || testPending}
         >
           Cancel
         </ControlButton>
         <ControlButton
           tone="primary"
           type="submit"
-          disabled={busy || saving || stale || !state.types.length}
+          disabled={
+            busy || saving || testPending || stale || !state.types.length
+          }
         >
           <Save size={15} />
           Save hardware
@@ -509,14 +736,14 @@ function ConnectionFields({
   password: string;
   onPasswordChange: (password: string) => void;
 }) {
-  const set = (key: string, value: string | number | JsonObject) =>
+  const set = (key: string, value: string | number | null | JsonObject) =>
     onChange({ ...config, [key]: value });
   if (typeId === "hardware.ssh") {
     const auth = config.auth as JsonObject;
     return (
       <>
         <label>
-          Host
+          Host or IP address
           <input
             aria-label="SSH host"
             required
@@ -604,6 +831,12 @@ function ConnectionFields({
                 ? "Password saved on CloudX host"
                 : "Saved privately on the CloudX host. Hardware stores only a reference."}
             </span>
+            {auth.credentialRefId ? (
+              <span className="hardware-muted">
+                Leave blank to keep the saved password. Enter a replacement to
+                change it.
+              </span>
+            ) : null}
           </label>
         ) : auth.kind === "agent" ? (
           <p className="hardware-muted">
@@ -626,6 +859,51 @@ function ConnectionFields({
             }
           />
         </label>
+        <label className="hardware-checkbox">
+          <input
+            type="checkbox"
+            aria-label="Enable automatic SSH login checks"
+            checked={config.onlineCheckIntervalMs !== null}
+            onChange={(event) =>
+              set(
+                "onlineCheckIntervalMs",
+                event.target.checked
+                  ? DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS
+                  : null,
+              )
+            }
+          />
+          Check SSH login automatically
+        </label>
+        {config.onlineCheckIntervalMs !== null ? (
+          <label>
+            Check interval (seconds)
+            <input
+              type="number"
+              aria-label="SSH login check interval"
+              min={1}
+              max={86400}
+              step={0.001}
+              required
+              value={
+                Number(
+                  config.onlineCheckIntervalMs ??
+                    DEFAULT_SSH_ONLINE_CHECK_INTERVAL_MS,
+                ) / 1000
+              }
+              onChange={(event) =>
+                set(
+                  "onlineCheckIntervalMs",
+                  Math.round(Number(event.target.value) * 1000),
+                )
+              }
+            />
+          </label>
+        ) : null}
+        <p className="hardware-muted">
+          Automatic checks sign in using the saved SSH settings. Checks pause
+          while the physical group is held.
+        </p>
         <p className="hardware-banner">
           {config.knownHostsFile
             ? "Verifies host keys against the configured known-hosts file."

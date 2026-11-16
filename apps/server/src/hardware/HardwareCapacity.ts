@@ -8,6 +8,7 @@ export const HARDWARE_REQUEST_QUOTA = 100_000;
 export const HARDWARE_CLEANUP_RESERVE = 640 * 1024;
 export const HARDWARE_CLEANUP_COMPLETION = 512 * 1024;
 const FINAL_ADMISSION_MARGIN = 32 * 1024;
+const CONNECTION_RECOVERY_BYTES = 96 * 1024;
 export const HARDWARE_OPERATION_RESERVE = 4 * 1024 * 1024 + 128 * 1024;
 
 const cleanupActions = new Set(["hardware.release", "hardware.forceRelease", "hardware.access.close"]);
@@ -56,7 +57,15 @@ export class HardwareCapacity {
       const otherCompletions = completion - final.reduce((sum, record) => sum + this.completionReserve(record), 0);
       reserved = Math.max(reserved, otherCompletions + restarted);
     }
-    return Buffer.byteLength(JSON.stringify(state)) + 1 + reserved;
+    // Scheduled login checks have no receipt completion credit. Keep room for
+    // 64 KiB of serialized diagnostics and a JSON-escaped 4096-character reason,
+    // including late evidence after the checking generation has been revoked.
+    const connectionRecovery = state.checkHolds.reduce((sum, hold) => {
+      if (!hold.connectionCheck) return sum;
+      const saved = Buffer.byteLength(JSON.stringify({ connectionCheck: hold.connectionCheck, recoveryReason: hold.recoveryReason }));
+      return sum + Math.max(0, CONNECTION_RECOVERY_BYTES - saved);
+    }, 0);
+    return Buffer.byteLength(JSON.stringify(state)) + 1 + reserved + connectionRecovery;
   }
 
   private restartReceiptBytes(record: StoredHardwareReceipt): number {

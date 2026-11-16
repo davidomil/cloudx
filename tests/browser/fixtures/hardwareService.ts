@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { HardwareTypeProvider } from "@cloudx/plugin-api";
 import type {
   HardwareItem,
+  HardwareConnectionResult,
   HardwareItemDraft,
   HardwareMutationResult,
   HardwareOwner,
@@ -48,6 +49,9 @@ export class HardwareBrowserService {
     generation: number;
   }[] = [];
   readonly connections: { authKind: string; credentialRefId?: string }[] = [];
+  readonly connectionChecks: JsonObject[] = [];
+  connectionCheckGate?: Promise<void>;
+  connectionCheckOutcome?: ProviderOutcome<HardwareConnectionResult>;
   registrationGate?: Promise<void>;
   registrationOutcome?: ProviderOutcome<JsonObject>;
   invokeGate?: Promise<void>;
@@ -110,6 +114,27 @@ export class HardwareBrowserService {
         summary: "Controlled browser-test endpoint",
         details: {},
       }),
+      ...(descriptor.id === "hardware.ssh"
+        ? {
+            checkConnection: async (config, context) => {
+              context.registerCleanup(async () => ({
+                state: "completed",
+                value: null,
+              }));
+              const auth = config.auth as JsonObject;
+              if (auth.kind === "password")
+                await context.resolveCredential(String(auth.credentialRefId));
+              this.connectionChecks.push(structuredClone(config));
+              await this.connectionCheckGate;
+              return (
+                this.connectionCheckOutcome ?? {
+                  state: "completed",
+                  value: { online: true },
+                }
+              );
+            },
+          }
+        : {}),
       registerKey: async (_config, input, context) => {
         context.registerCleanup(async () => ({
           state: "completed",
@@ -263,6 +288,7 @@ export class HardwareBrowserService {
       username: "root",
       auth: { kind: "agent" },
       connectTimeoutMs: 5000,
+      onlineCheckIntervalMs: null,
     };
   }
   async init() {
