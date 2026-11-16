@@ -138,6 +138,7 @@ process.stdin.on('end',()=>{
     'auth.test': 'tester@auth.test: Permission denied (password).',
     'hostkey.test': 'Host key verification failed.',
     'network.test': 'ssh: connect to host network.test port 22: Connection refused',
+    'blocked.example': 'ssh: connect to host blocked.example port 22: Permission denied',
     'dns.test': 'ssh: Could not resolve hostname dns.test: Name or service not known',
     'command.test': 'Login command not found',
     'permission.test': 'Login command: Permission denied'
@@ -172,6 +173,16 @@ process.stdin.on('end',()=>{
   ])("reports %s as a completed negative check with bounded redacted diagnostics", async (host, code, message) => {
     const result = await check(host);
     expect(result).toMatchObject({ state: "completed", value: { online: false, error: { code }, diagnostics: { stdout: "[redacted]", stderr: expect.stringContaining(message), interrupted: false } } });
+    expect(JSON.stringify(result)).not.toContain("private-password");
+  });
+
+  it("reports a socket permission error as a network failure after confirmed cleanup", async () => {
+    const result = await check("blocked.example");
+    expect(result).toMatchObject({ state: "completed", value: { online: false, error: { code: "SSH_NETWORK_FAILED" }, diagnostics: { exitCode: 255, stdout: "[redacted]", stderr: "ssh: connect to host blocked.example port 22: Permission denied", interrupted: false } } });
+    const captured = JSON.parse(await fs.readFile(capture, "utf8"));
+    expect(() => process.kill(captured.pid, 0)).toThrow();
+    await expect(fs.stat(captured.environment.CLOUDX_SSH_ASKPASS_SOCKET)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.stat(captured.environment.SSH_ASKPASS)).rejects.toMatchObject({ code: "ENOENT" });
     expect(JSON.stringify(result)).not.toContain("private-password");
   });
 

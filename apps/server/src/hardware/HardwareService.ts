@@ -27,6 +27,7 @@ interface Task { ref?: ReservationRef; hardwareId: string; controller: AbortCont
 interface Access { generation: number; connection?: HardwareConnection; cleanup: Array<(signal: AbortSignal) => Promise<ProviderOutcome<null>>> }
 interface ConnectionCheckWork { runId: string; generation: number; item: HardwareItem; candidate: HardwareItem; resourceKeys: string[]; draft: boolean; scheduled: boolean }
 interface ConnectionCheckRun { cleanup: Access["cleanup"]; outcome?: ProviderOutcome<HardwareConnectionResult> }
+type ScheduledCheck = { item: HardwareItem; resourceKeys: string[]; observedAt: number } & ({ kind: "connection" } | { kind: "statuses"; statusIds: string[] });
 interface RevokedCleanup {
   runId: string; hardwareId: string; priorRef?: ReservationRef; currentRef?: ReservationRef; checkRunId?: string;
   generation: number; priorUncertainty: boolean; priorOperationIds: string[]; hook?: BashScript; priorReleaseRunId?: string;
@@ -1252,6 +1253,7 @@ export class HardwareService {
       }
       if (!this.capacity.canSchedule(this.state)) return;
       const state = clone(this.state), inventory = await this.inspectInventory(state);
+      const checks: ScheduledCheck[] = [];
       for (const item of state.items) {
         const keys = inventory.groupKeys.get(item.physicalResourceId)!;
         if (!item.enabled || !inventory.endpoints.get(item.id)?.inspection.ready || inventory.conflictingGroups.has(item.physicalResourceId) || [...state.reservations, ...state.checkHolds].some(hold => hold.resourceKeys.some(key => keys.includes(key)))) continue;
@@ -1264,9 +1266,21 @@ export class HardwareService {
           return observation ? Date.parse(observation.observedAt) : -Infinity;
         }));
         const lastConnectionCheck = connection?.itemRevision === item.revision ? Date.parse(connection.checkedAt) : -Infinity;
+        if (connectionDue) checks.push({ kind: "connection", item, resourceKeys: keys, observedAt: lastConnectionCheck });
+        if (due.length) checks.push({ kind: "statuses", item, resourceKeys: keys, observedAt: lastStatusCheck, statusIds: due.map(binding => binding.definitionId) });
+      }
+      checks.sort((a, b) => {
+        if (a.observedAt !== b.observedAt) return a.observedAt < b.observedAt ? -1 : 1;
+        if (a.kind !== b.kind) return a.kind === "connection" ? -1 : 1;
+        return a.item.id.localeCompare(b.item.id);
+      });
+      const admittedKeys = new Set<string>();
+      for (const check of checks) {
+        if (check.resourceKeys.some(key => admittedKeys.has(key))) continue;
         try {
-          if (connectionDue && lastConnectionCheck <= lastStatusCheck) await this.checkConnection({ hardwareId: item.id, expectedItemRevision: item.revision }, { kind: "user", userId: "local" }, true);
-          else if (due.length) await this.refresh({ requestId: `scheduled-${randomUUID()}`, hardwareId: item.id, statusIds: due.map(binding => binding.definitionId) }, { kind: "user", userId: "local" });
+          if (check.kind === "connection") await this.checkConnection({ hardwareId: check.item.id, expectedItemRevision: check.item.revision }, { kind: "user", userId: "local" }, true);
+          else await this.refresh({ requestId: `scheduled-${randomUUID()}`, hardwareId: check.item.id, statusIds: check.statusIds }, { kind: "user", userId: "local" });
+          for (const key of check.resourceKeys) admittedKeys.add(key);
         }
         catch (error) { if (!(error instanceof HardwareError) || !["RESERVATION_CONFLICT", "CHECK_IN_PROGRESS", "RECOVERY_REQUIRED", "CAPACITY_EXCEEDED"].includes(error.code)) throw error; }
       }

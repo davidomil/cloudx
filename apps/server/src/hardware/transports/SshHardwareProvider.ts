@@ -307,8 +307,8 @@ function connectionCheckResult(result: ProcessResult, cancelled: boolean): Hardw
   else if (result.state === "not_started") error = { code: "SSH_NOT_STARTED", message: "The OpenSSH client could not start." };
   else if (result.exitCode === 255) {
     if (/Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED/i.test(result.stderr)) error = { code: "SSH_HOST_KEY_FAILED", message: "The SSH server host key was rejected. Inspect the configured host and trusted keys." };
-    else if (/Permission denied|Authentication failed|Too many authentication failures/i.test(result.stderr)) error = { code: "SSH_AUTH_FAILED", message: "The SSH server rejected the configured authentication." };
     else if (/ssh: (?:connect to host|Could not resolve hostname)/i.test(result.stderr)) error = { code: "SSH_NETWORK_FAILED", message: "The configured SSH server could not be reached." };
+    else if (/Permission denied|Authentication failed|Too many authentication failures/i.test(result.stderr)) error = { code: "SSH_AUTH_FAILED", message: "The SSH server rejected the configured authentication." };
   }
   return { online: false, error, diagnostics };
 }

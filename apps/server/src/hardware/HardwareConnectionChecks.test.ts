@@ -52,6 +52,13 @@ async function addItem(service: HardwareService, host = "first.example", options
   return result.receipt.result!.item as unknown as HardwareItem;
 }
 
+async function requireScheduledStatus(service: HardwareService, item: HardwareItem, cwd: string) {
+  const created = await mutate(service, "hardware.statuses.create", { label: "Required readiness", valueType: "boolean" });
+  const definitionId = (created.receipt.result!.statusDefinition as unknown as { id: string }).id;
+  const updated = await mutate(service, "hardware.items.update", { hardwareId: item.id, expectedItemRevision: item.revision, patch: { statuses: [{ revision: 1, definitionId, source: "command", script: { source: "printf checked >> required-checks; exit 0", cwd, timeoutMs: 1000, maxOutputBytes: 100, credentialRefIds: [] }, maxAgeMs: 60_000, intervalMs: 1000, requiredForReserve: { equals: true } }] } });
+  return { item: updated.receipt.result!.item as unknown as HardwareItem, definitionId };
+}
+
 async function settle(service: HardwareService, receipt: OperationReceipt) {
   let current = receipt;
   await vi.waitFor(async () => {
@@ -203,6 +210,46 @@ describe("SSH connection checks", () => {
     expect(f.checkConnection).toHaveBeenCalledTimes(2); expect(await fs.readFile(path.join(f.root, "custom-checks"), "utf8")).toBe("checked");
     vi.setSystemTime(clock + 3000); await schedule(f.service); await idle(f.service);
     expect(f.checkConnection).toHaveBeenCalledTimes(2); expect(await fs.readFile(path.join(f.root, "custom-checks"), "utf8")).toBe("checkedchecked");
+  });
+
+  it("makes a later alias's required status eligible despite repeated one-second logins and slow endpoint inspection", async () => {
+    const f = await fixture();
+    const first = await addItem(f.service, "login.example", { config: { ...config("login.example"), onlineCheckIntervalMs: 1000 } });
+    const later = await addItem(f.service, "required.example", { group: first.physicalResourceId, config: { ...config("required.example"), onlineCheckIntervalMs: null } });
+    const required = await requireScheduledStatus(f.service, later, f.root);
+    expect((await f.service.snapshot(operator)).items.find(summary => summary.item.id === later.id)?.availability).toBe("ineligible");
+    const inspectEndpoint = f.provider.inspectEndpoint.bind(f.provider);
+    f.provider.inspectEndpoint = async candidate => { await new Promise(resolve => setTimeout(resolve, 300)); return inspectEndpoint(candidate); };
+    await vi.waitFor(async () => {
+      const saved = JSON.parse(await fs.readFile(path.join(f.root, "hardware/state.json"), "utf8"));
+      expect(saved.observations[later.id]).toContainEqual(expect.objectContaining({ definitionId: required.definitionId, state: "known", value: true }));
+      expect(f.checkConnection.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(saved.checkHolds).toEqual([]);
+    }, { timeout: 18_000, interval: 50 });
+    const reserved = await mutate(f.service, "hardware.reserve", { hardwareId: later.id, expectedItemRevision: required.item.revision, purpose: "Use the ready alias while login monitoring remains enabled" }, agent);
+    expect(reserved.reservation).toMatchObject({ hardwareId: later.id, state: "active" });
+    expect(await fs.readFile(path.join(f.root, "required-checks"), "utf8")).toContain("checked");
+  }, 25_000);
+
+  it("admits one check per physical group per pass even after quick cleanup, while independent groups progress", async () => {
+    const f = await fixture();
+    clearInterval((f.service as unknown as { scheduler: ReturnType<typeof setInterval> }).scheduler);
+    const first = await addItem(f.service, "login.example", { config: { ...config("login.example"), onlineCheckIntervalMs: 1000 } });
+    const later = await addItem(f.service, "required.example", { group: first.physicalResourceId, config: { ...config("required.example"), onlineCheckIntervalMs: null } });
+    const required = await requireScheduledStatus(f.service, later, f.root);
+    await addItem(f.service, "independent.example");
+    const checking = f.service as unknown as { checkConnection(input: Record<string, unknown>, owner: HardwareOwner, scheduled?: boolean): Promise<HardwareMutationResult | undefined> };
+    const checkConnection = checking.checkConnection.bind(f.service);
+    vi.spyOn(checking, "checkConnection").mockImplementation(async (...args) => { const result = await checkConnection(...args); await idle(f.service); return result; });
+    const clock = Date.now(); vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(clock);
+    await schedule(f.service); await idle(f.service);
+    expect(f.checkConnection).toHaveBeenCalledTimes(2);
+    expect(f.checkConnection.mock.calls.map(([candidate]) => candidate.host).sort()).toEqual(["independent.example", "login.example"]);
+    await expect(fs.readFile(path.join(f.root, "required-checks"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    vi.setSystemTime(clock + 1000); await schedule(f.service); await idle(f.service);
+    expect((await f.service.snapshot(operator)).items.find(summary => summary.item.id === later.id)).toMatchObject({ availability: "available", observations: [expect.objectContaining({ definitionId: required.definitionId, state: "known", value: true })] });
+    expect(f.checkConnection).toHaveBeenCalledTimes(2);
+    expect(await fs.readFile(path.join(f.root, "required-checks"), "utf8")).toBe("checked");
   });
 
   it.each(["stale", "agent", "unknown-field", "invalid-config"])("rejects %s input before contacting a machine", async scenario => {
