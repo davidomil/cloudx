@@ -138,6 +138,14 @@ Build the server with `npm run typecheck`, then run
 The runner records the installed version in CI logs and rejects missing binaries,
 unsupported or mismatched versions, failures and skipped native cases.
 
+Codex 0.166.0 reports TUI lifecycle state through
+[OSC 7501](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/tui/src/terminal_program_status.rs).
+`wait_until_ready` stays busy during native `working` or `blocked` state,
+even after backend completion or quiet output. Native `idle`, `done` or
+`error` releases that state; the configured output quiet period still applies.
+Terminal handoff `clear` does not prove completion. Sessions without native
+lifecycle signals retain their existing quiet-output readiness.
+
 Native cases require a selected-conversation receipt before the first
 model prompt. Synthetic turns verify effective permissions and roots
 across startup, `/new`, idle `/resume`, fork, prompt editing and process-loss resume.

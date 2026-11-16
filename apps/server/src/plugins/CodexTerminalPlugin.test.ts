@@ -9,7 +9,7 @@ import { Terminal } from "@xterm/headless";
 import { CODEX_REASONING_EFFORTS, type TabIndicatorUpdate, type WorkspaceTab } from "@cloudx/shared";
 import { PluginSessionNotStartedError } from "@cloudx/plugin-api";
 
-import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_CLOSE_ON_EXIT_GRACE_MS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalShellIntegrationParser, buildCodexLaunchArgs, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
+import { CLOUDX_CODEX_DEFAULT_ARGS, CODEX_CLOSE_ON_EXIT_GRACE_MS, CODEX_TERMINAL_ACTIONS, CodexTerminalPlugin, CodexTerminalSession, DEFAULT_TERMINAL_REPLAY_BYTES, TERMINAL_ACTIONS, TerminalIntegrationParser, buildCodexLaunchArgs, materializeCodexTemplate } from "./CodexTerminalPlugin.js";
 import { codexResumeInput } from "../agents/resumeInput.js";
 import type { TerminalProcess, TerminalProcessFactory } from "../terminal/TerminalProcess.js";
 import type { TerminalExit } from "../terminal/TerminalSupervisor.js";
@@ -1453,6 +1453,83 @@ describe("CodexTerminalSession", () => {
     }
   });
 
+  it("waits for native Codex completion after the backend finishes and output becomes quiet", async () => {
+    vi.useFakeTimers();
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, readyQuietMs: 30, turnState: () => "idle" });
+    try {
+      process.emitData("\u001b]7501;state=working:app=codex\u001b\\The conversation is saved.");
+      const resolved = vi.fn();
+      const rejected = vi.fn();
+      const ready = Promise.resolve(session.handleAction("wait_until_ready", { timeoutMs: 1000, quietMs: 30 })).then(resolved, rejected);
+      await vi.advanceTimersByTimeAsync(60);
+      expect(resolved).not.toHaveBeenCalled();
+      expect(session.snapshot().state?.readiness).toMatchObject({ state: "busy" });
+      process.emitData("\u001b]133;D;0\u0007\u001b]7501;state=done:app=other\u001b\\\u001b]7501;state=clear\u001b\\");
+      await vi.advanceTimersByTimeAsync(60);
+      expect(resolved).not.toHaveBeenCalled();
+      process.emitData("\u001b]7501;state=do");
+      await vi.advanceTimersByTimeAsync(60);
+      expect(resolved).not.toHaveBeenCalled();
+      process.emitData("ne:app=codex\u001b");
+      await vi.advanceTimersByTimeAsync(60);
+      expect(resolved).not.toHaveBeenCalled();
+      process.emitData("\\");
+      await vi.advanceTimersByTimeAsync(29);
+      expect(resolved).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await ready;
+      expect(resolved).toHaveBeenCalledWith(expect.objectContaining({ ready: true, state: "ready" }));
+      expect(rejected).not.toHaveBeenCalled();
+    } finally { session.stop(); vi.useRealTimers(); }
+  });
+
+  it.each(["permission", "question", "auth"])("keeps native Codex %s blocking distinct from readiness", async kind => {
+    vi.useFakeTimers();
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, readyQuietMs: 10 });
+    try {
+      process.emitData(`\u001b]7501;state=blocked:app=codex:kind=${kind}\u001b\\`);
+      const resolved = vi.fn();
+      const ready = Promise.resolve(session.handleAction("wait_until_ready", { timeoutMs: 1000, quietMs: 10 })).then(resolved, () => undefined);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(resolved).not.toHaveBeenCalled();
+      process.emitData("\u001b]7501;state=idle:app=codex\u001b\\");
+      await vi.advanceTimersByTimeAsync(10);
+      await ready;
+      expect(resolved).toHaveBeenCalledWith(expect.objectContaining({ ready: true }));
+    } finally { session.stop(); vi.useRealTimers(); }
+  });
+
+  it.each(["idle", "done", "error"])("accepts native Codex %s as ready after a working turn", async state => {
+    vi.useFakeTimers();
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, readyQuietMs: 10 });
+    try {
+      process.emitData("\u001b]7501;state=working:app=codex\u001b\\");
+      process.emitData(`\u001b]7501;state=${state}:app=codex\u001b\\`);
+      const ready = session.handleAction("wait_until_ready", { timeoutMs: 1000, quietMs: 10 });
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(ready).resolves.toMatchObject({ ready: true, state: "ready" });
+      session.handleAction("enter_text", { text: "/help", submit: true });
+      process.emitData("Codex help");
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(session.handleAction("wait_until_ready", { timeoutMs: 1000, quietMs: 10 })).resolves.toMatchObject({ ready: true });
+    } finally { session.stop(); vi.useRealTimers(); }
+  });
+
+  it.each(["working", "done"])("uses the last native Codex status in a burst ending in %s", async state => {
+    vi.useFakeTimers();
+    const process = new FakeTerminalProcess();
+    const session = new CodexTerminalSession(tab, process, undefined, { closeOnExit: false, readyQuietMs: 10 });
+    try {
+      const first = state === "working" ? "done" : "working";
+      process.emitData(`\u001b]7501;state=${first}:app=codex\u001b\\\u001b]7501;state=${state}:app=codex\u001b\\`);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(session.snapshot().state?.readiness).toMatchObject({ state: state === "working" ? "busy" : "ready" });
+    } finally { session.stop(); vi.useRealTimers(); }
+  });
+
   it("times out when Codex readiness never arrives", async () => {
     vi.useFakeTimers();
     try {
@@ -1694,25 +1771,38 @@ describe("CodexTerminalSession", () => {
   });
 });
 
-describe("TerminalShellIntegrationParser", () => {
+describe("TerminalIntegrationParser", () => {
   it("parses chunked OSC command-finished events", () => {
-    const parser = new TerminalShellIntegrationParser();
+    const parser = new TerminalIntegrationParser();
 
     expect(parser.push("before \u001b]133;D;")).toEqual([]);
     expect(parser.push("1\u0007 after")).toEqual([{ sequence: 133, exitCode: 1 }]);
   });
 
   it("accepts VS Code OSC 633 command-finished events without exit code", () => {
-    const parser = new TerminalShellIntegrationParser();
+    const parser = new TerminalIntegrationParser();
 
     expect(parser.push("\u001b]633;D\u001b\\")).toEqual([{ sequence: 633 }]);
   });
 
   it("recovers after an overlong unterminated OSC sequence", () => {
-    const parser = new TerminalShellIntegrationParser();
+    const parser = new TerminalIntegrationParser();
 
     expect(parser.push(`\u001b]633;${"x".repeat(5000)}`)).toEqual([]);
     expect(parser.push("\u001b]633;D;0\u0007")).toEqual([{ sequence: 633, exitCode: 0 }]);
+  });
+
+  it("parses fragmented native Codex status and preserves event order", () => {
+    const parser = new TerminalIntegrationParser();
+    const events = [..."\u001b]7501;state=working:app=codex\u001b\\"].flatMap(character => parser.push(character));
+    expect(events).toEqual([{ sequence: 7501, state: "working" }]);
+    expect(parser.push("\u001b]7501;state=done:app=codex\u0007\u001b]133;D;0\u0007\u001b]7501;state=blocked:app=codex:kind=permission\u001b\\"))
+      .toEqual([{ sequence: 7501, state: "done" }, { sequence: 133, exitCode: 0 }, { sequence: 7501, state: "blocked" }]);
+  });
+
+  it.each(["7501;state=done:app=other", "7501;state=done", "7501;state=clear", "7501;state=unknown:app=codex", "7501;state=done:app=codex:kind=auth", "7501;state=blocked:app=codex:kind=unknown"])("ignores unsupported native status %s", payload => {
+    const parser = new TerminalIntegrationParser();
+    expect(parser.push(`\u001b]${payload}\u001b\\`)).toEqual([]);
   });
 });
 

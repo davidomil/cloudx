@@ -978,6 +978,13 @@ export interface TerminalCommandFinishEvent {
   sequence: 133 | 633;
 }
 
+interface CodexProgramStatusEvent {
+  sequence: 7501;
+  state: "idle" | "working" | "blocked" | "done" | "error";
+}
+
+type TerminalIntegrationEvent = TerminalCommandFinishEvent | CodexProgramStatusEvent;
+
 export type TerminalReadinessState = "starting" | "busy" | "ready" | "closed";
 
 interface TerminalReadinessSnapshot {
@@ -992,12 +999,12 @@ interface TerminalWaitUntilReadyOptions {
   signal?: AbortSignal;
 }
 
-export class TerminalShellIntegrationParser {
+export class TerminalIntegrationParser {
   private buffer = "";
 
-  push(data: string): TerminalCommandFinishEvent[] {
+  push(data: string): TerminalIntegrationEvent[] {
     this.buffer += data;
-    const events: TerminalCommandFinishEvent[] = [];
+    const events: TerminalIntegrationEvent[] = [];
 
     while (true) {
       const oscStart = this.buffer.indexOf("\u001b]");
@@ -1021,7 +1028,7 @@ export class TerminalShellIntegrationParser {
 
       const payload = this.buffer.slice(2, terminator.index);
       this.buffer = this.buffer.slice(terminator.index + terminator.length);
-      const event = parseShellIntegrationPayload(payload);
+      const event = parseTerminalIntegrationPayload(payload);
       if (event) {
         events.push(event);
       }
@@ -1044,7 +1051,8 @@ export class CodexTerminalSession implements PluginSession {
   private readiness: TerminalReadinessSnapshot = { state: "starting", reason: "Waiting for terminal output.", changedAt: Date.now() };
   private readonly replayBytes: number;
   private readonly startedAt = Date.now();
-  private readonly shellIntegrationParser = new TerminalShellIntegrationParser();
+  private readonly terminalIntegrationParser = new TerminalIntegrationParser();
+  private codexBusy = false;
   private readonly statusListeners = new Set<(status: WorkspaceTab["status"], message?: string) => void>();
   private readonly readinessListeners = new Set<() => void>();
   private readonly pendingSubmitTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -1087,15 +1095,20 @@ export class CodexTerminalSession implements PluginSession {
         this.bridgeFailure = failure[1]?.trim();
       }
       this.failureOutput = trimRecentOutput(this.failureOutput, 4096);
-      let sawCommandFinish = false;
-      for (const event of this.shellIntegrationParser.push(data)) {
-        sawCommandFinish = true;
-        this.recordCommandFinish(event.exitCode);
+      for (const event of this.terminalIntegrationParser.push(data)) {
+        if (event.sequence === 7501) {
+          this.codexBusy = event.state === "working" || event.state === "blocked";
+          this.clearReadyQuietTimer();
+          this.setReadiness(this.codexBusy ? "busy" : "ready", `Codex reported ${event.state}.`);
+        } else {
+          this.recordCommandFinish(event.exitCode);
+          if (!this.codexBusy) {
+            this.clearReadyQuietTimer();
+            this.setReadiness("ready", "Shell integration reported command completion.");
+          }
+        }
       }
-      if (sawCommandFinish) {
-        this.clearReadyQuietTimer();
-        this.setReadiness("ready", "Shell integration reported command completion.");
-      } else if (this.readiness.state === "starting" || this.readiness.state === "busy") {
+      if (this.readiness.state === "starting" || this.readiness.state === "busy") {
         this.scheduleReadyAfterQuietOutput();
       }
     }));
@@ -1453,6 +1466,7 @@ export class CodexTerminalSession implements PluginSession {
 
   private scheduleReadyAfterQuietOutput(): void {
     this.clearReadyQuietTimer();
+    if (this.codexBusy) return;
     this.readyQuietTimer = setTimeout(() => {
       this.readyQuietTimer = undefined;
       if (!this.terminalClosed && (this.readiness.state === "starting" || this.readiness.state === "busy")) {
@@ -1603,7 +1617,11 @@ function firstTerminator(belEnd: number, stEnd: number): { index: number; length
   return { index: stEnd, length: 2 };
 }
 
-function parseShellIntegrationPayload(payload: string): TerminalCommandFinishEvent | undefined {
+function parseTerminalIntegrationPayload(payload: string): TerminalIntegrationEvent | undefined {
+  const status = /^7501;state=(idle|working|blocked|done|error):app=codex(?::kind=(permission|question|auth))?$/.exec(payload);
+  if (status && (!status[2] || status[1] === "blocked")) {
+    return { sequence: 7501, state: status[1] as CodexProgramStatusEvent["state"] };
+  }
   const [identifier, marker, exitCodeText] = payload.split(";");
   if ((identifier !== "133" && identifier !== "633") || marker !== "D") {
     return undefined;
