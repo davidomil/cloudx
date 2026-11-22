@@ -69,6 +69,24 @@ async function createReadySsh(app: FastifyInstance, root: string): Promise<Hardw
 }
 
 describe("Hardware production composition", () => {
+  it("keeps the server and operator recovery routes available when Hardware startup state is corrupt", async () => {
+    const corrupt = '{"schemaVersion":1}';
+    const { app, root } = await fixture(async (_services, dataDir) => {
+      await fs.mkdir(path.join(dataDir, "hardware"), { recursive: true });
+      await fs.writeFile(path.join(dataDir, "hardware/state.json"), corrupt);
+    });
+    const state = await app.inject({ url: "/api/hardware/state" });
+    expect(state.statusCode, state.body).toBe(200);
+    expect(state.json()).toMatchObject({ readiness: { state: "unavailable", recovery: { phase: expect.any(String), nextAction: expect.any(String) } } });
+    const diagnostics = await action(app, "hardware.diagnostics", {});
+    expect(diagnostics).toMatchObject({ lastConfirmedState: false, readiness: state.json().readiness });
+    const reconcile = await app.inject({ method: "POST", url: "/api/hardware/actions", payload: { action: "hardware.reconcile", input: { requestId: randomUUID() } } });
+    expect(reconcile.statusCode, reconcile.body).toBe(503);
+    expect(await action(app, "hardware.diagnostics", {})).toMatchObject({ readiness: { state: "unavailable" } });
+    expect((await app.inject({ url: "/api/plugins" })).statusCode).toBe(200);
+    expect(await fs.readFile(path.join(root, ".cloudx/hardware/state.json"), "utf8")).toBe(corrupt);
+  });
+
   it("installs the native panel, both provider types, and four default system skills without selecting a user template", async () => {
     const { app, services } = await fixture();
     const plugins = await app.inject({ method: "GET", url: "/api/plugins" });
@@ -165,6 +183,8 @@ describe("Hardware production composition", () => {
         { method: "GET" as const, url: "/api/hardware/state" },
         { method: "PUT" as const, url: `/api/hardware/ssh-passwords/ssh-registration-${randomUUID()}`, payload: { password: "private-password-marker" } },
         { method: "POST" as const, url: "/api/hardware/actions", payload: { action: "hardware.tags.create", input: { requestId: randomUUID(), label: "Forbidden" } } },
+        { method: "POST" as const, url: "/api/hardware/actions", payload: { action: "hardware.reconcile", input: { requestId: randomUUID() } } },
+        { method: "POST" as const, url: "/api/hardware/actions", payload: { action: "hardware.diagnostics", input: {} } },
         { method: "POST" as const, url: "/api/hardware/agent", payload: { action: "hardware.items.list", tabId: "fake", executionId: "fake", input: {} } }
       ]) {
         const response = await app.inject({ ...request, headers });

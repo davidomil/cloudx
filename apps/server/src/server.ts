@@ -34,6 +34,7 @@ import type {
 
 import type { AppConfig } from "./config.js";
 import { ConfigService } from "./configService.js";
+import { HardwareError } from "./hardware/HardwareError.js";
 import { AsrClient } from "./asrClient.js";
 import { DEFAULT_DOCUMENTATION_URL, DocumentationClient, DocumentationStartupError } from "./documentation/DocumentationClient.js";
 import { DocumentationIngestQueue } from "./documentation/DocumentationIngestQueue.js";
@@ -357,7 +358,11 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     await services.sessions.restore?.(services.pluginContributionsReady);
     if (services.hardware) {
       await services.forge?.dashboard();
-      await services.hardware.init();
+      try { await services.hardware.init(); }
+      catch (error) {
+        if (!(error instanceof HardwareError)) throw error;
+        app.log.error({ code: error.code, details: error.details }, "Hardware admission is closed. Use Hardware storage recovery after host repair.");
+      }
       await services.hardwarePasswords?.clearRegistrationPasswords();
       await services.hardwareMonitor?.start();
     }

@@ -74,6 +74,18 @@ The Reservations view shows the owner tab's title and available workspace, plus 
 
 The user can release a hold manually. Force release requires the current hold revision, a reason, and acknowledgement when external activity remains unresolved. A replacement execution cannot inherit the old claim.
 
+## Recover unavailable storage
+
+A failed Hardware save closes admission. Freeing disk space or refreshing the panel does not reopen it. **Hardware storage recovery** stays available above the disabled operational controls. It shows the original errno when available, the failed persistence phase, and the durability boundary. `unchanged` means the failed write did not replace the state file; `unconfirmed` means durability was not confirmed; `confirmed` means the file and directory sync completed before a later failure. A replaced file can differ from the last confirmed in-memory view.
+
+Use **Inspect diagnostics** or **Download evidence** before repair. The export includes the last in-memory inventory, exact reservation generations, request identities, outcomes, history, and storage diagnostics. It does not export unreadable source bytes. Preserve the host files separately. These operator actions remain available when startup cannot read Hardware state; an empty unavailable view does not authorize hardware use.
+
+On the CloudX host, identify the configured `CLOUDX_DATA_DIR`. Preserve its `hardware` directory and service journal. Inspect `journalctl --user -u cloudx.service -n 100 --no-pager`. Check available bytes, inodes, filesystem write access, and directory permissions. Repair the reported condition. If another service owns the writer lease, identify and stop that duplicate process. Do not delete `state.json` or `.writer-lock`. For corrupt state, stop CloudX and preserve the original files before reviewed repair. Do not substitute empty state or roll back reservation generations, request receipts, or history.
+
+After repair, select **Reconcile storage**. Only the operator can run this action. It requires the exclusive writer lease, readable valid state, settled local tasks, and a successful durable save. It does not replay operations or hooks. It retains reservations and unknown activity. An idle connection still owned by this process can remain known; a missing or superseded handle remains uncertain. Inspect the current exact generation before release. Unknown activity requires explicit acceptance through Force release.
+
+If reconciliation fails, admission stays closed and diagnostics remain available. Repair the reported condition before another explicit attempt. If host repair requires restarting the service, use `systemctl --user restart cloudx.service`, then confirm Hardware readiness and inspect retained holds. Unrepairable storage, a competing writer, corrupt authority, or unsettled local work can prevent recovery. Force release cannot bypass these conditions or a failed durable save.
+
 ## Inspect retained outcomes
 
 Completed output and history have default bounds of 30 days and 10,000 entries; completed result payloads also share a 16 MiB budget. The panel shows applied retention settings and explicitly marks pruned output. Live and unknown receipts remain retained. The compact request identity and terminal outcome remain available so pruning cannot replay an old operation.

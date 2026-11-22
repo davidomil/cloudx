@@ -21,7 +21,7 @@ export async function registerHardwareRoutes(app: FastifyInstance, hardware: Har
       const known = error instanceof HardwareError || ["FORBIDDEN", "PROVIDER_UNAVAILABLE", "INVALID_INPUT"].includes(code);
       const status = code === "FORBIDDEN" || code === "OWNER_CHANGED" ? 403 : code === "NOT_FOUND" ? 404 :
         ["INVALID_INPUT", "INVALID_REQUEST", "INVALID_FILTER", "INVALID_CONFIG"].includes(code) ? 400 :
-        ["INTEGRITY_ERROR", "WRITER_UNAVAILABLE", "PROVIDER_UNAVAILABLE", "SERVICE_UNAVAILABLE", "STORE_UNAVAILABLE"].includes(code) ? 503 : known ? 409 : 500;
+        ["INTEGRITY_ERROR", "WRITER_LOST", "WRITER_UNAVAILABLE", "PROVIDER_UNAVAILABLE", "SERVICE_UNAVAILABLE", "STORE_UNAVAILABLE"].includes(code) ? 503 : known ? 409 : 500;
       if (!known) request.log.error({ err: error }, "Hardware request failed.");
       const message = known && error instanceof Error ? error.message : "The Hardware request failed.";
       return reply.code(status).send({ code, error: message, message, ...(error instanceof HardwareError && error.details ? { details: error.details } : {}) });

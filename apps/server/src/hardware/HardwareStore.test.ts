@@ -77,6 +77,114 @@ describe("durable Hardware authority", () => {
     expect(await store.read()).toEqual(state);
   });
 
+  it.each([
+    ["directory_open", "EACCES"],
+    ["temporary_open", "ENOSPC"],
+    ["temporary_write", "ENOSPC"],
+    ["temporary_sync", "EIO"],
+    ["temporary_close", "EIO"],
+    ["state_rename", "ENOSPC"],
+    ["directory_sync", "EIO"],
+    ["directory_close", "EIO"]
+  ])("reports %s failures without exposing source paths or messages", async (phase, errno) => {
+    const { root, store } = await fixture();
+    const before = emptyHardwareState(); before.revision = 1; await store.write(before);
+    const failure = Object.assign(new Error(`secret diagnostic ${root}/state.json`), { code: errno, path: root });
+    const original = fs.open;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const directory = typeof args[0] === "string" && args[0].endsWith("/hardware");
+      const temporary = typeof args[0] === "string" && args[0].endsWith(".tmp");
+      if ((phase === "directory_open" && directory) || (phase === "temporary_open" && temporary)) throw failure;
+      const file = await original(...args);
+      if ((phase === "temporary_write" && temporary)) vi.spyOn(file, "writeFile").mockRejectedValueOnce(failure);
+      if ((phase === "temporary_sync" && temporary) || (phase === "directory_sync" && directory)) vi.spyOn(file, "sync").mockRejectedValueOnce(failure);
+      if ((phase === "temporary_close" && temporary) || (phase === "directory_close" && directory)) {
+        const close = file.close.bind(file);
+        vi.spyOn(file, "close").mockImplementationOnce(async () => { await close(); throw failure; });
+      }
+      return file;
+    });
+    if (phase === "state_rename") vi.spyOn(fs, "rename").mockRejectedValueOnce(failure);
+    const afterRename = phase === "directory_sync" || phase === "directory_close";
+    const error = await store.write({ ...before, revision: 2 }).catch(error => error);
+    expect(error).toMatchObject({ code: "STORE_UNAVAILABLE", details: { errno, phase, durability: phase === "directory_close" ? "confirmed" : afterRename ? "unconfirmed" : "unchanged", authorityReplaced: afterRename } });
+    expect(JSON.stringify(error)).not.toContain(root);
+    expect(error.message).not.toContain("secret diagnostic");
+    expect(JSON.parse(await fs.readFile(path.join(root, "hardware/state.json"), "utf8"))).toEqual({ ...before, revision: afterRename ? 2 : 1 });
+  });
+
+  it("keeps the original write failure when file close and temporary cleanup also fail", async () => {
+    const { root, store } = await fixture();
+    const original = fs.open;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const file = await original(...args);
+      if (typeof args[0] === "string" && args[0].endsWith(".tmp")) {
+        vi.spyOn(file, "writeFile").mockRejectedValueOnce(Object.assign(new Error("private write details"), { code: "ENOSPC" }));
+        const close = file.close.bind(file);
+        vi.spyOn(file, "close").mockImplementationOnce(async () => { await close(); throw Object.assign(new Error("private close details"), { code: "EIO" }); });
+      }
+      return file;
+    });
+    vi.spyOn(fs, "rm").mockRejectedValueOnce(Object.assign(new Error("private cleanup details"), { code: "EACCES" }));
+    await expect(store.write(emptyHardwareState())).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { errno: "ENOSPC", phase: "temporary_write", durability: "unchanged", authorityReplaced: false } });
+    expect((await fs.readdir(path.join(root, "hardware"))).some(name => name.endsWith(".tmp"))).toBe(true);
+  });
+
+  it("reports read and validation failures without including snapshot content", async () => {
+    const { root, store } = await fixture();
+    const stateFile = path.join(root, "hardware/state.json");
+    await fs.writeFile(stateFile, "private snapshot secret");
+    const error = await store.reconcile().catch(error => error);
+    expect(error).toMatchObject({ code: "STORE_UNAVAILABLE", details: { phase: "state_validate", durability: "unchanged", authorityReplaced: false } });
+    expect(error.message).not.toContain("private snapshot secret");
+    const original = fs.open;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      if (typeof args[0] === "string" && args[0].endsWith("/state.json")) throw Object.assign(new Error(`private path ${root}`), { code: "EACCES" });
+      return original(...args);
+    });
+    await expect(store.reconcile()).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { errno: "EACCES", phase: "state_read", durability: "unchanged", authorityReplaced: false } });
+  });
+
+  it("reports writer acquisition errno and refuses reconciliation while another writer owns the snapshot", async () => {
+    const { root, store } = await fixture();
+    await store.write(emptyHardwareState());
+    const contender = new HardwareStore(root); stores.push(contender);
+    await expect(contender.reconcile()).rejects.toMatchObject({ code: "WRITER_LOST", details: { phase: "writer_acquire", durability: "unchanged", authorityReplaced: false } });
+    const original = fs.open;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      if (typeof args[0] === "string" && args[0].endsWith("/.writer-lock")) throw Object.assign(new Error(`private path ${root}`), { code: "EACCES" });
+      return original(...args);
+    });
+    await expect(contender.reconcile()).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { errno: "EACCES", phase: "writer_acquire", durability: "unchanged", authorityReplaced: false } });
+  });
+
+  it("does not initialize a missing snapshot during explicit reconciliation", async () => {
+    const { root, store } = await fixture();
+    const lock = path.join(root, "hardware/.writer-lock");
+    const identity = (await fs.stat(lock)).ino;
+    await expect(store.reconcile()).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { errno: "ENOENT", phase: "state_read" } });
+    expect(await fs.readdir(path.join(root, "hardware"))).toEqual([".writer-lock"]);
+    expect((await fs.stat(lock)).ino).toBe(identity);
+  });
+
+  it("reconciles the saved snapshot after writer loss without replacing the writer lock", async () => {
+    const { root, store } = await fixture();
+    const state = emptyHardwareState(); state.revision = 23; await store.write(state);
+    const lock = path.join(root, "hardware/.writer-lock");
+    const identity = (await fs.stat(lock)).ino;
+    const writer = (store as unknown as { writer: HardwareWriterLease }).writer;
+    const acquire = vi.spyOn(writer, "acquire");
+    const child = (writer as unknown as { child: { pid: number; once: (event: string, callback: () => void) => void } }).child;
+    const ended = new Promise<void>(resolve => child.once("exit", resolve));
+    process.kill(child.pid, "SIGKILL"); await ended;
+    expect(() => store.assertHeld()).toThrow(expect.objectContaining({ code: "WRITER_LOST", details: { phase: "writer_assert", durability: "unchanged", authorityReplaced: false } }));
+    expect(await store.reconcile()).toEqual(state);
+    store.assertHeld();
+    expect(acquire).toHaveBeenCalledTimes(1);
+    expect((await fs.stat(lock)).ino).toBe(identity);
+    expect(await store.read()).toEqual(state);
+  });
+
   it("rejects corrupted snapshots and symlink authority without erasing evidence", async () => {
     const { root, store } = await fixture();
     await store.dispose();

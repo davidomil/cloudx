@@ -22,6 +22,7 @@ import {
   getHardwareState,
   hardwareRequestId,
   HardwareApiError,
+  reconcileHardwareStorage,
 } from "../../hardwareApi.js";
 import { ControlButton } from "../Control.js";
 import { HardwareInventory } from "./HardwareInventory.js";
@@ -31,6 +32,7 @@ import { HardwareStatuses, type StatusEditDraft } from "./HardwareStatuses.js";
 import { HardwareReservations } from "./HardwareReservations.js";
 import { HardwareAccess } from "./HardwareAccess.js";
 import { HardwareReadiness } from "./HardwareReadiness.js";
+import { HardwareRecovery } from "./HardwareRecovery.js";
 import { ReceiptView } from "./HardwareControls.js";
 import "./hardware.css";
 
@@ -201,6 +203,31 @@ export function HardwarePanel({
       if (alive.current) setBusy(false);
     }
   }
+  async function reconcileStorage() {
+    if (running.current || !connected || state?.currentOwner.kind !== "user")
+      return;
+    running.current = true;
+    setBusy(true);
+    setError(undefined);
+    try {
+      install(await reconcileHardwareStorage(hardwareRequestId()));
+    } catch (cause) {
+      if (alive.current)
+        setError({
+          message: cause instanceof Error ? cause.message : String(cause),
+          code: cause instanceof HardwareApiError ? cause.code : undefined,
+        });
+      try {
+        install(await getHardwareState());
+      } catch {
+        observationStopped.current = true;
+        if (alive.current) setConnected(false);
+      }
+    } finally {
+      running.current = false;
+      if (alive.current) setBusy(false);
+    }
+  }
   const selected = state?.items.find((value) => value.item.id === selectedId);
   const edited = state?.items.find((value) => value.item.id === editingId);
   const navigate = (next: View) => {
@@ -239,7 +266,12 @@ export function HardwarePanel({
           </ControlButton>
           <ControlButton
             tone="primary"
-            disabled={!connected || busy || !state?.types.length}
+            disabled={
+              !connected ||
+              busy ||
+              !state?.types.length ||
+              state.readiness.state !== "ready"
+            }
             onClick={() => {
               setEditingId(undefined);
               setView("editor");
@@ -322,11 +354,12 @@ export function HardwarePanel({
               making changes.
             </p>
           ) : null}
-          {state.readiness.state !== "ready" ? (
-            <p className="hardware-banner warning">
-              {state.readiness.reason ?? "Hardware service is unavailable."}
-            </p>
-          ) : null}
+          <HardwareRecovery
+            state={state}
+            connected={connected}
+            busy={busy}
+            onReconcile={reconcileStorage}
+          />
           {state.agentReadiness ? (
             <HardwareReadiness
               executions={state.agentReadiness}

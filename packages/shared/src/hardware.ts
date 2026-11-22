@@ -306,9 +306,23 @@ export interface HardwareStateView {
   receipts: OperationReceipt[];
   history: HardwareHistoryEntry[];
   currentOwner: HardwareOwner;
-  readiness: { state: "ready" | "unavailable"; reason?: string };
+  readiness: { state: "ready" | "unavailable"; reason?: string; recovery?: HardwareStorageRecovery };
   agentReadiness?: HardwareAgentReadiness[];
   retention?: HardwareRetentionSettings;
+}
+
+export interface HardwareStorageRecovery {
+  phase: string;
+  errno?: string;
+  durability: "unchanged" | "unconfirmed" | "confirmed";
+  authorityReplaced: boolean;
+  nextAction: string;
+}
+
+export interface HardwareDiagnostics {
+  readiness: HardwareStateView["readiness"];
+  state: JsonObject;
+  lastConfirmedState: boolean;
 }
 
 export type HardwareItemDraft = Omit<HardwareItem, "id" | "revision" | "notesRevision">;

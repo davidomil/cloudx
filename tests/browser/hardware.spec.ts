@@ -2325,6 +2325,115 @@ test("failed reads preserve inventory and never fabricate an empty writable stat
   ).toBeVisible();
 });
 
+test("storage failure keeps evidence and reconciliation available while hardware effects stay blocked", async ({
+  page,
+}, info) => {
+  await openAccess(page, "Atlas SSH");
+  const original = (await lab.service.snapshot(operator)).reservations[0]!;
+  const open = fs.open;
+  let storageFull = true;
+  fs.open = async (...args: Parameters<typeof fs.open>) => {
+    const file = await open(...args);
+    if (String(args[0]).includes("/.state-")) {
+      const write = file.writeFile.bind(file);
+      file.writeFile = async (
+        ...writeArgs: Parameters<typeof file.writeFile>
+      ) => {
+        if (storageFull)
+          throw Object.assign(new Error("Injected disk exhaustion"), {
+            code: "ENOSPC",
+          });
+        return write(...writeArgs);
+      };
+    }
+    return file;
+  };
+  try {
+    await expect(
+      lab.mutate("hardware.groups.create", { name: "Must not persist" }),
+    ).rejects.toMatchObject({ code: "STORE_UNAVAILABLE" });
+    await button(page, "Refresh inventory").click();
+    const recovery = page.getByRole("region", {
+      name: "Hardware storage recovery",
+    });
+    await expect(recovery).toContainText("ENOSPC");
+    await expect(page.locator(".hardware-content")).toHaveAttribute(
+      "disabled",
+      "",
+    );
+    await expect(button(page, "Add hardware")).toBeDisabled();
+    await expect(button(page, "Run script")).toBeDisabled();
+    await expect(button(page, "Reconcile storage")).toBeEnabled();
+    await expect(button(page, "Download evidence")).toBeEnabled();
+    const downloadPromise = page.waitForEvent("download");
+    await button(page, "Download evidence").click();
+    const download = await downloadPromise;
+    const evidencePath = info.outputPath("hardware-storage-evidence.json");
+    await download.saveAs(evidencePath);
+    await info.attach("hardware-storage-evidence", {
+      path: evidencePath,
+      contentType: "application/json",
+    });
+    const evidence = JSON.parse(await fs.readFile(evidencePath, "utf8"));
+    expect(evidence.readiness.recovery).toMatchObject({
+      errno: "ENOSPC",
+      durability: "unchanged",
+      authorityReplaced: false,
+    });
+    expect(evidence.state.reservations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          reservationId: original.reservationId,
+          generation: original.generation,
+        }),
+      ]),
+    );
+    expect(evidence.state.receipts.length).toBeGreaterThan(0);
+    expect(evidence.state.history.length).toBeGreaterThan(0);
+    await recovery
+      .getByText("Host recovery procedure", { exact: true })
+      .click();
+    await expect(recovery).toContainText(
+      "Do not delete state.json or .writer-lock",
+    );
+    await screenshot(page, info, "hardware-storage-recovery");
+
+    const beforeRecovery = lab.invocations.length;
+    await button(page, "Reconcile storage").click();
+    await expect(page.getByRole("alert")).toContainText("STORE_UNAVAILABLE");
+    await expect(button(page, "Reconcile storage")).toBeEnabled();
+    await expect(page.locator(".hardware-content")).toHaveAttribute(
+      "disabled",
+      "",
+    );
+    expect(lab.invocations).toHaveLength(beforeRecovery);
+
+    storageFull = false;
+    await button(page, "Refresh inventory").click();
+    await expect(page.locator(".hardware-content")).toHaveAttribute(
+      "disabled",
+      "",
+    );
+    await button(page, "Reconcile storage").click();
+    await expect(recovery).toHaveCount(0);
+    await expect(page.locator(".hardware-content")).toBeEnabled();
+    const reconciled = (await lab.service.snapshot(operator)).reservations[0]!;
+    expect(reconciled).toMatchObject({
+      reservationId: original.reservationId,
+      generation: original.generation,
+    });
+    expect(lab.invocations).toHaveLength(beforeRecovery);
+    await button(page, "Release hardware").click();
+    await expect
+      .poll(
+        async () => (await lab.service.snapshot(operator)).reservations.length,
+      )
+      .toBe(0);
+  } finally {
+    fs.open = open;
+  }
+});
+
 test("an external catalog reference cannot be deleted through the UI", async ({
   page,
 }) => {

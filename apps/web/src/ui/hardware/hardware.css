@@ -110,6 +110,38 @@
 .hardware-content {
   flex: 1;
 }
+.hardware-recovery {
+  border-color: var(--color-warning);
+  line-height: 1.55;
+}
+.hardware-recovery-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 28px;
+}
+.hardware-recovery-facts dt {
+  color: var(--color-muted-foreground);
+  font-size: 11px;
+}
+.hardware-recovery-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.hardware-recovery details {
+  margin-top: 14px;
+}
+.hardware-recovery summary {
+  cursor: pointer;
+}
+.hardware-recovery li {
+  margin-bottom: 8px;
+}
+.hardware-recovery pre {
+  max-height: 280px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .hardware-owner {
   display: flex;
   flex-direction: column;

@@ -33,58 +33,128 @@ export class HardwareStore {
   constructor(private readonly dataDir: string, onWriterLost?: (error: HardwareError) => void) { this.directory = path.join(path.resolve(dataDir), "hardware"); this.writer = new HardwareWriterLease(onWriterLost); }
 
   async init(): Promise<HardwareStoredState> {
-    await requireSafeDirectory(this.dataDir, this.directory, { create: true, label: "Hardware data directory" });
-    await this.writer.acquire(path.join(this.directory, ".writer-lock"));
+    try { await requireSafeDirectory(this.dataDir, this.directory, { create: true, label: "Hardware data directory" }); }
+    catch (error) { throw storeFailure(error, "directory_open"); }
+    await this.acquireWriter();
     try { return await this.read(); }
-    catch (error) { await this.writer.release(); throw error; }
+    catch (error) { await this.writer.release().catch(() => undefined); throw error; }
   }
 
-  assertHeld(): void { this.writer.assertHeld(); }
+  async reconcile(): Promise<HardwareStoredState> {
+    await this.acquireWriter();
+    this.assertHeld();
+    const state = await this.readState(false);
+    this.assertHeld();
+    return state;
+  }
+
+  assertHeld(): void {
+    try { this.writer.assertHeld(); }
+    catch (error) { throw storeFailure(error, "writer_assert"); }
+  }
   dispose(): Promise<void> { return this.writer.release(); }
 
-  async read(): Promise<HardwareStoredState> {
-    const directory = await this.openDirectory();
+  read(): Promise<HardwareStoredState> { return this.readState(true); }
+
+  private async readState(allowMissing: boolean): Promise<HardwareStoredState> {
+    let directory: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let phase = "directory_open";
     try {
-      let file;
+      directory = await this.openDirectory();
+      phase = "state_read";
       try { file = await fs.open(`/proc/self/fd/${directory.fd}/state.json`, constants.O_RDONLY | constants.O_NOFOLLOW); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyHardwareState(); throw error; }
-      try {
+      catch (error) { if (!allowMissing || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      let state = emptyHardwareState();
+      if (file) {
         const stat = await file.stat();
+        phase = "state_validate";
         requireHardware(stat.isFile() && stat.size <= HARDWARE_STATE_BYTES, "STORE_UNAVAILABLE", "Hardware state must be a bounded regular file.");
-        return validateHardwareState(JSON.parse(await file.readFile("utf8")));
-      } finally { await file.close(); }
-    } catch (error) { throw new HardwareError("STORE_UNAVAILABLE", `Hardware state cannot be read. Preserve it for repair. ${error instanceof Error ? error.message : ""}`); }
-    finally { await directory.close(); }
+        phase = "state_read";
+        const text = await file.readFile("utf8");
+        phase = "state_validate";
+        state = validateHardwareState(JSON.parse(text));
+        phase = "state_close";
+        await file.close(); file = undefined;
+      }
+      phase = "directory_close";
+      await directory.close(); directory = undefined;
+      return state;
+    } catch (error) {
+      const failure = storeFailure(error, phase);
+      await file?.close().catch(() => undefined);
+      await directory?.close().catch(() => undefined);
+      throw failure;
+    }
   }
 
   async write(state: HardwareStoredState): Promise<void> {
-    this.writer.assertHeld();
-    validateHardwareState(state);
-    const text = `${JSON.stringify(state)}\n`;
-    requireHardware(Buffer.byteLength(text) <= HARDWARE_STATE_BYTES, "LIMIT_EXCEEDED", "Hardware state exceeds its 64 MiB bound.");
-    const directory = await this.openDirectory();
-    const temporary = `/proc/self/fd/${directory.fd}/.state-${randomUUID()}.tmp`;
+    let directory: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let temporary: string | undefined;
+    let temporaryCreated = false;
     let renamed = false;
+    let durability: "unchanged" | "unconfirmed" | "confirmed" = "unchanged";
+    let phase = "writer_assert";
     try {
+      this.writer.assertHeld();
+      phase = "state_validate";
+      validateHardwareState(state);
+      phase = "state_serialize";
+      const text = `${JSON.stringify(state)}\n`;
+      requireHardware(Buffer.byteLength(text) <= HARDWARE_STATE_BYTES, "LIMIT_EXCEEDED", "Hardware state exceeds its 64 MiB bound.");
+      phase = "directory_open";
+      directory = await this.openDirectory();
+      temporary = `/proc/self/fd/${directory.fd}/.state-${randomUUID()}.tmp`;
       const destination = `/proc/self/fd/${directory.fd}/state.json`;
+      phase = "destination_check";
       const prior = await fs.lstat(destination).catch(error => { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; });
       requireHardware(!prior || prior.isFile(), "STORE_UNAVAILABLE", "Hardware state cannot replace a link or non-file.");
-      const file = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
-      try { await file.writeFile(text); await file.sync(); } finally { await file.close(); }
+      phase = "temporary_open";
+      file = await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      temporaryCreated = true;
+      phase = "temporary_write";
+      await file.writeFile(text);
+      phase = "temporary_sync";
+      await file.sync();
+      phase = "temporary_close";
+      await file.close(); file = undefined;
+      phase = "writer_assert";
       this.writer.assertHeld();
+      phase = "state_rename";
       await fs.rename(temporary, destination);
       renamed = true;
+      durability = "unconfirmed";
+      phase = "directory_sync";
       await directory.sync();
+      durability = "confirmed";
+      phase = "directory_close";
+      await directory.close(); directory = undefined;
     } catch (error) {
-      if (!renamed) await fs.rm(temporary, { force: true });
-      throw new HardwareError("STORE_UNAVAILABLE", "Hardware persistence failed. No new effects may start until state is reconciled.", { authorityReplaced: renamed });
-    } finally { await directory.close(); }
+      const failure = storeFailure(error, phase, durability, renamed);
+      await file?.close().catch(() => undefined);
+      if (temporary && temporaryCreated && !renamed) await fs.rm(temporary, { force: true }).catch(() => undefined);
+      await directory?.close().catch(() => undefined);
+      throw failure;
+    }
+  }
+
+  private async acquireWriter(): Promise<void> {
+    try { await this.writer.acquire(path.join(this.directory, ".writer-lock")); }
+    catch (error) { throw storeFailure(error, "writer_acquire"); }
   }
 
   private async openDirectory() {
     await requireSafeDirectory(this.dataDir, this.directory, { create: false, label: "Hardware data directory" });
     return fs.open(this.directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   }
+}
+
+function storeFailure(error: unknown, phase: string, durability: "unchanged" | "unconfirmed" | "confirmed" = "unchanged", authorityReplaced = false): HardwareError {
+  const source = error instanceof HardwareError ? error.details?.errno : (error as NodeJS.ErrnoException | null)?.code;
+  const errno = typeof source === "string" && /^E[A-Z0-9]+$/.test(source) ? source : undefined;
+  const code = error instanceof HardwareError && ["WRITER_LOST", "LIMIT_EXCEEDED"].includes(error.code) ? error.code : "STORE_UNAVAILABLE";
+  return new HardwareError(code, "Hardware durable state is unavailable. Preserve the saved state, repair storage or writer ownership, then run operator reconciliation.", { ...(errno && { errno }), phase, durability, authorityReplaced });
 }
 
 export function validateHardwareState(value: unknown): HardwareStoredState {

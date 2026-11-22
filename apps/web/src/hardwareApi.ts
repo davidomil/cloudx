@@ -3,6 +3,7 @@ import {
   parseHardwareConnectionObservation,
   parseHardwareItem,
   parseHardwareOwner,
+  type HardwareDiagnostics,
   type HardwareMutationResult,
   type HardwareStateView,
   type OperationReceipt,
@@ -67,6 +68,31 @@ export async function getHardwareState(
   signal?: AbortSignal,
 ): Promise<HardwareStateView> {
   const value = await request("/state", { signal, cache: "no-store" });
+  return parseHardwareState(value);
+}
+
+function validReadiness(value: unknown): boolean {
+  if (
+    !isRecord(value) ||
+    !["ready", "unavailable"].includes(String(value.state)) ||
+    (value.reason !== undefined && typeof value.reason !== "string")
+  )
+    return false;
+  if (value.recovery === undefined) return true;
+  const recovery = value.recovery;
+  return (
+    isRecord(recovery) &&
+    typeof recovery.phase === "string" &&
+    (recovery.errno === undefined || typeof recovery.errno === "string") &&
+    ["unchanged", "unconfirmed", "confirmed"].includes(
+      String(recovery.durability),
+    ) &&
+    typeof recovery.authorityReplaced === "boolean" &&
+    typeof recovery.nextAction === "string"
+  );
+}
+
+function parseHardwareState(value: unknown): HardwareStateView {
   if (
     !isRecord(value) ||
     !Number.isSafeInteger(value.revision) ||
@@ -104,8 +130,7 @@ export async function getHardwareState(
         ))
     )
       throw new Error("Invalid execution readiness");
-    if (!["ready", "unavailable"].includes(String(value.readiness.state)))
-      throw new Error("Invalid readiness");
+    if (!validReadiness(value.readiness)) throw new Error("Invalid readiness");
     for (const summary of value.items as unknown[]) {
       if (
         !isRecord(summary) ||
@@ -127,6 +152,71 @@ export async function getHardwareState(
     );
   }
   return value as unknown as HardwareStateView;
+}
+
+export async function getHardwareDiagnostics(
+  signal?: AbortSignal,
+): Promise<HardwareDiagnostics> {
+  const body = await request("/actions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ action: "hardware.diagnostics", input: {} }),
+    signal,
+  });
+  const result = isRecord(body) ? body.result : undefined;
+  const state = isRecord(result) ? result.state : undefined;
+  if (
+    !isRecord(result) ||
+    !validReadiness(result.readiness) ||
+    typeof result.lastConfirmedState !== "boolean" ||
+    !isRecord(state) ||
+    state.schemaVersion !== 1 ||
+    !Number.isSafeInteger(state.revision) ||
+    !Number.isSafeInteger(state.nextGeneration) ||
+    ![
+      "items",
+      "tags",
+      "groups",
+      "statusDefinitions",
+      "reservations",
+      "checkHolds",
+      "receipts",
+      "history",
+    ].every((key) => Array.isArray(state[key]))
+  )
+    throw new HardwareApiError(
+      "Hardware diagnostics are invalid. No evidence was exported.",
+      "INVALID_RESPONSE",
+    );
+  return result as unknown as HardwareDiagnostics;
+}
+
+export async function reconcileHardwareStorage(
+  requestId: string,
+  signal?: AbortSignal,
+): Promise<HardwareStateView> {
+  const body = await request(
+    "/actions",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        action: "hardware.reconcile",
+        input: { requestId },
+      }),
+      signal,
+    },
+    requestId,
+  );
+  try {
+    return parseHardwareState(isRecord(body) ? body.result : undefined);
+  } catch {
+    throw new HardwareApiError(
+      "The reconciliation response is invalid. Refresh diagnostics before continuing.",
+      "OUTCOME_UNKNOWN",
+      requestId,
+    );
+  }
 }
 
 export async function callHardwareAction<T = HardwareMutationResult>(

@@ -18,14 +18,15 @@ export class HardwareWriterLease {
       this.child = child;
       child.on("exit", () => { const unexpected = this.held && this.child === child; this.held = false; if (unexpected) this.onLost?.(new HardwareError("WRITER_LOST", "Hardware writer ownership was lost.")); });
       await new Promise<void>((resolve, reject) => {
-        child.once("error", () => reject(new HardwareError("STORE_UNAVAILABLE", "The Linux flock writer lease helper could not be started.")));
+        child.once("error", error => reject(new HardwareError("STORE_UNAVAILABLE", "The Linux flock writer lease helper could not be started.", { errno: (error as NodeJS.ErrnoException).code })));
         child.once("exit", code => reject(new HardwareError("WRITER_LOST", code === 73 ? "Another CloudX service owns this hardware inventory." : "Hardware writer ownership could not be acquired.")));
         child.stdout!.once("data", () => { this.held = true; resolve(); });
       });
-    } finally { await handle.close(); }
+    } catch (error) { await handle.close().catch(() => undefined); throw error; }
+    await handle.close();
   }
 
-  assertHeld(): void { requireHardware(this.held, "WRITER_LOST", "Hardware writer ownership was lost. Restart to reconcile saved claims."); }
+  assertHeld(): void { requireHardware(this.held, "WRITER_LOST", "Hardware writer ownership was lost. Run operator reconciliation to reacquire saved claims."); }
 
   async release(): Promise<void> {
     const child = this.child;

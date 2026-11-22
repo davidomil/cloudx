@@ -12,13 +12,14 @@ const CONNECTION_RECOVERY_BYTES = 96 * 1024;
 export const HARDWARE_OPERATION_RESERVE = 4 * 1024 * 1024 + 128 * 1024;
 
 const cleanupActions = new Set(["hardware.release", "hardware.forceRelease", "hardware.access.close"]);
+const bookkeepingActions = new Set(["hardware.reconcile"]);
 type HardwareHold = HardwareStoredState["reservations"][number] | HardwareStoredState["checkHolds"][number];
 type CapacityUse = "ordinary" | "cleanup" | "bookkeeping";
 
 /** Ordinary work must leave room to save outcomes and clean up every existing hold. */
 export class HardwareCapacity {
   assertNewRequest(state: HardwareStoredState, action: string): void {
-    if (!cleanupActions.has(action) && state.receipts.length >= HARDWARE_REQUEST_QUOTA) this.exceeded(state, "The retained request index reached its ordinary-work quota. Existing receipts and cleanup remain available.");
+    if (!cleanupActions.has(action) && !bookkeepingActions.has(action) && state.receipts.length >= HARDWARE_REQUEST_QUOTA) this.exceeded(state, "The retained request index reached its ordinary-work quota. Existing receipts and cleanup remain available.");
   }
 
   canSchedule(state: HardwareStoredState): boolean {
@@ -27,11 +28,11 @@ export class HardwareCapacity {
 
   assertMutation(previous: HardwareStoredState, next: HardwareStoredState): void {
     const added = next.receipts.slice(previous.receipts.length);
-    const ordinary = added.some(record => !cleanupActions.has(record.action));
+    const ordinary = added.some(record => !cleanupActions.has(record.action) && !bookkeepingActions.has(record.action));
     if (ordinary && next.receipts.length > HARDWARE_REQUEST_QUOTA) this.exceeded(next, "The retained request index reached its ordinary-work quota.");
     const limit = ordinary ? HARDWARE_ORDINARY_BYTES : HARDWARE_STATE_BYTES;
-    const final = added.length > 0 && added.every(record => record.finalCleanupTarget);
-    const accounted = this.accountedBytes(next, ordinary ? "ordinary" : added.length && !final ? "cleanup" : "bookkeeping");
+    const cleanup = added.some(record => cleanupActions.has(record.action) && !record.finalCleanupTarget);
+    const accounted = this.accountedBytes(next, ordinary ? "ordinary" : cleanup ? "cleanup" : "bookkeeping");
     if (accounted > limit) this.exceeded(next, ordinary ? "Hardware has no capacity for new work while preserving operation outcomes and cleanup." : "Hardware cleanup capacity is reserved for acknowledged overrides. Inspect existing receipts or explicitly acknowledge unresolved activity when releasing a hold.");
   }
 
