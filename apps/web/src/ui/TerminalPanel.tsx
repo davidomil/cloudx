@@ -21,6 +21,8 @@ import { CodexCommandDetails } from "./CodexCommandDetails.js";
 import { CodexNativeWorkPanel } from "./CodexNativeWorkPanel.js";
 import { ControlButton } from "./Control.js";
 import { openNativeWorkDetails } from "./nativeWorkDetails.js";
+import { TerminalShortcutBar } from "./TerminalShortcutBar.js";
+import { sendTerminalShortcut } from "./terminalShortcuts.js";
 
 interface TerminalView {
   tabId: string;
@@ -46,6 +48,7 @@ interface TerminalView {
   releasePreferences?: () => void;
   providerId?: string;
   onReconnect?: () => void;
+  onConnectionChange?: (connected: boolean) => void;
   selectionCopy?: TerminalSelectionCopy;
   clipboardRequest?: TerminalClipboardRequest;
   uiScale: number;
@@ -76,6 +79,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
   const tabRef = useRef(tab);
   const [connectionError, setConnectionError] = useState<string>();
   const [connectionRevision, setConnectionRevision] = useState(0);
+  const [connected, setConnected] = useState(false);
   const [runtimeRevision, setRuntimeRevision] = useState(0);
   const [capabilityResult, setCapabilityResult] = useState<{ scope: string; capabilities: TerminalCapabilities }>();
   const starting = tab.status === "starting";
@@ -127,6 +131,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
 
   useEffect(() => {
     if (needsRecovery) {
+      setConnected(false);
       disposeTerminalViewInternal(tab.id);
       return;
     }
@@ -136,6 +141,8 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     view.active = activeRef.current;
     viewRef.current = view;
     view.onReconnect = () => setConnectionRevision(value => value + 1);
+    view.onConnectionChange = setConnected;
+    setConnected(view.socket.readyState === WebSocket.OPEN);
     view.clipboardRequest?.setActive(activeRef.current);
     view.terminal.options.disableStdin = preserveOutput;
     if (preserveOutput) {
@@ -173,6 +180,7 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
       releaseTerminalContainerBindings(view);
       view.onConnectionError = undefined;
       view.onReconnect = undefined;
+      view.onConnectionChange = undefined;
       viewRef.current = null;
     };
   }, [tab.id, tab.cwd, tab.title, tab.nativeWork?.executionId, uiScale, needsRecovery, recoveryEnabled, preserveOutput, runtimeRevision]);
@@ -195,12 +203,23 @@ export function TerminalPanel({ tab, active, uiScale, onRecover }: {
     {recoveryPanel}
     <div className="terminal-panel" ref={containerRef} role="region" aria-label="Codex terminal output" />
   </div> : recoveryPanel ?? <div className="terminal-panel" ref={containerRef} />;
-  return tab.pluginId === "codex-terminal" ? <div className="codex-terminal-view">
+  const shortcuts = !needsRecovery && <TerminalShortcutBar agent={isAgentTab(tab)} disabled={!active || starting || preserveOutput || !connected} onShortcut={shortcut => {
+    const view = viewRef.current;
+    if (!view) return;
+    sendTerminalShortcut({
+      terminal: view.terminal,
+      active: active && view.active && !starting,
+      connected: view.socket.readyState === WebSocket.OPEN,
+      disposed: view.disposed
+    }, shortcut, readTerminalPreferences().shiftEnter);
+  }} />;
+  return tab.pluginId === "codex-terminal" ? <div className="codex-terminal-view terminal-view">
     <CodexNativeWorkPanel tab={tab} onRecover={onRecover} onDismiss={() => { if (active) viewRef.current?.terminal.focus(); }} />
     <TerminalInputHelp provider={capabilities?.providerId} terminal={() => viewRef.current?.terminal} actions={tab.nativeWork ? <ControlButton size="compact" iconOnly aria-label={`Open native work details for ${tab.title}`} title="Native work details" onClick={() => openNativeWorkDetails(tab)}><Info size={14} aria-hidden="true" /></ControlButton> : undefined} />
     {capabilities?.commandCapture && <CodexCommandDetails key={`${capabilities.providerId}:${capabilities.executionId ?? ""}`} tabId={tab.id} tabTitle={tab.title} providerLabel={capabilities.providerId ? agentProviderLabel(capabilities.providerId) : "Agent"} active={active && !needsRecovery} />}
     {content}
-  </div> : content;
+    {shortcuts}
+  </div> : <div className="terminal-view">{content}{shortcuts}</div>;
 }
 
 function disposeTerminalViewInternal(tabId: string): void {
@@ -321,11 +340,13 @@ function subscribeTerminalSocket(view: TerminalView): void {
   socket.addEventListener("open", () => {
     if (!isCurrentSocket()) return;
     view.reconnectAttempt = 0;
+    view.onConnectionChange?.(true);
     view.onReconnect?.();
     fitAndResize(view);
   });
   socket.addEventListener("close", (event) => {
     if (!isCurrentSocket()) return;
+    view.onConnectionChange?.(false);
     if (view.terminal.options.disableStdin) return;
     if (event.code === 1008) {
       view.connectionError = {

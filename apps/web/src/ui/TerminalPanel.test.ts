@@ -9,7 +9,7 @@ const terminalPanelMocks = vi.hoisted(() => ({
   fitCalls: [] as unknown[],
   installMobileScroller: vi.fn(),
   releaseMobileScroller: vi.fn(),
-  terminals: [] as Array<{ disposed: boolean; element?: HTMLElement; options: Record<string, unknown>; writelnCalls: string[]; writeCalls: string[]; inputHandlers: Array<(data: string) => void> }>,
+  terminals: [] as Array<{ disposed: boolean; element?: HTMLElement; options: Record<string, unknown>; modes: { applicationCursorKeysMode: boolean }; input: (data: string, wasUserInput?: boolean) => void; focus: () => void; writelnCalls: string[]; writeCalls: string[]; inputHandlers: Array<(data: string) => void> }>,
   uploadFileBrowserFile: vi.fn(),
   readCodexCommandDetails: vi.fn(),
   readTerminalCapabilities: vi.fn()
@@ -38,6 +38,7 @@ vi.mock("@xterm/xterm", () => ({
     readonly writeCalls: string[] = [];
     readonly inputHandlers: Array<(data: string) => void> = [];
     readonly _core = { _inputHandler: { parse: (_data: string) => undefined } };
+    readonly modes = { applicationCursorKeysMode: false };
     readonly buffer = { active: { length: 0, viewportY: 0, getLine: () => undefined } };
     keyHandler?: (event: KeyboardEvent) => boolean;
     registerLinkProvider() { return { dispose() {} }; }
@@ -94,6 +95,10 @@ vi.mock("@xterm/xterm", () => ({
     onData(handler: (data: string) => void): { dispose: () => void } {
       this.inputHandlers.push(handler);
       return { dispose: () => undefined };
+    }
+
+    input(data: string): void {
+      if (!this.options.disableStdin) this.inputHandlers.forEach(handler => handler(data));
     }
 
     focus(): void {
@@ -183,6 +188,88 @@ describe("TerminalPanel", () => {
     host = undefined;
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it.each(["standard-terminal", "codex-terminal"])("sends touch shortcuts through the native input path for %s", async pluginId => {
+    await act(async () => root!.render(createElement(TerminalPanel, { tab: { ...tab, pluginId }, active: true, uiScale: 1 })));
+    const socket = TestWebSocket.latest!;
+    const terminal = terminalPanelMocks.terminals[0]!;
+    const input = vi.spyOn(terminal, "input");
+    const focus = vi.spyOn(terminal, "focus");
+    const button = (label: string) => host!.querySelector<HTMLButtonElement>(`[aria-label="${label}"]`)!;
+    act(() => socket.open());
+    focus.mockClear();
+
+    for (const label of ["Send Escape", "Send Tab", "Send Ctrl+C to interrupt", "Send left arrow", "Send down arrow", "Send up arrow", "Send right arrow", "Send Enter"]) act(() => button(label).click());
+    expect(inputMessages(socket).map(message => message.data)).toEqual(["\x1b", "\t", "\x03", "\x1b[D", "\x1b[B", "\x1b[A", "\x1b[C", "\r"]);
+    expect(input).toHaveBeenLastCalledWith("\r", true);
+    expect(focus).toHaveBeenCalledTimes(8);
+
+    terminal.modes.applicationCursorKeysMode = true;
+    act(() => button("Send up arrow").click());
+    expect(inputMessages(socket).at(-1)?.data).toBe("\x1bOA");
+    expect(Boolean(button("Send configured Shift+Enter newline"))).toBe(pluginId === "codex-terminal");
+    if (pluginId === "codex-terminal") {
+      act(() => button("Send configured Shift+Enter newline").click());
+      expect(inputMessages(socket).at(-1)?.data).toBe("\x1b[13;2u");
+      localStorage.setItem("cloudx.terminal-preferences.v1", JSON.stringify({ shiftEnter: "ctrl-j" }));
+      act(() => button("Send configured Shift+Enter newline").click());
+      expect(inputMessages(socket).at(-1)?.data).toBe("\n");
+    }
+  });
+
+  it("disables touch shortcuts until connected, while inactive, and while reconnecting", () => {
+    vi.useFakeTimers();
+    const render = (active = true) => act(() => root!.render(createElement(TerminalPanel, { tab, active, uiScale: 1 })));
+    render();
+    const button = () => host!.querySelector<HTMLButtonElement>('[aria-label="Send Escape"]')!;
+    const socket = TestWebSocket.latest!;
+    expect(button().disabled).toBe(true);
+    act(() => button().click());
+    expect(inputMessages(socket)).toEqual([]);
+    act(() => socket.open());
+    expect(button().disabled).toBe(false);
+    render(false);
+    expect(button().disabled).toBe(true);
+    act(() => button().click());
+    expect(inputMessages(socket)).toEqual([]);
+    render();
+    act(() => socket.close(1001));
+    expect(button().disabled).toBe(true);
+    act(() => vi.advanceTimersByTime(500));
+    const replacement = TestWebSocket.latest!;
+    expect(button().disabled).toBe(true);
+    act(() => replacement.open());
+    expect(button().disabled).toBe(false);
+    act(() => button().click());
+    expect(inputMessages(replacement)).toEqual([{ type: "input", data: "\x1b" }]);
+    expect(inputMessages(socket)).toEqual([]);
+  });
+
+  it("keeps retained failed output read-only and does not refocus from touch shortcuts", () => {
+    const render = (currentTab: WorkspaceTab) => act(() => root!.render(createElement(TerminalPanel, { tab: currentTab, active: true, uiScale: 1, onRecover: vi.fn() })));
+    const codexTab = { ...tab, pluginId: "codex-terminal" };
+    render(codexTab);
+    const socket = TestWebSocket.latest!;
+    act(() => socket.open());
+    render({ ...codexTab, status: "failed", recovery: { state: "missing", message: "Native startup failed", startupFailed: true } });
+    const terminal = terminalPanelMocks.terminals[0]!;
+    const focus = vi.spyOn(terminal, "focus");
+    const button = host!.querySelector<HTMLButtonElement>('[aria-label="Send Ctrl+C to interrupt"]')!;
+    expect(button.disabled).toBe(true);
+    act(() => button.click());
+    expect(terminal.options.disableStdin).toBe(true);
+    expect(focus).not.toHaveBeenCalled();
+    expect(inputMessages(socket)).toEqual([]);
+  });
+
+  it("prevents pointer focus from leaving the terminal before sending a shortcut", () => {
+    act(() => root!.render(createElement(TerminalPanel, { tab, active: true, uiScale: 1 })));
+    act(() => TestWebSocket.latest!.open());
+    const button = host!.querySelector<HTMLButtonElement>('[aria-label="Send Escape"]')!;
+    const pointerDown = new Event("pointerdown", { bubbles: true, cancelable: true });
+    act(() => button.dispatchEvent(pointerDown));
+    expect(pointerDown.defaultPrevented).toBe(true);
   });
 
   it("inspects healthy native work from the compact terminal control without restarting or replacing the terminal", async () => {

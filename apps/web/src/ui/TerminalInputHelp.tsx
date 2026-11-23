@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import type { Terminal } from "@xterm/xterm";
 import { agentProviderLabel, type AgentProviderId } from "@cloudx/shared";
 import { copyTextToClipboard } from "./clipboard.js";
+import { ControlButton } from "./Control.js";
 import { onTerminalPreferencesChanged, terminalPreferenceState } from "./terminalPreferences.js";
 
 export function TerminalInputHelp({ provider, terminal, actions }: { provider?: AgentProviderId; terminal: () => Terminal | undefined; actions?: ReactNode }) {
@@ -21,7 +22,7 @@ export function TerminalInputHelp({ provider, terminal, actions }: { provider?: 
       <p>Native external-editor actions run on the server in the provider environment (VISUAL/EDITOR), not this browser. CloudX has not observed their target or successful execution for this session. Links use the CloudX destination preview instead.</p>
       <p>Native copy requests, including copy-on-select, remain staged until you approve Copy in CloudX. Browser clipboard permission may still deny the write.</p>
     </details>
-    <button type="button" onClick={() => {
+    <ControlButton size="compact" aria-label="Select visible terminal text" onClick={() => {
       const current = terminal();
       if (!current) return;
       const buffer = current.buffer.active;
@@ -31,7 +32,7 @@ export function TerminalInputHelp({ provider, terminal, actions }: { provider?: 
       setSelection(text);
       setSelectedText(text);
       setStatus("Visible terminal text saved. Select text below, then copy. Scroll the terminal first to select older output.");
-    }}>Select visible terminal text</button>
+    }}>Select text</ControlButton>
     {selection !== undefined && <aside className="terminal-touch-selection" aria-label="Terminal text selection mode">
       <p role="status">{status}</p>
       <textarea aria-label="Visible terminal text" readOnly value={selection} onSelect={event => { const text = event.currentTarget; setSelectedText(text.value.slice(text.selectionStart, text.selectionEnd)); }} />
