@@ -358,12 +358,18 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     await services.sessions.restore?.(services.pluginContributionsReady);
     if (services.hardware) {
       await services.forge?.dashboard();
+      let hardwareUnavailable = false;
       try { await services.hardware.init(); }
       catch (error) {
         if (!(error instanceof HardwareError)) throw error;
+        hardwareUnavailable = true;
         app.log.error({ code: error.code, details: error.details }, "Hardware admission is closed. Use Hardware storage recovery after host repair.");
       }
-      await services.hardwareMonitor?.start();
+      try { await services.hardwareMonitor?.start(); }
+      catch (error) {
+        // The monitor reports its failure. Keep recovery reachable while admission is closed.
+        if (!hardwareUnavailable) throw error;
+      }
     }
     if (services.cooperation && services.cooperationContexts) {
       // Forge restores its embedded sessions while loading the dashboard. Its

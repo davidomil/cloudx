@@ -11,6 +11,7 @@ import { DEFAULT_DOCUMENTATION_RESPONSE_MAX_BYTES } from "../documentation/Docum
 import { buildServer, buildServices, type AppServices } from "../server.js";
 import { ConfigSecretStore } from "../configSecretStore.js";
 import { emptyHardwareState, HardwareStore } from "./HardwareStore.js";
+import { SessionStateStore } from "../workspace/SessionStateStore.js";
 
 const fixtures: { root: string; app: FastifyInstance }[] = [];
 afterEach(async () => {
@@ -113,6 +114,70 @@ async function expectUnavailableWithoutSecrets(app: FastifyInstance) {
 }
 
 describe("Hardware production composition", () => {
+  it("keeps recovery reachable when a persisted agent locator fails after Hardware startup has already become unavailable", async () => {
+    const tabId = "saved-codex-tab", executionId = "saved-codex-execution";
+    const attempts = { hardware: 0, locator: 0 };
+    const { app, root, services } = await fixture(async (_services, dataDir) => {
+      const at = new Date().toISOString();
+      await new SessionStateStore(dataDir).save({ version: 1, activeTabId: tabId, sessions: [{
+        tab: { id: tabId, pluginId: "codex-terminal", title: "Saved conversation", cwd: path.dirname(dataDir), status: "running", indicator: { color: "green", label: "OK", updatedAt: at }, createdAt: at, updatedAt: at },
+        initialInput: { agent: { providerId: "codex" }, codexExecutionId: executionId }
+      }] });
+      const state = emptyHardwareState(); state.revision = 7;
+      await fs.mkdir(path.join(dataDir, "hardware"), { recursive: true });
+      await fs.writeFile(path.join(dataDir, "hardware/state.json"), JSON.stringify(state));
+      const open = fs.open, write = fs.writeFile;
+      vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+        const file = await open(...args);
+        if (/\/\.state-.*\.tmp$/.test(String(args[0])) && ++attempts.hardware === 1)
+          vi.spyOn(file, "writeFile").mockRejectedValueOnce(Object.assign(new Error("Injected Hardware state failure"), { code: "ENOSPC" }));
+        return file;
+      });
+      vi.spyOn(fs, "writeFile").mockImplementation(async (...args) => {
+        if (String(args[0]).includes("/hardware-agents/") && String(args[0]).endsWith(".tmp") && ++attempts.locator <= 2)
+          throw Object.assign(new Error("Injected private Hardware locator failure"), { code: "ENOSPC" });
+        return write(...args);
+      });
+    });
+    expect(attempts).toEqual({ hardware: 1, locator: 2 });
+    expect(services.sessions.getTab(tabId)).toMatchObject({ id: tabId, recovery: { state: "unavailable" } });
+    const owner = (await services.hardwareContexts!.owner(tabId))!;
+    expect(owner).toMatchObject({ kind: "agent", tabId, providerId: "codex", executionId });
+    const unavailable = await expectUnavailableWithoutSecrets(app);
+    expect(unavailable.readiness).toMatchObject({ recovery: { errno: "ENOSPC", phase: "temporary_write" } });
+    const unauthenticated = await app.inject({ method: "POST", url: "/api/hardware/agent", payload: { tabId, executionId, action: "hardware.reserve", input: { requestId: randomUUID() } } });
+    expect(unauthenticated.statusCode).toBe(403);
+    expect(attempts.locator).toBe(2);
+    await expect(fs.stat(services.hardwareContexts!.contextPath(owner))).rejects.toMatchObject({ code: "ENOENT" });
+    // Repair only the locator. Hardware authority still requires operator reconciliation.
+    const locator = (await services.hardwareContexts!.prepare(tabId))!;
+    expect(locator.owner).toMatchObject({ tabId, executionId });
+    await expectUnavailableWithoutSecrets(app);
+    const blocked = await app.inject({ method: "POST", url: "/api/hardware/agent", headers: { authorization: `Bearer ${locator.capability}` }, payload: { tabId, executionId, action: "hardware.reserve", input: { requestId: randomUUID() } } });
+    expect(blocked.statusCode, blocked.body).toBe(503);
+    expect((await action(app, "hardware.reconcile", { requestId: randomUUID() })).readiness.state).toBe("ready");
+    const item = await createReadySsh(app, root);
+    const provider = services.plugins.get("hardware").hardwareTypes!.find(type => type.descriptor.id === "hardware.ssh")!;
+    const check = vi.spyOn(provider, "checkConnection").mockImplementation(async (_config, context) => {
+      context.registerCleanup(async () => ({ state: "completed", value: null }));
+      return { state: "completed", value: { online: true } };
+    });
+    const checked = await mutation(app, "hardware.connection.check", { hardwareId: item.id, expectedItemRevision: item.revision });
+    expect((await settled(app, checked.receipt)).state).toBe("succeeded");
+    expect(check).toHaveBeenCalledOnce();
+  });
+
+  it("does not tolerate owner monitor startup failure after Hardware initializes successfully", async () => {
+    const failure = new Error("Unexpected owner monitor startup failure");
+    let root: string | undefined;
+    try {
+      await expect(fixture(async (services, dataDir) => {
+        root = path.dirname(dataDir);
+        vi.spyOn(services.hardwareMonitor!, "start").mockRejectedValueOnce(failure);
+      })).rejects.toBe(failure);
+    } finally { if (root) await fs.rm(root, { recursive: true, force: true }); }
+  });
+
   it("defers password cleanup after failed Hardware startup and requires cleanup to succeed before reconciliation admits work", async () => {
     const faults = { hardware: true, secrets: true };
     let saved!: Awaited<ReturnType<typeof savedHardwareAndInterruptedRegistration>>;

@@ -88,6 +88,8 @@ After repair, select **Reconcile storage**. Only the operator can run this actio
 
 Startup must also discard interrupted SSH registration passwords from the legacy secret file before Hardware admits effects. This cleanup runs under the Hardware writer lease. If it fails, diagnostics and recovery remain available. Repair storage and permissions for `secrets/config-secrets.json`, then select **Reconcile storage** to finish the pending cleanup. A later reconciliation in the same process preserves newly staged in-memory passwords after startup cleanup has succeeded.
 
+When Hardware initialization fails, a failure to save a restored agent's Hardware locator also leaves the server and recovery routes available. Hardware admission stays closed. Hardware reconciliation does not reconnect the failed agent tab. After host repair, use the tab's **Check connection** action to prepare its execution context and verify terminal ownership.
+
 If reconciliation fails, admission stays closed and diagnostics remain available. Repair the reported condition before another explicit attempt. If host repair requires restarting the service, use `systemctl --user restart cloudx.service`, then confirm Hardware readiness and inspect retained holds. Unrepairable storage, a competing writer, corrupt authority, or unsettled local work can prevent recovery. Force release cannot bypass these conditions or a failed durable save.
 
 ## Inspect retained outcomes
