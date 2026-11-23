@@ -1,0 +1,57 @@
+.terminal-view {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.terminal-view > .terminal-panel,
+.terminal-view > .terminal-recovery-with-output {
+  flex: 1;
+  height: auto;
+  min-height: 0;
+}
+
+.terminal-shortcut-bar {
+  display: none;
+}
+
+@media (max-width: 760px), all and (hover: none) and (pointer: coarse) and (max-width: 960px) and (max-height: 520px) {
+  .terminal-shortcut-bar {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 4px;
+    min-width: 0;
+    padding: 4px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    touch-action: pan-x;
+    border-top: 1px solid var(--color-border);
+    background: var(--color-background);
+    scrollbar-width: thin;
+  }
+
+  .terminal-shortcut-bar button {
+    flex: 0 0 auto;
+    min-width: 44px;
+    min-height: 44px;
+    padding: 4px 8px;
+    border: 1px solid var(--color-border);
+    border-radius: 6px;
+    color: var(--color-foreground);
+    background: var(--color-card);
+    font: inherit;
+    font-size: var(--font-size-xs);
+    white-space: nowrap;
+    touch-action: pan-x;
+  }
+
+  .terminal-shortcut-bar button:active:not(:disabled) {
+    color: var(--color-accent);
+    border-color: var(--color-accent);
+  }
+
+  .terminal-shortcut-bar button:disabled {
+    opacity: 0.45;
+  }
+}

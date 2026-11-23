@@ -46,6 +46,7 @@ import { disposeFileBrowserTransfersExcept } from "./fileBrowserTransfers.js";
 import { disposeDocumentationIngestController, disposeDocumentationIngestControllersExcept } from "./documentationPanelQueue.js";
 import { PathEntry } from "./PathEntry.js";
 import { TabPanel } from "./TabPanel.js";
+import { WorkspaceTabStrip } from "./WorkspaceTabStrip.js";
 import { WorkspaceRecoveryPanel } from "./WorkspaceRecoveryPanel.js";
 import type { RecoverTabRequest } from "@cloudx/shared";
 import {
@@ -86,7 +87,7 @@ import { useCooperationBoards } from "./cooperation/cooperationBoards.js";
 import { agentSelection, agentTabChoices } from "./agentTabChoice.js";
 import { ClaudeLaunchModeControl, claudeLaunchModeLabel } from "./ClaudeLaunchModeControl.js";
 import { CLAUDE_SETTINGS_HOOKS, type ClaudeGlobalSettings, type ClaudeLaunchMode } from "@cloudx/shared";
-import { UsageHoverCard, useAgentUsage, usageLine, useUsageHover } from "./AgentUsage.js";
+import { UsageButton, UsageHoverCard, useAgentUsage, usageLine, useUsageHover } from "./AgentUsage.js";
 import { RulesSkillsPanel, TemplateSelect, cloudxRuleFromEdit, pluginMetadataForTemplate, selectedTemplateId } from "./RulesSkillsPanel.js";
 import {
   PLUGIN_WEBVIEW_RENDERER,
@@ -214,6 +215,7 @@ export function App() {
   const [windowMenuOpen, setWindowMenuOpen] = useState(false);
   const [templateMenuOpen, setTemplateMenuOpen] = useState(false);
   const [mobileActionsOpen, setMobileActionsOpen] = useState(false);
+  const [mobileVoiceOpen, setMobileVoiceOpen] = useState(false);
   const [maximizedPaneId, setMaximizedPaneId] = useState<string | undefined>();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsCategory, setSettingsCategory] = useState("general");
@@ -1372,11 +1374,11 @@ export function App() {
     [UI_RENDERER_STATUS_DOT]: (_contribution, context) => (context.tab ? <TabIndicatorDot tab={context.tab} attention={context.attention} /> : null),
     "audio-ai.voice-control": () => renderMicControl("topbar-mic-control", topbarMicControlRef, 17),
     "audio-ai.voice-console": () => {
-      if (!voiceCommandsEnabled) {
+      if (!voiceCommandsEnabled || mobileActionsEnabled && !mobileVoiceOpen && voiceState === "idle") {
         return null;
       }
       return (
-        <footer className="voice-console">
+        <footer className="voice-console" id="voice-console">
           <textarea
             aria-label="Voice transcript"
             value={voiceConsoleText}
@@ -1480,6 +1482,7 @@ export function App() {
             onContextSearch={handleContextSearch}
             callHook={usageAvailable ? callUiHook : undefined}
           />
+          {mobileActionsEnabled && voiceCommandsEnabled && uiContributions.some(contribution => contribution.renderer === "audio-ai.voice-console") ? <ControlButton className="icon-button mobile-voice-toggle" iconOnly aria-label="Voice input" aria-expanded={mobileVoiceOpen || voiceState !== "idle"} aria-controls="voice-console" onClick={() => setMobileVoiceOpen(open => !open)}><Mic size={18} /></ControlButton> : null}
           <div className="mobile-action-menu" ref={mobileActionsRef}>
             <ControlButton className="icon-button" iconOnly pressed={mobileActionsOpen} onClick={() => setMobileActionsOpen((open) => !open)} title="Workspace actions" aria-label="Workspace actions" aria-expanded={mobileActionsOpen} aria-haspopup="menu">
               <MoreHorizontal size={19} />
@@ -1562,7 +1565,7 @@ export function App() {
       {layoutPersistenceError ?? error ? <div className="error-banner">{layoutPersistenceError ?? error}</div> : null}
       {notificationToastIds.size ? <NotificationStack notifications={notifications.filter((notification) => notificationToastIds.has(notification.id))} onDismiss={dismissNotificationToast} /> : null}
 
-      <section className={`pane-root${maximizedPaneId ? " maximized" : ""}`}>
+      <section className={`pane-root${maximizedPaneId ? " maximized" : ""}${panes.length === 1 ? " single-pane" : ""}`}>
         {renderLayoutNode(layout.root)}
       </section>
 
@@ -1677,107 +1680,115 @@ export function App() {
         onDragOver={(event) => event.preventDefault()}
         onDrop={(event) => handleDropTab(pane.id, event.dataTransfer.getData("text/tab-id"))}
       >
-        <div className="tab-strip">
-          {pane.tabIds.map((tabId) => {
-            const tab = tabById.get(tabId);
-            if (!tab) return null;
-            const selected = pane.activeTabId === tabId;
-            const focused = isTabFocused(layout, tabId);
-            const shouldBlink = attentionTabIds.has(tabId) && !focused;
-            return (
-              <div
-                key={tabId}
-                draggable
-                className={`tab-button ${selected ? "selected" : ""}`}
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={(event) => {
-                  event.stopPropagation();
-                  handleDropTab(pane.id, event.dataTransfer.getData("text/tab-id"), tabId);
-                }}
-                onDragStart={(event) => event.dataTransfer.setData("text/tab-id", tabId)}
-                onClick={(event) => {
-                  event.stopPropagation();
-                }}
-                {...agentSwitch.tabHandlers(tab)}
-              >
-                <button
-                  type="button"
-                  className="tab-activation"
-                  {...(usageAvailable && isAgentTab(tab) ? usageHover.handlers(tab.title, { tabIds: [tab.id] }) : {})}
+        <div className="pane-tabbar">
+          <WorkspaceTabStrip selection={`${activePaneTabId}:${pane.tabIds.join(",")}`}>
+            {pane.tabIds.map((tabId) => {
+              const tab = tabById.get(tabId);
+              if (!tab) return null;
+              const selected = pane.activeTabId === tabId;
+              const focused = isTabFocused(layout, tabId);
+              const shouldBlink = attentionTabIds.has(tabId) && !focused;
+              return (
+                <div
+                  key={tabId}
+                  draggable={!mobileActionsEnabled}
+                  onPointerDownCapture={event => { event.currentTarget.draggable = event.pointerType === "mouse"; }}
+                  className={`tab-button ${selected ? "selected" : ""}`}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={(event) => {
+                    event.stopPropagation();
+                    handleDropTab(pane.id, event.dataTransfer.getData("text/tab-id"), tabId);
+                  }}
+                  onDragStart={(event) => event.dataTransfer.setData("text/tab-id", tabId)}
                   onClick={(event) => {
                     event.stopPropagation();
-                    void activateTab(tabId, pane.id);
                   }}
+                  {...agentSwitch.tabHandlers(tab)}
                 >
-                  <span className="tab-title">{tab.title}</span>
-                  {renderTabIndicator(tab, shouldBlink)}
-                </button>
-                <div className="tab-actions">
-                  {cooperationEnabled && isAgentTab(tab) ? (() => {
-                    const board = cooperation.boards.find(board => board.members.some(member => member.tabId === tab.id));
-                    return board ? <button type="button" className="cooperation-tab-badge" aria-label={`Open blackboard ${board.title}${board.openQuestions ? `, ${board.openQuestions} open questions` : ""}`} title={`${board.title}${board.openQuestions ? ` · ${board.openQuestions} open questions` : ""}`} onClick={event => { event.stopPropagation(); void openBlackboard(board.boardId, board.title); }}><Monitor size={13} />{board.openQuestions ? <span>{board.openQuestions}</span> : null}</button> : null;
-                  })() : null}
-                  {renderUiContributions("tab.actions.trailing", { tab })}
                   <button
                     type="button"
-                    className="tab-close"
+                    className="tab-activation"
+                    aria-pressed={selected}
+                    {...(usageAvailable && isAgentTab(tab) ? usageHover.handlers(tab.title, { tabIds: [tab.id] }) : {})}
                     onClick={(event) => {
                       event.stopPropagation();
-                      void handleClose(tabId);
+                      void activateTab(tabId, pane.id);
                     }}
-                    aria-label={`Close ${tab.title}`}
-                    title={`Close ${tab.title}`}
                   >
-                    <X size={13} />
+                    <span className="tab-title">{tab.title}</span>
+                    {renderTabIndicator(tab, shouldBlink)}
                   </button>
+                  <div className="tab-actions">
+                    {cooperationEnabled && isAgentTab(tab) ? (() => {
+                      const board = cooperation.boards.find(board => board.members.some(member => member.tabId === tab.id));
+                      return board ? <button type="button" className="cooperation-tab-badge" aria-label={`Open blackboard ${board.title}${board.openQuestions ? `, ${board.openQuestions} open questions` : ""}`} title={`${board.title}${board.openQuestions ? ` · ${board.openQuestions} open questions` : ""}`} onClick={event => { event.stopPropagation(); void openBlackboard(board.boardId, board.title); }}><Monitor size={13} />{board.openQuestions ? <span>{board.openQuestions}</span> : null}</button> : null;
+                    })() : null}
+                    {renderUiContributions("tab.actions.trailing", { tab })}
+                    <button
+                      type="button"
+                      className="tab-close"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void handleClose(tabId);
+                      }}
+                      aria-label={`Close ${tab.title}`}
+                      title={`Close ${tab.title}`}
+                    >
+                      <X size={13} />
+                    </button>
+                  </div>
                 </div>
-              </div>
-            );
-          })}
-          <ControlButton
-            type="button"
-            className="new-tab-inline add-tab-button"
-            tone="primary"
-            iconOnly
-            onPointerDown={(event) => {
-              event.stopPropagation();
-              selectPaneForCreation(pane.id);
-            }}
-            onClick={(event) => {
-              event.stopPropagation();
-              openCreateDialogForPane(pane.id);
-            }}
-            title="Add tab to this pane"
-          >
-            <SquarePlus size={18} />
-          </ControlButton>
-          {panes.length > 1 ? (
+              );
+            })}
+          </WorkspaceTabStrip>
+          <div className="pane-actions">
+            {usageAvailable && activePaneTab && isAgentTab(activePaneTab) ? <UsageButton key={activePaneTab.id} title={activePaneTab.title} request={{ tabIds: [activePaneTab.id] }} callHook={callUiHook} /> : null}
             <ControlButton
-              className="new-tab-inline pane-maximize-button"
+              type="button"
+              className="new-tab-inline add-tab-button"
+              tone="primary"
               iconOnly
+              onPointerDown={(event) => {
+                event.stopPropagation();
+                selectPaneForCreation(pane.id);
+              }}
               onClick={(event) => {
                 event.stopPropagation();
-                togglePaneMaximized(pane);
+                openCreateDialogForPane(pane.id);
               }}
-              title={paneMaximized ? "Restore pane" : "Maximize pane"}
-              aria-label={paneMaximized ? "Restore pane" : "Maximize pane"}
+              title="Add tab to this pane"
+              aria-label="Add tab to this pane"
             >
-              {paneMaximized ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+              <SquarePlus size={18} />
             </ControlButton>
-          ) : null}
-          {panes.length > 1 ? (
-            <ControlButton
-              className="new-tab-inline pane-close-button"
-              iconOnly
-              onClick={(event) => {
-                event.stopPropagation();
-                handleClosePane(pane.id);
-              }}
-              title="Close pane"
-            >
-              <X size={16} />
-            </ControlButton>
-          ) : null}
+            {panes.length > 1 ? (
+              <ControlButton
+                className="new-tab-inline pane-maximize-button"
+                iconOnly
+                onClick={(event) => {
+                  event.stopPropagation();
+                  togglePaneMaximized(pane);
+                }}
+                title={paneMaximized ? "Restore pane" : "Maximize pane"}
+                aria-label={paneMaximized ? "Restore pane" : "Maximize pane"}
+              >
+                {paneMaximized ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+              </ControlButton>
+            ) : null}
+            {panes.length > 1 ? (
+              <ControlButton
+                className="new-tab-inline pane-close-button"
+                iconOnly
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleClosePane(pane.id);
+                }}
+                title="Close pane"
+              >
+                <X size={16} />
+              </ControlButton>
+            ) : null}
+          </div>
         </div>
         <div className="pane-body">
           {panelTabIds.map((tabId) => {

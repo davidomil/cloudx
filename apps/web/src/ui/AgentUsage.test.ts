@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { combineAgentUsage, emptyAgentUsageTotals, type AgentPricingState, type AgentUsageReadRequest, type AgentUsageReadResult, type AgentUsageSummary } from "@cloudx/shared";
 
-import { UsageHoverCard, formatTokens, formatUsd, usageLine, useAgentUsage } from "./AgentUsage.js";
+import { UsageButton, UsageHoverCard, formatTokens, formatUsd, usageLine, useAgentUsage, useUsageHover } from "./AgentUsage.js";
 import { AgentPricingPanel } from "./AgentPricingPanel.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
@@ -69,6 +69,202 @@ function UsageProbe({ callHook, request }: { callHook: CallHook; request?: Agent
 function usageResult(cost: number): { usage: AgentUsageReadResult } {
   return { usage: { tabs: {}, windows: {}, forgeWorkers: {}, total: summary(cost, "api", "model", 100) } };
 }
+
+function HoverProbe({ callHook }: { callHook: CallHook }) {
+  const hover = useUsageHover();
+  return createElement("div", null,
+    createElement("button", { ...hover.handlers("Agent tab", { tabIds: ["tab"] }) }, "Agent tab"),
+    createElement("button", null, "Outside"),
+    hover.target ? createElement(UsageHoverCard, { target: hover.target, callHook }) : null);
+}
+
+async function pointer(element: Element, type: string, pointerType = "mouse") {
+  await act(async () => {
+    const event = new Event(type, { bubbles: true });
+    Object.defineProperty(event, "pointerType", { value: pointerType });
+    element.dispatchEvent(event);
+  });
+}
+
+describe("usage previews", () => {
+  it("keeps touch activation and its synthetic mouse events free of hover cards", async () => {
+    const callHook = vi.fn().mockResolvedValue(usageResult(1));
+    const container = await render(createElement(HoverProbe, { callHook: callHook as CallHook }));
+    const button = container.querySelector("button")!;
+    await pointer(button, "pointerover", "touch");
+    await pointer(button, "pointerdown", "touch");
+    await act(async () => {
+      button.focus();
+      button.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      button.click();
+    });
+    expect(container.querySelector('[role="tooltip"]')).toBeNull();
+    expect(callHook).not.toHaveBeenCalled();
+  });
+
+  it("shows a mouse preview and cancels its polling when the pointer leaves", async () => {
+    vi.useFakeTimers();
+    const callHook = vi.fn().mockResolvedValue(usageResult(1));
+    const container = await render(createElement(HoverProbe, { callHook: callHook as CallHook }));
+    const button = container.querySelector("button")!;
+    await pointer(button, "pointerover");
+    const tooltip = container.querySelector('[role="tooltip"]')!;
+    expect(tooltip.textContent).toContain("$1.00 API");
+    expect(button.getAttribute("aria-describedby")).toBe(tooltip.id);
+    const signal = callHook.mock.calls[0]![3] as AbortSignal;
+    await pointer(button, "pointerout");
+    expect(container.querySelector('[role="tooltip"]')).toBeNull();
+    expect(signal.aborted).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(callHook).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows keyboard focus after touch and dismisses Escape without consuming it", async () => {
+    const callHook = vi.fn().mockResolvedValue(usageResult(1));
+    const container = await render(createElement(HoverProbe, { callHook: callHook as CallHook }));
+    const [button, outside] = container.querySelectorAll("button");
+    await pointer(outside!, "pointerdown", "touch");
+    await act(async () => {
+      outside!.focus();
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+      button!.focus();
+    });
+    expect(container.querySelector('[role="tooltip"]')).not.toBeNull();
+    const escape = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    await act(async () => button!.dispatchEvent(escape));
+    expect(container.querySelector('[role="tooltip"]')).toBeNull();
+    expect(escape.defaultPrevented).toBe(false);
+    expect(document.activeElement).toBe(button);
+    await act(async () => outside!.focus());
+    await act(async () => button!.focus());
+    expect(container.querySelector('[role="tooltip"]')).not.toBeNull();
+    await act(async () => outside!.focus());
+    expect(container.querySelector('[role="tooltip"]')).toBeNull();
+  });
+
+  it.each(["scroll", "resize", "pointerdown"])("dismisses a preview on %s outside the trigger", async event => {
+    const callHook = vi.fn().mockResolvedValue(usageResult(1));
+    const container = await render(createElement(HoverProbe, { callHook: callHook as CallHook }));
+    await pointer(container.querySelector("button")!, "pointerover");
+    expect(container.querySelector('[role="tooltip"]')).not.toBeNull();
+    await act(async () => {
+      if (event === "resize") window.dispatchEvent(new Event(event));
+      else container.lastElementChild!.dispatchEvent(new Event(event, { bubbles: true }));
+    });
+    expect(container.querySelector('[role="tooltip"]')).toBeNull();
+  });
+});
+
+describe("UsageButton", () => {
+  it("loads a labelled usage dialog on tap and restores focus after explicit close", async () => {
+    vi.useFakeTimers();
+    const callHook = vi.fn().mockResolvedValue(usageResult(2));
+    const container = await render(createElement(UsageButton, { title: "Codex", request: { tabIds: ["tab"] }, callHook: callHook as CallHook }));
+    const trigger = container.querySelector("button")!;
+    expect(trigger.getAttribute("aria-label")).toBe("Usage for Codex");
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect(callHook).not.toHaveBeenCalled();
+    await pointer(trigger, "pointerdown", "touch");
+    await act(async () => trigger.click());
+    const dialog = document.querySelector('[role="dialog"]')!;
+    const close = dialog.querySelector<HTMLButtonElement>('[aria-label="Close usage"]')!;
+    expect(dialog.getAttribute("aria-label")).toBe("Usage for Codex");
+    expect(dialog.getAttribute("aria-modal")).toBeNull();
+    expect(dialog.textContent).toContain("$2.00 API");
+    expect(trigger.getAttribute("aria-controls")).toBe(dialog.id);
+    expect(document.activeElement).toBe(close);
+    expect(callHook).toHaveBeenCalledWith("agent-usage.read", { tabIds: ["tab"] }, undefined, expect.any(AbortSignal));
+    await pointer(close, "pointerdown", "touch");
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    await act(async () => close.click());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    expect((callHook.mock.calls[0]![3] as AbortSignal).aborted).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(callHook).toHaveBeenCalledTimes(1);
+  });
+
+  it("dismisses Escape without consuming terminal input and returns focus", async () => {
+    const callHook = vi.fn().mockResolvedValue(usageResult(2));
+    const container = await render(createElement(UsageButton, { title: "Codex", request: { tabIds: ["tab"] }, callHook: callHook as CallHook }));
+    const trigger = container.querySelector("button")!;
+    await act(async () => trigger.click());
+    const escape = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+    await act(async () => document.activeElement!.dispatchEvent(escape));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    expect(escape.defaultPrevented).toBe(false);
+  });
+
+  it("dismisses outside touch without stealing focus from the touched control", async () => {
+    const callHook = vi.fn().mockResolvedValue(usageResult(2));
+    const container = await render(createElement(UsageButton, { title: "Codex", request: { tabIds: ["tab"] }, callHook: callHook as CallHook }));
+    const outside = document.createElement("button");
+    document.body.append(outside);
+    await act(async () => container.querySelector("button")!.click());
+    await pointer(outside, "pointerdown", "touch");
+    await act(async () => outside.focus());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.activeElement).toBe(outside);
+  });
+
+  it.each(["resize", "scroll"])("fits the visible phone viewport and dismisses on viewport %s", async event => {
+    const viewport = Object.assign(new EventTarget(), { width: 280, height: 260, offsetLeft: 20, offsetTop: 70 });
+    vi.stubGlobal("visualViewport", viewport);
+    const remove = vi.spyOn(viewport, "removeEventListener");
+    const callHook = vi.fn().mockResolvedValue(usageResult(2));
+    const container = await render(createElement(UsageButton, { title: "Codex", request: { tabIds: ["tab"] }, callHook: callHook as CallHook }));
+    const trigger = container.querySelector("button")!;
+    vi.spyOn(trigger, "getBoundingClientRect").mockReturnValue({ left: 260, right: 292, bottom: 300 } as DOMRect);
+    await act(async () => trigger.click());
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
+    expect(dialog.style.left).toBe("28px");
+    expect(dialog.style.top).toBe("210px");
+    expect(dialog.style.maxWidth).toBe("264px");
+    expect(dialog.style.maxHeight).toBe("112px");
+    await act(async () => viewport.dispatchEvent(new Event(event)));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(remove).toHaveBeenCalledWith("resize", expect.any(Function));
+    expect(remove).toHaveBeenCalledWith("scroll", expect.any(Function));
+  });
+
+  it("allows details to scroll and closes when the page scrolls or resizes", async () => {
+    const callHook = vi.fn().mockResolvedValue(usageResult(2));
+    const container = await render(createElement(UsageButton, { title: "Codex", request: { tabIds: ["tab"] }, callHook: callHook as CallHook }));
+    const trigger = container.querySelector("button")!;
+    await act(async () => trigger.click());
+    await act(async () => document.querySelector(".usage-popover .usage-card-body")!.dispatchEvent(new Event("scroll")));
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    await act(async () => window.dispatchEvent(new Event("scroll")));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    await act(async () => trigger.click());
+    await act(async () => window.dispatchEvent(new Event("resize")));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("closes when the usage owner changes and aborts pending reads on unmount", async () => {
+    vi.useFakeTimers();
+    const pending = deferredUsage();
+    const callHook = vi.fn().mockReturnValue(pending.promise);
+    const container = await render(createElement(UsageButton, { title: "First", request: { tabIds: ["first"] }, callHook: callHook as CallHook }));
+    await act(async () => container.querySelector("button")!.click());
+    const firstSignal = callHook.mock.calls[0]![3] as AbortSignal;
+    await act(async () => root!.render(createElement(UsageButton, { title: "Second", request: { tabIds: ["second"] }, callHook: callHook as CallHook })));
+    expect(firstSignal.aborted).toBe(true);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    await act(async () => container.querySelector("button")!.click());
+    const signal = callHook.mock.calls.at(-1)![3] as AbortSignal;
+    const reads = callHook.mock.calls.length;
+    await act(async () => root!.unmount());
+    root = undefined;
+    expect(signal.aborted).toBe(true);
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    await act(async () => pending.resolve(usageResult(1)));
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(callHook).toHaveBeenCalledTimes(reads);
+  });
+});
 
 function deferredUsage() {
   let resolve!: (result: ReturnType<typeof usageResult>) => void;
