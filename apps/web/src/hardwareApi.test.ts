@@ -3,7 +3,9 @@ import {
   callHardwareAction,
   getHardwareReceipt,
   getHardwareState,
+  getHardwareDiagnostics,
   hardwareRequestId,
+  reconcileHardwareStorage,
   stageHardwareSshPassword,
 } from "./hardwareApi.js";
 
@@ -142,6 +144,128 @@ const checkedConnection = {
   checkedAt: "2026-11-15T22:00:00.000Z",
   expiresAt: "2026-11-15T22:02:00.000Z",
 };
+
+describe("Hardware storage recovery transport", () => {
+  const readiness = {
+    state: "unavailable",
+    reason: "Hardware storage cannot confirm durable state.",
+    recovery: {
+      phase: "write",
+      errno: "ENOSPC",
+      durability: "unchanged",
+      authorityReplaced: false,
+      nextAction: "Free host storage, then reconcile.",
+    },
+  };
+  const diagnostics = {
+    readiness,
+    lastConfirmedState: true,
+    state: {
+      schemaVersion: 1,
+      revision: 8,
+      nextGeneration: 10,
+      items: [],
+      tags: [],
+      groups: [],
+      statusDefinitions: [],
+      reservations: [],
+      checkHolds: [],
+      receipts: [],
+      history: [],
+      observations: {},
+      endpointKeys: {},
+    },
+  };
+
+  it("reads failure metadata and full operator evidence without requiring a mutation receipt", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(response({ ...snapshot, readiness }))
+      .mockResolvedValueOnce(response({ result: diagnostics }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(getHardwareState()).resolves.toMatchObject({ readiness });
+    await expect(getHardwareDiagnostics()).resolves.toEqual(diagnostics);
+    expect(JSON.parse(fetch.mock.calls[1]![1].body)).toEqual({
+      action: "hardware.diagnostics",
+      input: {},
+    });
+  });
+
+  it("requires an explicit reconciliation and validates its returned state", async () => {
+    const fetch = vi.fn().mockResolvedValue(response({ result: snapshot }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(reconcileHardwareStorage("recovery-request")).resolves.toEqual(
+      snapshot,
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(fetch.mock.calls[0]![1].body)).toEqual({
+      action: "hardware.reconcile",
+      input: { requestId: "recovery-request" },
+    });
+  });
+
+  it("does not repeat reconciliation when the response is lost or invalid", async () => {
+    const fetch = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Response lost"))
+      .mockResolvedValueOnce(response({ result: { receipt: {} } }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(reconcileHardwareStorage("lost")).rejects.toMatchObject({
+      code: "OUTCOME_UNKNOWN",
+      requestId: "lost",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await expect(reconcileHardwareStorage("invalid")).rejects.toMatchObject({
+      code: "OUTCOME_UNKNOWN",
+      requestId: "invalid",
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { ...readiness.recovery, phase: 4 },
+    { ...readiness.recovery, errno: {} },
+    { ...readiness.recovery, durability: "safe" },
+    { ...readiness.recovery, authorityReplaced: "false" },
+    { ...readiness.recovery, nextAction: null },
+  ])("rejects malformed recovery metadata %#", async (recovery) => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          response({ ...snapshot, readiness: { ...readiness, recovery } }),
+        ),
+    );
+    await expect(getHardwareState()).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+  });
+
+  it("rejects incomplete evidence and preserves server authorization failures", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          response({ result: { ...diagnostics, state: { revision: 8 } } }),
+        )
+        .mockResolvedValueOnce(
+          response(
+            { error: { code: "FORBIDDEN", message: "Operator required." } },
+            403,
+          ),
+        ),
+    );
+    await expect(getHardwareDiagnostics()).rejects.toMatchObject({
+      code: "INVALID_RESPONSE",
+    });
+    await expect(reconcileHardwareStorage("operator")).rejects.toMatchObject({
+      code: "FORBIDDEN",
+      message: "Operator required.",
+    });
+  });
+});
 
 describe("Hardware browser transport", () => {
   it("keeps a measured SSH login failure distinct from reservation availability", async () => {

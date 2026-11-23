@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { HardwareItem, HardwareReservationRecord } from "@cloudx/shared";
-import { HardwareCapacity, HARDWARE_CLEANUP_COMPLETION, HARDWARE_CLEANUP_RESERVE, HARDWARE_ORDINARY_BYTES, HARDWARE_STATE_BYTES } from "./HardwareCapacity.js";
+import { HardwareCapacity, HARDWARE_CLEANUP_COMPLETION, HARDWARE_CLEANUP_RESERVE, HARDWARE_ORDINARY_BYTES, HARDWARE_REQUEST_QUOTA, HARDWARE_STATE_BYTES } from "./HardwareCapacity.js";
 import { emptyHardwareState, validateHardwareState, type HardwareStoredState, type StoredHardwareReceipt } from "./HardwareStore.js";
 
 const at = "2026-11-03T00:00:00.000Z", owner = { kind: "user" as const, userId: "local" };
@@ -33,8 +33,54 @@ function acknowledgedOverride(state: HardwareStoredState, id: string) {
   saved.finalCleanupTarget = { kind: "reservation", ...saved.receipt.reservation };
   state.receipts.push(saved); return saved;
 }
+function reconciliationReceipt(id: string): StoredHardwareReceipt {
+  const saved = record(id, "hardware.reconcile");
+  saved.receipt.state = "succeeded"; saved.receipt.finishedAt = at; saved.receipt.result = { reconciled: true };
+  return saved;
+}
 
 describe("Hardware completion and cleanup byte allowances", () => {
+  it("admits durable reconciliation above ordinary request and byte limits while ordinary work stays blocked", () => {
+    const before = heldState();
+    before.receipts = Array.from({ length: HARDWARE_REQUEST_QUOTA }, (_, index) => {
+      const saved = record(`retained-${index}`); saved.receipt.state = "succeeded"; saved.receipt.finishedAt = at;
+      return saved;
+    });
+    fillToBytes(before, HARDWARE_ORDINARY_BYTES + 1024);
+    const reconciled = { ...before, receipts: [...before.receipts, reconciliationReceipt("reconcile-at-capacity")] };
+    expect(() => validateHardwareState(reconciled)).not.toThrow();
+    expect(() => policy.assertNewRequest(before, "hardware.reconcile")).not.toThrow();
+    expect(() => policy.assertMutation(before, reconciled)).not.toThrow();
+    expect(() => policy.assertNewRequest(reconciled, "hardware.access.invoke")).toThrow(expect.objectContaining({ code: "CAPACITY_EXCEEDED" }));
+    expect(() => policy.assertMutation(reconciled, { ...reconciled, receipts: [...reconciled.receipts, record("ordinary-at-capacity")] })).toThrow(expect.objectContaining({ code: "CAPACITY_EXCEEDED" }));
+    expect(policy.canSchedule(reconciled)).toBe(false);
+  });
+
+  it("charges reconciliation as bookkeeping and preserves final cleanup space at the durable state limit", () => {
+    const before = heldState(), saved = reconciliationReceipt("near-state-limit");
+    const pending = { ...before, receipts: [saved] };
+    const bookkeepingReserve = policy.accountedBytes(pending, "bookkeeping") - Buffer.byteLength(JSON.stringify(pending)) - 1;
+    const receiptBytes = Buffer.byteLength(JSON.stringify(saved)) + 1;
+    fillToBytes(before, HARDWARE_STATE_BYTES - bookkeepingReserve - receiptBytes - 16 * 1024);
+    const reconciled = { ...before, receipts: [...before.receipts, saved] };
+    expect(policy.accountedBytes(reconciled, "bookkeeping")).toBe(HARDWARE_STATE_BYTES - 16 * 1024);
+    expect(policy.accountedBytes(reconciled, "cleanup")).toBeGreaterThan(HARDWARE_STATE_BYTES);
+    expect(() => policy.assertMutation(before, reconciled)).not.toThrow();
+    const closing = { ...reconciled, receipts: [...reconciled.receipts, record("another-close", "hardware.access.close")] };
+    expect(() => policy.assertMutation(reconciled, closing)).toThrow(expect.objectContaining({ code: "CAPACITY_EXCEEDED" }));
+    const final = { ...reconciled, reservations: structuredClone(reconciled.reservations), receipts: [...reconciled.receipts] };
+    acknowledgedOverride(final, "final-after-reconciliation");
+    expect(() => policy.assertMutation(reconciled, final)).not.toThrow();
+    expect(() => validateHardwareState(final)).not.toThrow();
+    const enlarged = (bytes: number) => ({ ...reconciled, receipts: [...before.receipts, { ...saved, receipt: { ...saved.receipt, result: { reconciled: true, evidence: "x".repeat(bytes) } } }] });
+    const spendsCleanupReserve = enlarged(32 * 1024);
+    expect(Buffer.byteLength(JSON.stringify(spendsCleanupReserve)) + 1).toBeLessThan(HARDWARE_STATE_BYTES);
+    expect(() => policy.assertMutation(before, spendsCleanupReserve)).toThrow(expect.objectContaining({ code: "CAPACITY_EXCEEDED" }));
+    const exceedsStateLimit = enlarged(1024 * 1024);
+    expect(Buffer.byteLength(JSON.stringify(exceedsStateLimit)) + 1).toBeGreaterThan(HARDWARE_STATE_BYTES);
+    expect(() => policy.assertMutation(before, exceedsStateLimit)).toThrow(expect.objectContaining({ code: "CAPACITY_EXCEEDED" }));
+  });
+
   it("leaves completion space for a running result and separately saved status observations", () => {
     const before = heldState(); fillToBytes(before, HARDWARE_ORDINARY_BYTES - 1024 * 1024);
     const next = structuredClone(before); next.receipts.push(record("new-command"));

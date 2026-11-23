@@ -63,7 +63,11 @@ export class HardwareSshPasswords {
       try {
         for (const id of this.secrets.getPluginSecretKeys("hardware"))
           if (referencePattern.test(id) && id.startsWith("ssh-registration-")) await this.secrets.deletePluginSecret("hardware", id);
-      } catch { throw new HardwareError("STORE_UNAVAILABLE", "Interrupted SSH registration passwords could not be discarded."); }
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException | null)?.code;
+        const errno = typeof code === "string" && /^E[A-Z0-9_]{1,63}$/.test(code) ? code : undefined;
+        throw new HardwareError("STORE_UNAVAILABLE", "Interrupted SSH registration passwords could not be discarded.", errno ? { errno } : undefined);
+      }
     });
   }
 

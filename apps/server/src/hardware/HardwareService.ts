@@ -19,6 +19,7 @@ export interface HardwareServiceOptions {
   resolveCredential?: (id: string) => Promise<string>;
   discardCredential?: (id: string) => Promise<void>;
   discardSavedPassword?: (id: string) => Promise<void>;
+  clearRegistrationPasswords?: () => Promise<void>;
   ownerState?: (owner: HardwareOwner) => "active" | "confirmed_ended" | "unknown" | Promise<"active" | "confirmed_ended" | "unknown">;
   retention?: Partial<HardwareRetentionSettings>;
 }
@@ -63,8 +64,10 @@ export class HardwareService {
   private readonly connectionChecks = new Map<string, HardwareConnectionObservation>();
   private readonly connectionRuns = new Map<string, ConnectionCheckRun>();
   private ready = false;
+  private registrationPasswordsCleared = false;
   private stopping = false;
   private unavailableReason?: string;
+  private storageRecovery?: HardwareStateView["readiness"]["recovery"];
   private initialization?: Promise<void>;
   private disposal?: Promise<void>;
   private scheduler?: ReturnType<typeof setInterval>;
@@ -73,7 +76,7 @@ export class HardwareService {
   private readonly replayedRequests = new WeakSet<HardwareStoredState>();
 
   constructor(private readonly options: HardwareServiceOptions) {
-    this.store = new HardwareStore(options.dataDir, error => { this.unavailableReason = error.message; this.beginShutdown(); for (const task of this.tasks.values()) task.controller.abort(error); this.notifyChange(); });
+    this.store = new HardwareStore(options.dataDir, error => this.suspendAdmission(error, "writer_assert"));
     this.scripts = new HardwareScriptRunner(options);
     this.retention = { completedMaxAgeMs: 30 * 86_400_000, completedMaxEntries: 10_000, outputMaxBytes: 16 * 1024 * 1024, snapshotMaxCompletedReceipts: 200, ...options.retention };
     hardwareInput(() => { hardwareInteger(this.retention.completedMaxAgeMs, "Completed retention age", 1, 3650 * 86_400_000); hardwareInteger(this.retention.completedMaxEntries, "Completed retention entries", 1, 100_000); hardwareInteger(this.retention.outputMaxBytes, "Completed output budget", 1, 32 * 1024 * 1024); hardwareInteger(this.retention.snapshotMaxCompletedReceipts, "Snapshot completed receipt limit", 1, 10_000); });
@@ -81,8 +84,8 @@ export class HardwareService {
 
   init(): Promise<void> { return this.initialization ??= this.initialize(); }
   private async initialize(): Promise<void> {
-    this.state = await this.store.init();
     try {
+      this.state = await this.store.init();
       const next = clone(this.state);
       for (const record of next.receipts) if (record.receipt.state === "running") { record.receipt.state = "unknown"; record.receipt.error = { code: "OUTCOME_UNKNOWN", message: "CloudX restarted before the operation outcome was saved. The effect will not be replayed." }; record.receipt.finishedAt = now(); }
       for (const claim of next.reservations) {
@@ -103,16 +106,13 @@ export class HardwareService {
       next.revision++;
       this.pruneDetails(next);
       await this.store.write(next);
+      await this.clearInterruptedPasswords();
       this.state = next; this.ready = true;
       const ended = new Map(next.reservations.filter(claim => claim.lastOwnerObservation === "confirmed_ended").map(claim => [ownerKey(claim.owner), claim.owner]));
       for (const owner of ended.values()) await this.ownerEnded(owner);
-      if (!this.stopping) {
-        this.scheduler = setInterval(() => { void this.checkScheduledStatuses().catch(() => undefined); }, 1000);
-        this.scheduler.unref();
-      }
+      this.startScheduler();
     } catch (error) {
-      this.beginShutdown();
-      for (const task of this.tasks.values()) task.controller.abort(error);
+      this.suspendAdmission(error);
       await Promise.allSettled([...this.tasks.values()].map(task => task.promise));
       this.ready = false;
       await this.store.dispose();
@@ -125,27 +125,35 @@ export class HardwareService {
 
   async snapshot(candidate: HardwareOwner): Promise<HardwareStateView> {
     const owner = hardwareInput(() => parseHardwareOwner(candidate));
-    requireHardware(this.ready, "STORE_UNAVAILABLE", this.unavailableReason ?? "Hardware inventory has not finished loading.");
-    try { this.store.assertHeld(); } catch { this.unavailableReason = "Hardware lost its exclusive writer authority."; this.beginShutdown(); for (const task of this.tasks.values()) task.controller.abort(); }
+    if (this.ready && !this.unavailableReason && !this.stopping) {
+      try { this.store.assertHeld(); } catch (error) { this.suspendAdmission(error, "writer_assert"); }
+    }
     const state = clone(this.state);
     const inventory = await this.inspectInventory(state);
     const visible = state.receipts.filter(record => owner.kind === "user" || sameOwner(record.owner, owner));
     const completed = new Set(visible.filter(record => ["succeeded", "failed"].includes(record.receipt.state)).sort((a, b) => Date.parse(a.receipt.finishedAt!) - Date.parse(b.receipt.finishedAt!)).slice(-this.retention.snapshotMaxCompletedReceipts));
     return { revision: state.revision, items: state.items.map(item => this.summary(state, item, inventory)), tags: state.tags, groups: state.groups, types: this.options.registry.values().map(provider => clone(provider.descriptor)), statusDefinitions: state.statusDefinitions, reservations: state.reservations.map(publicClaim), checkHolds: state.checkHolds,
       receipts: visible.filter(record => completed.has(record) || ["running", "unknown"].includes(record.receipt.state)).map(record => clone(record.receipt)), history: state.history, currentOwner: owner, retention: clone(this.retention),
-      readiness: { state: this.stopping || this.unavailableReason ? "unavailable" : "ready", ...(this.unavailableReason ? { reason: this.unavailableReason } : {}) } };
+      readiness: this.readiness() };
   }
 
   async execute(action: string, candidate: unknown, candidateOwner: HardwareOwner): Promise<unknown> {
     const owner = hardwareInput(() => parseHardwareOwner(candidateOwner));
     const input = hardwareInput(() => hardwareRecord(candidate));
     if (action === "hardware.state" || action === "hardware.readiness") return this.snapshot(owner);
-    this.assertAdmission();
+    if (action === "hardware.diagnostics") {
+      requireHardware(owner.kind === "user", "FORBIDDEN", "Hardware evidence export belongs to the user.");
+      fields(input, []);
+      await this.snapshot(owner);
+      return { readiness: this.readiness(), state: clone(this.state), lastConfirmedState: this.ready };
+    }
+    if (action === "hardware.reconcile") return this.reconcile(input, owner);
     if (action === "hardware.receipt.get") {
       const requestId = hardwareInput(() => hardwareId(input.requestId, "Request ID"));
       const record = this.state.receipts.find(record => sameOwner(record.owner, owner) && record.receipt.requestId === requestId);
       return { receipt: record ? clone(record.receipt) : null };
     }
+    this.assertAdmission();
     if (action.endsWith(".list")) return this.list(action, input, owner);
     if (action === "hardware.items.get") {
       const hardwareIdValue = hardwareInput(() => hardwareId(input.hardwareId));
@@ -163,6 +171,115 @@ export class HardwareService {
     if (["hardware.access.open", "hardware.access.invoke", "hardware.access.close"].includes(action)) return this.accessAction(action, input, owner);
     if (/^hardware\.(items|tags|groups|statuses)\.(create|update|delete|set)$/.test(action)) return this.manage(action, input, owner);
     throw new HardwareError("INVALID_INPUT", `Unknown hardware action: ${action}`);
+  }
+
+  private readiness(): HardwareStateView["readiness"] {
+    if (this.ready && !this.stopping && !this.unavailableReason) return { state: "ready" };
+    return { state: "unavailable", reason: this.unavailableReason ?? (this.stopping ? "Hardware is shutting down." : "Hardware inventory has not finished loading."), ...(this.storageRecovery ? { recovery: clone(this.storageRecovery) } : {}) };
+  }
+
+  private suspendAdmission(error: unknown, phase = "state_write"): void {
+    const details = error instanceof HardwareError ? error.details : undefined;
+    const code = details?.errno ?? (isRecord(error) ? error.code : undefined);
+    const errno = typeof code === "string" && /^E[A-Z0-9_]{1,63}$/.test(code) ? code : undefined;
+    const failedPhase = typeof details?.phase === "string" ? details.phase : phase;
+    const authorityReplaced = details?.authorityReplaced === true;
+    const durability = details?.durability === "confirmed" || details?.durability === "unchanged" ? details.durability : "unconfirmed";
+    const nextAction = failedPhase === "local_cleanup"
+      ? "Wait for local hardware work to stop, inspect its activity, then select Reconcile storage again. Keep uncertain remote activity held."
+      : failedPhase === "registration_password_cleanup"
+      ? "Repair storage and permissions for secrets/config-secrets.json, then select Reconcile storage. Interrupted registration passwords must be discarded under the writer lease before Hardware effects resume."
+      : failedPhase.startsWith("writer_")
+      ? "Stop the competing CloudX writer or repair the Linux flock helper, then select Reconcile storage. Do not delete the writer lock."
+      : ["state_read", "state_validate"].includes(failedPhase)
+        ? "Preserve hardware/state.json and the writer lock. Repair file access or have the operator repair the current state while CloudX is stopped. Do not reset state or restore an older generation. Then select Reconcile storage."
+        : "Repair the host storage: free disk space and check write permissions and filesystem health. Then select Reconcile storage. Hardware effects stay blocked until a durable save succeeds.";
+    this.unavailableReason = error instanceof HardwareError ? error.message : "Hardware could not confirm its durable state. Admission is closed.";
+    this.storageRecovery = { phase: failedPhase, ...(errno ? { errno } : {}), durability, authorityReplaced, nextAction };
+    if (this.scheduler) clearInterval(this.scheduler);
+    for (const task of this.tasks.values()) task.controller.abort(error);
+    this.notifyChange();
+  }
+
+  private startScheduler(): void {
+    if (this.stopping || this.unavailableReason) return;
+    if (this.scheduler) clearInterval(this.scheduler);
+    this.scheduler = setInterval(() => { void this.checkScheduledStatuses().catch(() => undefined); }, 1000);
+    this.scheduler.unref();
+  }
+
+  private async clearInterruptedPasswords(): Promise<void> {
+    if (this.registrationPasswordsCleared) return;
+    this.store.assertHeld();
+    try { await this.options.clearRegistrationPasswords?.(); }
+    catch (error) {
+      const code = error instanceof HardwareError ? error.details?.errno : isRecord(error) ? error.code : undefined;
+      const errno = typeof code === "string" && /^E[A-Z0-9_]{1,63}$/.test(code) ? code : undefined;
+      throw new HardwareError("STORE_UNAVAILABLE", "Interrupted SSH registration passwords could not be discarded. Hardware admission remains closed.", { phase: "registration_password_cleanup", ...(errno ? { errno } : {}), durability: "unconfirmed", authorityReplaced: false });
+    }
+    this.store.assertHeld();
+    this.registrationPasswordsCleared = true;
+  }
+
+  private async reconcile(input: Record<string, unknown>, owner: HardwareOwner): Promise<HardwareStateView> {
+    requireHardware(owner.kind === "user", "FORBIDDEN", "Hardware storage reconciliation belongs to the user.");
+    fields(input, ["requestId"]);
+    hardwareInput(() => hardwareId(input.requestId, "Request ID"));
+    requireHardware(!this.stopping, "STORE_UNAVAILABLE", "Hardware is shutting down. Wait for host startup before reconciliation.");
+    // Close admission before joining the mutation queue. No callback may overwrite
+    // a snapshot whose rename succeeded but whose directory sync failed.
+    const wasAvailable = this.ready && !this.unavailableReason;
+    this.unavailableReason ??= "The operator requested Hardware storage reconciliation.";
+    if (this.scheduler) clearInterval(this.scheduler);
+    for (const task of this.tasks.values()) task.controller.abort(new Error("Hardware storage reconciliation requested."));
+    const mutation = this.tail.then(async () => {
+      requireHardware(!this.stopping, "STORE_UNAVAILABLE", "Hardware is shutting down.");
+      requireHardware(this.tasks.size === 0, "STORE_UNAVAILABLE", "Local hardware work is still stopping. Keep the resource held, inspect activity, and select Reconcile storage after local cleanup settles.", { phase: "local_cleanup", durability: "unconfirmed", authorityReplaced: false });
+      const next = await this.store.reconcile();
+      requireHardware(next.revision >= this.state.revision && next.nextGeneration >= this.state.nextGeneration, "STORE_UNAVAILABLE", "Saved Hardware state is older than the last confirmed state. Preserve both copies for operator repair.", { phase: "state_validate", durability: "unconfirmed", authorityReplaced: false });
+      const saved = clone(next);
+      const admitted = this.admit(next, "hardware.reconcile", input, owner);
+      if (admitted.existing && wasAvailable && !this.storageRecovery && next.revision === this.state.revision) {
+        this.unavailableReason = undefined; this.startScheduler();
+        return;
+      }
+      await this.clearInterruptedPasswords();
+      for (const [reservationId, access] of this.access) {
+        const previous = this.state.reservations.find(claim => claim.reservationId === reservationId);
+        requireHardware(previous && next.reservations.some(claim => claim.reservationId === reservationId && claim.generation >= access.generation && sameOwner(claim.owner, previous.owner) && canonical(claim.acquiredItem) === canonical(previous.acquiredItem)), "STORE_UNAVAILABLE", "A local managed connection does not match the saved reservation. Keep the hardware isolated and stop this CloudX instance for managed cleanup before operator repair.", { phase: "state_validate", durability: "unconfirmed", authorityReplaced: false });
+      }
+      for (const record of next.receipts) if (record !== admitted.record && record.receipt.state === "running") {
+        record.receipt.state = "unknown"; record.receipt.finishedAt = now();
+        record.receipt.error = { code: "OUTCOME_UNKNOWN", message: "Storage reconciliation could not confirm the saved operation outcome. The effect will not be replayed." };
+      }
+      for (const claim of next.reservations) {
+        const observation = claim.lastOwnerObservation === "confirmed_ended" ? "confirmed_ended" : await this.observeOwner(claim.owner);
+        claim.lastOwnerObservation = observation; claim.lastOwnerObservedAt = now();
+        const access = this.access.get(claim.reservationId);
+        const knownAccess = access ? access.generation === claim.generation && claim.accessState === "open" && Boolean(access.connection) : claim.accessState === "closed" || claim.accessState === undefined;
+        const linkedRuns = [claim.preparationRunId, claim.releaseRunId, ...claim.activeOperationIds].filter((id): id is string => Boolean(id));
+        const uncertain = claim.state !== "active" && !(claim.state === "recovery_required" && claim.recoveryCause === "owner") || !knownAccess || claim.activeOperationIds.length > 0 || linkedRuns.some(id => !next.receipts.some(record => record.receipt.runId === id)) || next.receipts.some(record => record.receipt.reservation && sameRef(record.receipt.reservation, claim) && record.receipt.state === "unknown");
+        if (uncertain || observation !== "active") this.recover(claim, "Storage reconciliation could not prove the exact owner and all prior effects are settled.", uncertain ? "effects" : "owner");
+        if (!knownAccess) claim.accessState = "unknown";
+        claim.activeOperationIds = [];
+      }
+      for (const hold of next.checkHolds) { hold.state = "recovery_required"; hold.revision++; hold.recoveryReason = "Storage reconciliation could not confirm that the previous checking activity ended."; }
+      if (admitted.record.receipt.state !== "succeeded") {
+        admitted.record.receipt.state = "succeeded"; admitted.record.receipt.finishedAt = now(); admitted.record.receipt.result = { reconciled: true }; delete admitted.record.receipt.error;
+      }
+      this.addHistory(next, "storage_reconciled", "The operator reconciled Hardware storage under exclusive writer authority. Uncertain activity remains held.", owner);
+      next.revision++;
+      this.pruneDetails(next);
+      this.capacity.assertMutation(saved, next);
+      await this.store.write(next);
+      this.store.assertHeld();
+      this.state = next; this.ready = true;
+      this.unavailableReason = undefined; this.storageRecovery = undefined;
+      this.startScheduler(); this.notifyChange();
+    }).catch(error => { this.suspendAdmission(error); throw error; });
+    this.tail = mutation.catch(() => undefined);
+    await mutation;
+    return this.snapshot(owner);
   }
 
   private async manage(action: string, input: Record<string, unknown>, owner: HardwareOwner): Promise<HardwareMutationResult> {
@@ -967,12 +1084,13 @@ export class HardwareService {
       await Promise.allSettled([...this.tasks.values()].map(task => task.promise));
       for (const [reservationId, access] of this.access) {
         const outcome = await this.closeAccess({ reservationId, generation: access.generation }, new AbortController().signal);
+        if (this.unavailableReason) continue;
         await this.change(next => {
           const claim = next.reservations.find(claim => claim.reservationId === reservationId && claim.generation === access.generation);
           if (!claim) return;
           claim.accessState = outcome.state === "completed" ? "closed" : "unknown"; claim.revision++;
           if (outcome.state !== "completed") this.recover(claim, "Shutdown could not confirm managed access cleanup.", "cleanup");
-        }, true);
+        }, true).catch(error => { if (!this.unavailableReason) throw error; });
       }
       await this.tail;
     } finally {
@@ -982,9 +1100,9 @@ export class HardwareService {
     }
   }
 
-  private assertAdmission(): void {
-    requireHardware(this.ready && !this.stopping && !this.unavailableReason, "STORE_UNAVAILABLE", this.unavailableReason ?? (this.stopping ? "Hardware is shutting down." : "Hardware has not finished loading."));
-    try { this.store.assertHeld(); } catch (error) { this.unavailableReason = "Hardware lost its exclusive writer authority."; this.beginShutdown(); for (const task of this.tasks.values()) task.controller.abort(error); throw error; }
+  private assertAdmission(internal = false): void {
+    requireHardware(this.ready && (internal || !this.stopping) && !this.unavailableReason, "STORE_UNAVAILABLE", this.unavailableReason ?? (this.stopping ? "Hardware is shutting down." : "Hardware has not finished loading."), this.storageRecovery ? { ...this.storageRecovery } : undefined);
+    try { this.store.assertHeld(); } catch (error) { this.suspendAdmission(error, "writer_assert"); throw error; }
   }
   private async assertOwnerActive(owner: HardwareOwner): Promise<void> {
     const observation = await this.observeOwner(owner);
@@ -999,7 +1117,7 @@ export class HardwareService {
   private async change<T>(update: (next: HardwareStoredState) => T | Promise<T>, internal = false): Promise<T> {
     const mutation = this.tail.then(async () => {
       if (!internal) this.assertAdmission();
-      else { requireHardware(this.ready, "STORE_UNAVAILABLE", "Hardware store is closed."); this.store.assertHeld(); }
+      else { requireHardware(this.ready && !this.unavailableReason, "STORE_UNAVAILABLE", this.unavailableReason ?? "Hardware store is closed."); this.store.assertHeld(); }
       const next = clone(this.state);
       const result = await update(next);
       if (this.replayedRequests.has(next)) return clone(result);
@@ -1008,8 +1126,7 @@ export class HardwareService {
       this.capacity.assertMutation(this.state, next);
       try { await this.store.write(next); }
       catch (error) {
-        this.unavailableReason = "Hardware could not confirm its durable state. Admission is closed until restart and reconciliation.";
-        this.beginShutdown(); for (const task of this.tasks.values()) task.controller.abort(error);
+        this.suspendAdmission(error);
         throw error;
       }
       this.state = next;
@@ -1268,7 +1385,7 @@ export class HardwareService {
     const previous = this.lanes.get(group) ?? Promise.resolve();
     let started = false;
     const promise = previous.catch(() => undefined).then(async () => {
-      controller.signal.throwIfAborted(); this.store.assertHeld();
+      controller.signal.throwIfAborted(); this.assertAdmission(true);
       started = true;
       await run(controller.signal);
     }).catch(async error => {

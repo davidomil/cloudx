@@ -34,6 +34,7 @@ import type {
 
 import type { AppConfig } from "./config.js";
 import { ConfigService } from "./configService.js";
+import { HardwareError } from "./hardware/HardwareError.js";
 import { AsrClient } from "./asrClient.js";
 import { DEFAULT_DOCUMENTATION_URL, DocumentationClient, DocumentationStartupError } from "./documentation/DocumentationClient.js";
 import { DocumentationIngestQueue } from "./documentation/DocumentationIngestQueue.js";
@@ -357,9 +358,18 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     await services.sessions.restore?.(services.pluginContributionsReady);
     if (services.hardware) {
       await services.forge?.dashboard();
-      await services.hardware.init();
-      await services.hardwarePasswords?.clearRegistrationPasswords();
-      await services.hardwareMonitor?.start();
+      let hardwareUnavailable = false;
+      try { await services.hardware.init(); }
+      catch (error) {
+        if (!(error instanceof HardwareError)) throw error;
+        hardwareUnavailable = true;
+        app.log.error({ code: error.code, details: error.details }, "Hardware admission is closed. Use Hardware storage recovery after host repair.");
+      }
+      try { await services.hardwareMonitor?.start(); }
+      catch (error) {
+        // The monitor reports its failure. Keep recovery reachable while admission is closed.
+        if (!hardwareUnavailable) throw error;
+      }
     }
     if (services.cooperation && services.cooperationContexts) {
       // Forge restores its embedded sessions while loading the dashboard. Its
@@ -1630,6 +1640,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   hardware = new HardwareService({ dataDir: config.dataDir, pathPolicy, registry: new HardwareTypeRegistry(plugins.values()), resolveCredential: hardwareCredentialResolver(process.env, hardwarePasswords),
     discardCredential: id => hardwarePasswords.discardRegistration(id),
     discardSavedPassword: id => hardwarePasswords.discardSavedPassword(id),
+    clearRegistrationPasswords: () => hardwarePasswords.clearRegistrationPasswords(),
     ownerState: async owner => {
       if (owner.kind === "user") return "active";
       if (owner.ownerPluginId === "forge" && await forgeRuntime?.hardwareOwnerState(owner) === "confirmed_ended") return "confirmed_ended";
