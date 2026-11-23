@@ -1369,5 +1369,6 @@ export * from "./forgeGitHistory.js";
 export * from "./forgeDiagnosticSnapshots.js";
 
 export * from "./terminalCapabilities.js";
+export * from "./terminalMemory.js";
 export * from "./hardware.js";
 export * from "./codexStorage.js";

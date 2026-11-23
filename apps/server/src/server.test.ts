@@ -54,8 +54,31 @@ import type { TerminalSpawnOptions } from "./terminal/TerminalProcess.js";
 import { VoiceController } from "./voice/VoiceController.js";
 import type { VoicePlanner } from "./voice/VoicePlanner.js";
 import { WorkspaceLayoutStore } from "./workspace/WorkspaceLayoutStore.js";
+import { TerminalMemoryService } from "./system/TerminalMemoryService.js";
 
 describe("buildServer", () => {
+  it("composes terminal memory routes with the host service and protects changes by browser origin", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-terminal-memory-routes-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const memory = services.terminalMemory = new TerminalMemoryService({ platform: "darwin" });
+    const status = await memory.status();
+    const apply = vi.spyOn(memory, "apply").mockResolvedValue(status);
+    const app = await buildServer(config, services);
+    try {
+      const read = await app.inject({ method: "GET", url: "/api/terminal-memory" });
+      expect(read.statusCode).toBe(200);
+      expect(read.headers["cache-control"]).toBe("no-store");
+      expect(read.json()).toEqual(status);
+      expect((await app.inject({ method: "PUT", url: "/api/terminal-memory", payload: { memoryHigh: "1GiB", memoryMax: "2GiB" } })).statusCode).toBe(403);
+      expect(apply).not.toHaveBeenCalled();
+      const body = { memoryHigh: "1GiB", memoryMax: "2GiB" };
+      const applied = await app.inject({ method: "PUT", url: "/api/terminal-memory", headers: { origin: config.trustedOrigins[0]! }, payload: body });
+      expect(applied.statusCode).toBe(200);
+      expect(applied.json()).toEqual(status);
+      expect(apply).toHaveBeenCalledWith(body);
+    } finally { await app.close(); await fs.rm(root, { recursive: true, force: true }); }
+  });
   it("serves source citations from agent tabs as bounded inert text through the production route", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-agent-citation-route-"));
     const config = testConfig(root);

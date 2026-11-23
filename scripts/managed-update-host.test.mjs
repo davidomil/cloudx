@@ -8,11 +8,12 @@ import { ManagedUpdate, UpdateHost } from './managed-update.mjs';
 import { writeUpdateJson, snapshotTree, verifySnapshot, filesystemCapacity } from './managed-update-store.mjs';
 
 const temporary = [];
-afterEach(() => { for (const root of temporary.splice(0)) fs.rmSync(root, { recursive: true, force: true }); vi.restoreAllMocks(); });
+afterEach(() => { for (const root of temporary.splice(0)) fs.rmSync(root, { recursive: true, force: true }); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 function git(root, ...args) { return execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'apply.whitespace=fix', ...args], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim(); }
 function write(root, file, value) { fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true }); fs.writeFileSync(path.join(root, file), value); }
-function fixture() {
+function fixture({ terminalMemory = false } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'cloudx-managed-host-')); temporary.push(home);
+  vi.stubEnv('XDG_RUNTIME_DIR', path.join(home, 'runtime'));
   const root = path.join(home, 'checkout'), origin = path.join(home, 'origin');
   fs.mkdirSync(origin); git(origin, 'init', '-b', 'main'); git(origin, 'config', 'user.email', 'test@local'); git(origin, 'config', 'user.name', 'Test');
   const source = { 'package.json': '{"name":"fixture","type":"module"}', 'package-lock.json': '{"lockfileVersion":3}', 'version.txt': 'old', 'local.txt': 'original',
@@ -27,11 +28,20 @@ function fixture() {
   write(dataDir, 'workspace.json', '{"windows":[]}');
   const envPath = path.join(home, '.config/cloudx/cloudx.env'); write(home, '.config/cloudx/cloudx.env', `CLOUDX_DATA_DIR=${dataDir}\nSECRET=keep-private\n`);
   for (const name of ['cloudx-asr.service', 'cloudx-documentation.service', 'cloudx.service', 'cloudx-terminal.service']) write(home, `.config/systemd/user/${name}`, 'original unit');
+  const memoryFiles = terminalMemory ? [['MemoryHigh', '59055800320'], ['MemoryMax', '68719476736']].map(([property, value]) => {
+    const file = path.join(home, '.config/systemd/user.control/cloudx-terminal.service.d', `50-${property}.conf`);
+    const contents = `[Service]\n${property}=${value}\n`;
+    write(path.dirname(file), path.basename(file), contents);
+    return { file, contents };
+  }) : [];
+  if (terminalMemory) {
+    vi.stubEnv('XDG_CONFIG_HOME', path.join(home, '.config'));
+  }
   const id = randomUUID(), runDir = path.join(home, '.local/state/cloudx/settings-update', id); fs.mkdirSync(runDir, { recursive: true });
   const recordPath = `${runDir}.json`;
   const calls = [];
   const properties = service => ({ LoadState: 'loaded', ActiveState: 'inactive', MainPID: '0', InvocationID: '', ControlGroup: '', KillMode: 'control-group', SendSIGKILL: 'yes', WorkingDirectory: root,
-    Id: service, NeedDaemonReload: 'no', DropInPaths: '', EnvironmentFiles: `${envPath} (ignore_errors=no)`, FragmentPath: path.join(home, '.config/systemd/user', service) });
+    Id: service, NeedDaemonReload: 'no', DropInPaths: service === 'cloudx-terminal.service' ? memoryFiles.map(({ file }) => file).join(' ') : '', EnvironmentFiles: `${envPath} (ignore_errors=no)`, FragmentPath: path.join(home, '.config/systemd/user', service) });
   const commands = {
     inspect(command, args, options = {}) {
       calls.push([command, args]);
@@ -58,10 +68,41 @@ function fixture() {
   write(root, 'node_modules/dependency/index.js', 'export default 0;');
   const save = value => writeUpdateJson(recordPath, value);
   const host = new UpdateHost({ repoRoot: root, home, dataDir, runDir, commands, prepareRelease: build, save });
-  return { home, root, origin, dataDir, old, target, record, recordPath, host, save, commands, build, calls, envPath };
+  return { home, root, origin, dataDir, old, target, record, recordPath, host, save, commands, build, calls, envPath, memoryFiles };
 }
 
 describe('managed update host with real Git and recovery files', () => {
+  it.each(['success', 'rollback'])('preserves terminal memory properties through a standard update: %s', async outcome => {
+    const f = fixture({ terminalMemory: true });
+    const brokerFile = path.join(f.home, '.config/systemd/user/cloudx-terminal.service');
+    const originalUnit = fs.readFileSync(brokerFile, 'utf8');
+    const expectMemory = () => {
+      for (const { file, contents } of f.memoryFiles) expect(fs.readFileSync(file, 'utf8')).toBe(contents);
+    };
+    expect(f.host.target.kind).toBe('standard');
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(f.host, 'verify').mockImplementation(() => {
+      expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.target);
+      expect(fs.readFileSync(brokerFile, 'utf8')).toContain(`WorkingDirectory=${f.root}`);
+      expectMemory();
+      if (outcome === 'rollback') throw new Error('Injected target readiness failure');
+    });
+    const run = await new ManagedUpdate({ record: f.record, save: f.save, host: f.host }).run();
+    expectMemory();
+    if (outcome === 'success') {
+      expect(run).toMatchObject({ state: 'succeeded', phase: 'complete' });
+      expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.target);
+    } else {
+      expect(run).toMatchObject({ state: 'failed', phase: 'verify', resumable: true });
+      expect(f.record.transition.restored).toBe(true);
+      expect(git(f.root, 'rev-parse', 'HEAD')).toBe(f.old);
+      expect(fs.readFileSync(brokerFile, 'utf8')).toBe(originalUnit);
+    }
+    expect(new UpdateHost({ repoRoot: f.root, home: f.home, dataDir: f.dataDir, runDir: f.host.runDir,
+      commands: f.commands }).target.kind).toBe('standard');
+    expect(f.calls.some(([command, args]) => command === 'systemctl' && args[1] === 'daemon-reload')).toBe(true);
+  });
+
   it.each(['bytes', 'inodes'])('reserves separate recovery %s for a larger historical profile before stopping, then restores after a failed start', async limit => {
     const f = fixture();
     const historicalFile = 'historical/entry-199';
