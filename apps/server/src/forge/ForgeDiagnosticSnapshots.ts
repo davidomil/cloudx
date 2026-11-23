@@ -21,6 +21,7 @@ export interface OwnedDiagnosticSnapshot extends ForgeDiagnosticSnapshotResult {
   indexBaseline?: SnapshotIndexBaseline;
   removalContents?: ForgeRemovalContents[];
   recovery?: SnapshotRecoveryReceipt;
+  recoveryRetention?: { reason: string; heldAt: string };
   hold?: string;
 }
 
@@ -242,6 +243,8 @@ export class ForgeDiagnosticSnapshots {
         throw new Error("Diagnostic snapshot has conflicting recovery directories; both copies were preserved.");
       const identity = { ...snapshot.identity, path: path.join(parentPath, sourceExists ? "source" : "retiring-source") };
       await assertIdentity(identity);
+      snapshot.recoveryRetention ??= { reason: "The user explicitly recovered this diagnostic snapshot.", heldAt: new Date().toISOString() };
+      await save();
       // A verified receipt is immutable. Changed source after preservation stays protected.
       if (!snapshot.recovery) {
         snapshot.removalContents = await captureForgeRemovalContents(identity, signal);
@@ -310,6 +313,8 @@ export function isOwnedDiagnosticSnapshot(value: unknown, workerId: string, chec
     typeof snapshot.origin.url === "string" && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(snapshot.origin.commitSha) &&
     (snapshot.hold === undefined || typeof snapshot.hold === "string") &&
     (snapshot.recovery === undefined || isSnapshotRecoveryReceipt(snapshot.recovery)) &&
+    (snapshot.recoveryRetention === undefined || typeof snapshot.recoveryRetention.reason === "string" && snapshot.recoveryRetention.reason.length > 0 &&
+      Number.isFinite(Date.parse(snapshot.recoveryRetention.heldAt))) &&
     (snapshot.indexBaseline === undefined || snapshot.kind === "repository" && isSnapshotIndexBaseline(snapshot.indexBaseline)) &&
     (snapshot.removalContents === undefined || isForgeRemovalContents(snapshot.removalContents)) &&
     (snapshot.contents === undefined ? snapshot.state === "creating" || snapshot.state === "removed" ||

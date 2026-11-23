@@ -48,6 +48,9 @@ import { LOCAL_WEB_PROXY_MAX_BODY_BYTES, LocalWebProxy } from "./localWebProxy.j
 import { contentDispositionAttachment, FileTransferService, FileUploadTooLargeError } from "./fileTransfer.js";
 import { CodexTerminalPlugin } from "./plugins/CodexTerminalPlugin.js";
 import { CodexStateSources } from "./plugins/CodexStateSources.js";
+import { CodexStorageService } from "./plugins/CodexStorageService.js";
+import { CodexLaunchCacheLifecycle } from "./plugins/CodexLaunchCacheLifecycle.js";
+import { ForgeArchiveRetirement } from "./forge/ForgeArchiveRetirement.js";
 import { CodexSettingsPlugin } from "./plugins/CodexSettingsPlugin.js";
 import { AgentAccountsPlugin } from "./plugins/AgentAccountsPlugin.js";
 import { AgentAccountStore } from "./agents/AgentAccountStore.js";
@@ -194,6 +197,8 @@ export interface AppServices {
   disposeRulesSkillsUpdates?: () => Promise<void>;
   disposeAgentUsage?: () => Promise<void>;
   codexStateSources?: CodexStateSources;
+  codexLaunchCaches?: CodexLaunchCacheLifecycle;
+  disposeCodexLaunchCaches?: () => Promise<void>;
   codexUpdates?: CodexUpdateService;
 }
 
@@ -306,7 +311,6 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       () => services.voice.dispose?.(),
       () => services.forgeConnections?.dispose()
     ]);
-    const sourceShutdown = settleDisposers([() => services.codexStateSources?.dispose()]);
     const setupShutdown = settleDisposers([() => services.pluginContributionsReady]);
     const rulesSkillsUpdatesShutdown = settleDisposers([() => services.disposeRulesSkillsUpdates?.()]);
     const producerShutdown = settleDisposers([
@@ -314,6 +318,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       async () => {
         const failures = await settleDisposers([() => services.forge?.dispose()]);
         failures.push(...await settleDisposers([() => services.sessions.dispose?.()]));
+        failures.push(...await settleDisposers([() => services.disposeCodexLaunchCaches?.()]));
         failures.push(...await settleDisposers([() => services.disposeAgentUsage?.()]));
         if (failures.length === 1) throw failures[0];
         if (failures.length > 1) throw new AggregateError(failures, "Forge workers or sessions failed to stop.");
@@ -341,7 +346,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       failures.push(...await settleDisposers([() => services.hardwareMonitor?.dispose(), () => services.hardware?.dispose()]));
       services.cooperationNative?.close();
       failures.push(...await settleDisposers([() => disposePersistenceNotifications()]));
-      failures.push(...await sourceShutdown);
+      failures.push(...await settleDisposers([() => services.codexStateSources?.dispose()]));
       if (failures.length > 0) {
         throw new AggregateError(failures, "One or more server services failed to stop.");
       }
@@ -356,8 +361,10 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
     await services.cooperationReady;
     await services.pluginContributionsReady;
     await services.sessions.restore?.(services.pluginContributionsReady);
+    // Forge's dashboard load restores embedded sessions before cache reconciliation.
+    await services.forge?.dashboard();
+    await services.codexLaunchCaches?.start();
     if (services.hardware) {
-      await services.forge?.dashboard();
       let hardwareUnavailable = false;
       try { await services.hardware.init(); }
       catch (error) {
@@ -372,9 +379,6 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
       }
     }
     if (services.cooperation && services.cooperationContexts) {
-      // Forge restores its embedded sessions while loading the dashboard. Its
-      // polling timer is not a restoration barrier.
-      await services.forge?.dashboard();
       services.cooperationHost ??= new CooperationHost(services.cooperation, services.cooperationContexts, services.sessions,
         error => app.log.error({ err: error }, "Cooperation host synchronization failed."), services.cooperationNative);
       await services.cooperationHost.start();
@@ -1512,6 +1516,12 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   process.env.CLOUDX_DOCUMENTATION_URL ??= documentationUrl;
   process.env.CLOUDX_SERVER_URL ??= `${config.https ? "https" : "http"}://127.0.0.1:${config.port}`;
   let sessions: SessionStore | undefined;
+  const codexLaunchCaches = new CodexLaunchCacheLifecycle({
+    sources: codexStateSources, factory: terminalFactory,
+    referencedProfiles: () => sessions?.referencedCodexProfiles() ?? [],
+    onReclaimed: result => logger?.info({ ...result }, "Unused Codex launch caches reclaimed."),
+    onError: (error, tabId) => logger?.warn({ err: error, tabId }, "Codex launch caches preserved."),
+  });
   let hardware: HardwareService | undefined;
   const hardwarePasswords = new HardwareSshPasswords(config.dataDir);
   let hardwareMonitor: HardwareOwnerMonitor | undefined;
@@ -1568,7 +1578,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     accounts: agentAccounts,
     claudeSettings,
     usage: usageRecorder
-  }));
+  }, codexLaunchCaches));
   const usageOwners = () => {
     const windows = workspace.snapshot().windows;
     return {
@@ -1590,7 +1600,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   };
   plugins.register(new AgentAccountsPlugin(agentAccounts, terminalFactory, config.terminalReplayBytes));
   plugins.register(new ClaudeSettingsPlugin(claudeSettings));
-  plugins.register(new CodexSettingsPlugin(new CodexSettingsService(codexStateSources), codexUpdates, new CodexConfigRepairService(codexStateSources)));
+  plugins.register(new CodexSettingsPlugin(new CodexSettingsService(codexStateSources), codexUpdates, new CodexConfigRepairService(codexStateSources), new CodexStorageService(codexStateSources)));
   plugins.register(new StandardTerminalPlugin(terminalFactory, config.terminalReplayBytes));
   plugins.register(new FileBrowserPlugin(pathPolicy));
   plugins.register(new LocalWebPlugin());
@@ -1660,6 +1670,8 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   }, (error, details) => {
     logger?.error({ err: serializeError(error), ...details }, "session background operation failed");
   }, new SessionStateStore(config.dataDir));
+  const unbindCacheCleanup = sessions.onTabRemoved(tab => codexLaunchCaches.reclaimClosed(tab.id));
+  const disposeCodexLaunchCaches = async () => { unbindCacheCleanup(); await codexLaunchCaches.dispose(); };
   const cooperationHost = new CooperationHost(cooperation, cooperationContexts, sessions,
     error => logger?.error({ err: error }, "Cooperation host synchronization failed."), cooperationNative);
   hardwareMonitor = new HardwareOwnerMonitor({ sessions, contexts: hardwareContexts, hardware,
@@ -1675,6 +1687,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   });
   const settingsForForge: ForgeSettingsService = forgeSettings;
   const forgeResources = new ForgeDisposableResources(config.dataDir, async () => (await forge!.dashboard()).workers);
+  const forgeArchives = new ForgeArchiveRetirement(config.dataDir);
   forge = new ForgeWorkflowService({
     settings: () => settingsForForge.settings(),
     refreshPublicationCredentials: (repository, signal) => settingsForForge.refreshPublicationCredentials(repository, signal),
@@ -1685,6 +1698,17 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
     store: new ForgeWorkflowStore(pluginData),
     reports: new ForgeWorkerReports(config.dataDir),
     cleanupDisposableResources: worker => forgeResources.retire(worker),
+    retireArchives: async (worker, workers) => {
+      const result = await forgeArchives.retire(worker, workers, await forgeResources.records());
+      await forgeResources.compactRetiredArchives();
+      forgeLog(logger, "info", "archive_retirement", { workerId: worker.id, cumulativeReclaimedBytes: result.reclaimedBytes, heldPaths: result.heldPaths });
+      if (result.eligible) await forgeRuntime!.retireNativeHistory(worker.id);
+    },
+    reconcileArchives: async workers => {
+      const result = await forgeArchives.reconcile(workers, await forgeResources.records());
+      await forgeResources.compactRetiredArchives();
+      for (const id of result.eligibleWorkerIds) await forgeRuntime!.retireNativeHistory(id);
+    },
     validateEvidenceHandoff: worker => forgeResources.validateEvidenceHandoff(worker),
     notify: (title, body) => { notifications.send({ title, body }); }
   });
@@ -1754,7 +1778,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   sessions.setTriggerRegistry(triggers);
   jiraPolling = new JiraPollingService(jira, pluginData, () => triggers, logger);
   automation = createAutomationService(automationRepository, { agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, pluginData, rulesSkills, fileTransfer }, config, logger);
-  return { hardware, hardwarePasswords, hardwareContexts, hardwareMonitor, cooperation, cooperationContexts, cooperationReady, cooperationHost, cooperationFeedback, cooperationNative, cooperationForge, agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, disposeAgentUsage, codexStateSources, codexUpdates };
+  return { hardware, hardwarePasswords, hardwareContexts, hardwareMonitor, cooperation, cooperationContexts, cooperationReady, cooperationHost, cooperationFeedback, cooperationNative, cooperationForge, agentAccounts, plugins, sessions, pathPolicy, voice, asr, config: configService, workspace, workspaceCommands, hooks, triggers, automation, pluginData, installedPlugins, rulesSkills, fileTransfer, notifications, documentation, documentationIngestQueue, documentationEnrichment, jira, jiraPolling, forge, forgeResources, forgeConnections, pluginContributionsReady, disposeRulesSkillsUpdates, disposeAgentUsage, codexStateSources, codexUpdates, codexLaunchCaches, disposeCodexLaunchCaches };
 }
 
 function isStreamingHookRequest(request: FastifyRequest<{ Querystring: { stream?: string } }>): boolean {

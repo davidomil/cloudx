@@ -69,6 +69,8 @@ export class SessionStore {
   private readonly tabOwnershipActions = new Map<string, Promise<unknown>>();
   private readonly tabRecoveries = new Map<string, Promise<WorkspaceTab>>();
   private readonly tabRecoveryRequests = new Map<string, RecoverTabRequest>();
+  private readonly codexConversationAdmissions = new Map<string, number>();
+  private readonly retiringCodexConversations = new Set<string>();
   private readonly tabRuntimeContextActions = new Map<string, Promise<unknown>>();
   private readonly restartingNativeTabs = new Set<string>();
   // Tabs whose agent is being switched. Their input and actions are refused
@@ -141,6 +143,7 @@ export class SessionStore {
   private async restoreTabSession(tab: WorkspaceTab): Promise<PluginSession> {
     const plugin = this.plugins.get(tab.pluginId);
     const input = await this.sessionInput(tab);
+    this.assertCodexConversationAvailable(plugin.id, input.initialInput);
     if (plugin.panelKind === "terminal" && !plugin.restoreSession) {
       throw new Error(`${plugin.displayName} does not support reconnecting an existing session.`);
     }
@@ -188,6 +191,11 @@ export class SessionStore {
       }
       return pending;
     }
+    let releaseConversation: () => void;
+    try {
+      const tab = this.getTab(tabId);
+      releaseConversation = this.reserveCodexConversation(tab.pluginId, this.initialInputs.get(tabId), request.sessionId ?? tab.recovery?.conversationId);
+    } catch (error) { return Promise.reject(error); }
     if (request.action === "restart-native") this.restartingNativeTabs.add(tabId);
     this.tabRecoveryRequests.set(tabId, { ...request });
     const recovering = this.admitAction(undefined, () => request.action === "restart-native"
@@ -195,6 +203,7 @@ export class SessionStore {
       : this.recoverTabNow(tabId, request));
     this.tabRecoveries.set(tabId, recovering);
     const finished = () => {
+      releaseConversation();
       this.tabRecoveries.delete(tabId);
       this.tabRecoveryRequests.delete(tabId);
       this.restartingNativeTabs.delete(tabId);
@@ -286,6 +295,7 @@ export class SessionStore {
     const work = this.nativeWorkForRecovery(tab.id, previous, request);
     if (work.turnId !== before.turnId || work.turnStatus !== before.turnStatus || work.goalStatus !== before.goalStatus)
       throw new Error("The native work changed while recovery was prepared. Refresh its state before recovery.");
+    const releaseConversation = this.reserveCodexConversation(plugin.id, prepared.initialInput);
     try {
       await previous.terminate();
       if (previous.hasExited?.() !== true) throw new Error("The native client did not confirm process termination.");
@@ -308,7 +318,7 @@ export class SessionStore {
       });
       await this.savedSessions?.flush();
       throw error;
-    }
+    } finally { releaseConversation(); }
     await this.savedSessions?.flush();
     return this.getTab(tab.id);
   }
@@ -343,25 +353,28 @@ export class SessionStore {
     // Preparation awaited account and handoff work; check the run again.
     if (this.sessions.get(tabId) !== previous || (alive && !isIdleAgent(previous!)))
       throw new Error("The run changed while the switch was prepared. Switch again when it is idle.");
-    if (previous) {
-      this.disposeSessionListeners(tabId);
-      if (alive) await previous.terminate?.();
-      if (previous.hasExited?.() === true) await this.notifyExecutionEnded(tab);
-      this.sessions.delete(tabId);
-    }
-    this.initialInputs.set(tabId, structuredClone(next));
-    this.updateTab(tabId, { status: "starting", statusMessage: "Switching agent.", recovery: undefined });
+    const releaseConversation = this.reserveCodexConversation(plugin.id, next);
     try {
-      const session = await plugin.createSession(await this.sessionInput(this.getTab(tabId)));
-      this.bindSession(tabId, session);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.updateTab(tabId, { status: "failed", statusMessage: message, indicator: indicatorForStatus("failed", message) });
+      if (previous) {
+        this.disposeSessionListeners(tabId);
+        if (alive) await previous.terminate?.();
+        if (previous.hasExited?.() === true) await this.notifyExecutionEnded(tab);
+        this.sessions.delete(tabId);
+      }
+      this.initialInputs.set(tabId, structuredClone(next));
+      this.updateTab(tabId, { status: "starting", statusMessage: "Switching agent.", recovery: undefined });
+      try {
+        const session = await plugin.createSession(await this.sessionInput(this.getTab(tabId)));
+        this.bindSession(tabId, session);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.updateTab(tabId, { status: "failed", statusMessage: message, indicator: indicatorForStatus("failed", message) });
+        await this.savedSessions?.flush();
+        throw error;
+      }
       await this.savedSessions?.flush();
-      throw error;
-    }
-    await this.savedSessions?.flush();
-    return this.getTab(tabId);
+      return this.getTab(tabId);
+    } finally { releaseConversation(); }
   }
 
   async tabOwnershipAvailability(tabId: string): Promise<DirectoryOwnershipAvailability> {
@@ -470,6 +483,12 @@ export class SessionStore {
     if (this.disposed) {
       throw new Error("Session store is disposed.");
     }
+    const releaseConversation = this.reserveCodexConversation(request.pluginId, request.initialInput);
+    try { return await this.prepareTabNow(request, runtimeWindow, launchOptions); }
+    finally { releaseConversation(); }
+  }
+
+  private async prepareTabNow(request: StartTabRequest, runtimeWindow?: WorkspaceWindow, launchOptions?: PluginSessionLaunchOptions): Promise<WorkspaceTab> {
     const plugin = this.plugins.get(request.pluginId);
     const ownerPluginId = launchOptions?.ownerPluginId;
     if (ownerPluginId !== undefined) this.plugins.get(ownerPluginId);
@@ -505,6 +524,7 @@ export class SessionStore {
       if (templateIndicator) {
         tab.indicator = createTabIndicator(templateIndicator, now);
       }
+      this.assertCodexConversationAvailable(plugin.id, request.initialInput);
       const session = await plugin.createSession({
         tab,
         cwd,
@@ -612,6 +632,58 @@ export class SessionStore {
 
   listTabs(): WorkspaceTab[] {
     return Array.from(this.tabs.values()).filter((tab) => !this.unpublishedTabIds.has(tab.id));
+  }
+
+  referencedCodexProfiles(): Set<string> {
+    const references = new Set(this.tabs.keys());
+    for (const input of this.initialInputs.values()) {
+      if (typeof input?.codexForkSourceTabId === "string") references.add(input.codexForkSourceTabId);
+    }
+    return references;
+  }
+
+  referencedCodexConversations(): Set<string> {
+    const references = new Set(this.codexConversationAdmissions.keys());
+    for (const tab of this.tabs.values()) {
+      addCodexConversationReferences(references, tab, this.initialInputs.get(tab.id));
+      const request = this.tabRecoveryRequests.get(tab.id);
+      if (isAgentTab(tab) && typeof request?.sessionId === "string") references.add(request.sessionId.trim().toLowerCase());
+    }
+    return references;
+  }
+
+  withCodexConversationRetirement<T>(threadId: string, task: () => Promise<T>): Promise<T> {
+    if (this.disposed) return Promise.reject(new Error("Session store is disposed."));
+    if (!threadId || threadId.length > 128 || /[\u0000-\u001f]/u.test(threadId)) return Promise.reject(new Error("An exact Codex conversation identity is required."));
+    threadId = threadId.trim().toLowerCase();
+    if (this.retiringCodexConversations.has(threadId)) return Promise.reject(new Error("Codex conversation retirement is already in progress."));
+    if (this.referencedCodexConversations().has(threadId)) return Promise.reject(new Error("A saved, starting or recovering tab still references the Codex conversation."));
+    this.retiringCodexConversations.add(threadId);
+    return this.admitAction(undefined, async signal => {
+      const saved = await this.savedSessions?.read();
+      signal.throwIfAborted();
+      const references = this.referencedCodexConversations();
+      for (const { tab, initialInput } of saved?.sessions ?? []) addCodexConversationReferences(references, tab, initialInput);
+      if (references.has(threadId)) throw new Error("A persisted recovery consumer still references the Codex conversation.");
+      return task();
+    }).finally(() => { this.retiringCodexConversations.delete(threadId); });
+  }
+
+  private assertCodexConversationAvailable(pluginId: string, input: Record<string, unknown> | undefined, selected?: string): void {
+    const threadId = codexConversationForInput(pluginId, input, selected);
+    if (threadId && this.retiringCodexConversations.has(threadId)) throw new Error("This Codex conversation is being retired. Select another saved conversation.");
+  }
+
+  private reserveCodexConversation(pluginId: string, input: Record<string, unknown> | undefined, selected?: string): () => void {
+    this.assertCodexConversationAvailable(pluginId, input, selected);
+    const threadId = codexConversationForInput(pluginId, input, selected);
+    if (!threadId) return () => {};
+    this.codexConversationAdmissions.set(threadId, (this.codexConversationAdmissions.get(threadId) ?? 0) + 1);
+    return () => {
+      const remaining = this.codexConversationAdmissions.get(threadId)! - 1;
+      if (remaining) this.codexConversationAdmissions.set(threadId, remaining);
+      else this.codexConversationAdmissions.delete(threadId);
+    };
   }
 
   onTabsChange(listener: (update: WorkspaceTabsUpdate) => void): () => void {
@@ -1044,6 +1116,7 @@ export class SessionStore {
     if (current.ownerPluginId === "forge") throw new Error("Resume the worker through Forge to start a new execution.");
     const plugin = this.plugins.get(current.pluginId);
     const oldSession = this.sessions.get(tabId);
+    this.assertCodexConversationAvailable(plugin.id, oldSession?.restoreInput?.() ?? this.initialInputs.get(tabId));
     this.disposeSessionListeners(tabId);
     this.sessions.delete(tabId);
     if (oldSession?.terminate) await oldSession.terminate();
@@ -1198,6 +1271,7 @@ export class SessionStore {
 
   private bindSession(tabId: string, session: PluginSession, templateIndicator?: TabIndicatorUpdate): void {
     const agentInput = isAgentTab(session.tab) ? session.restoreInput?.() : undefined;
+    this.assertCodexConversationAvailable(session.tab.pluginId, agentInput);
     if (agentInput) this.initialInputs.set(tabId, structuredClone(agentInput));
     this.sessions.set(tabId, session);
     const offersRecovery = !session.tab.ownerPluginId && this.plugins.get(session.tab.pluginId).panelKind === "terminal";
@@ -1281,6 +1355,7 @@ export class SessionStore {
       setRestoreInput: async (input) => {
         const tab = this.tabs.get(tabId);
         if (!tab) return;
+        this.assertCodexConversationAvailable(tab.pluginId, input);
         const previous = this.initialInputs.get(tabId);
         this.initialInputs.set(tabId, structuredClone(input));
         this.persistSessions();
@@ -1721,6 +1796,20 @@ function mergePluginMetadata(current: PluginMetadataMap | undefined, pluginId: s
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function codexConversationForInput(pluginId: string, input: Record<string, unknown> | undefined, selected?: string): string | undefined {
+  if (pluginId !== AGENT_TERMINAL_PLUGIN_ID || readAgentSelection(input?.agent)?.providerId === "claude") return undefined;
+  if (selected) return selected.trim().toLowerCase();
+  const resume = input?.resume;
+  return isRecord(resume) && resume.mode === "session" && typeof resume.sessionId === "string" ? resume.sessionId.trim().toLowerCase() : undefined;
+}
+
+function addCodexConversationReferences(references: Set<string>, tab: WorkspaceTab, input: Record<string, unknown> | undefined): void {
+  if (!isAgentTab(tab)) return;
+  for (const id of [tab.nativeWork?.threadId, tab.recovery?.conversationId, codexConversationForInput(tab.pluginId, input)]) {
+    if (id) references.add(id.trim().toLowerCase());
+  }
 }
 
 // The provider's turn receipt is authoritative. Without one, a terminal that

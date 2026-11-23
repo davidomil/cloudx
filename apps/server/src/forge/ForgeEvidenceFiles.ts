@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { ForgeEvidenceBatch, ForgeEvidenceFile } from "@cloudx/shared";
 import { requireRegularFile, requireSafeDirectory, stringifyJsonDocument, type JsonStateFile } from "../jsonStateFile.js";
+import { retainForgeArchive, retainForgeArchiveStream } from "./ForgeArchiveAccess.js";
 
 export const maxEvidenceBytes = 256 * 1024 * 1024;
 export const maxEvidenceFiles = 512;
@@ -114,8 +115,11 @@ export class ForgeEvidenceFiles {
   }
 
   async fileStream(namespace: string, id: string, filePath: string, batch?: number) {
-    const handle = await this.openFile(namespace, id, filePath, batch);
-    return handle.createReadStream({ highWaterMark: 64 * 1024 });
+    const release = retainForgeArchive(path.resolve(this.dataDir, namespace, id));
+    try {
+      const handle = await this.openFile(namespace, id, filePath, batch);
+      return retainForgeArchiveStream(handle.createReadStream({ highWaterMark: 64 * 1024 }), release);
+    } catch (error) { release(); throw error; }
   }
 
   private async openFile(namespace: string, id: string, filePath: string, batch?: number) {

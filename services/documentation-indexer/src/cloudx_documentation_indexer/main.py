@@ -25,6 +25,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .archive import ACTIVE_STATE, ArchiveError, DocumentationArchive
 from .archive_jobs import ArchiveExportJobError, ArchiveExportJobs
+from .extraction_storage import ExtractionMaintenance
 from .archive_imports import ArchiveImports
 from .enrichment_api import install_enrichment_routes
 from .revision_api import install_revision_routes
@@ -34,6 +35,7 @@ from .retrieval import RetrievalUnavailable
 UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 DEFAULT_DOCUMENTATION_UPLOAD_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_ARCHIVE_IMPORT_UPLOAD_MAX_BYTES = 1024 * 1024 * 1024
+EXTRACTION_RECONCILIATION_INTERVAL_SECONDS = 60
 
 
 class IngestPathRequest(BaseModel):
@@ -111,9 +113,13 @@ def create_app(root: str | Path | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        maintenance = ExtractionMaintenance(archive.reconcile_extraction_storage, interval_seconds=EXTRACTION_RECONCILIATION_INTERVAL_SECONDS)
+        _app.state.extraction_maintenance = maintenance
+        maintenance.start()
         try:
             yield
         finally:
+            await run_in_threadpool(maintenance.close)
             await run_in_threadpool(campaigns.close)
             await run_in_threadpool(imports.close)
             await run_in_threadpool(exports.close)
@@ -292,8 +298,20 @@ def create_app(root: str | Path | None = None) -> FastAPI:
 
     @app.get("/documents/{document_id}/artifact")
     def document_artifact(document_id: str, path: str) -> FileResponse:
-        artifact = handle_archive_error(lambda: archive.document_artifact_file(document_id, path))
-        return FileResponse(artifact.path, media_type=artifact.media_type, filename=artifact.filename)
+        def open_artifact():
+            with archive._write_lock:
+                artifact = archive.document_artifact_file(document_id, path)
+                snapshot = archive.root / archive._document_row(document_id)["snapshot_path"]
+                lease = archive._extraction_storage.reader_lease(snapshot.parent)
+                return artifact, snapshot, lease
+
+        artifact, snapshot, lease = handle_archive_error(open_artifact)
+
+        def release():
+            os.close(lease)
+            archive._discard_unreferenced_snapshot(snapshot)
+
+        return ArtifactResponse(artifact.path, media_type=artifact.media_type, filename=artifact.filename, release=release)
 
     @app.delete("/documents/{document_id}")
     def remove_document(document_id: str) -> dict:
@@ -488,6 +506,18 @@ def uploaded_archive_package(file: UploadFile, archive_root: Path) -> Path:
         raise
     finally:
         handle.close()
+
+
+class ArtifactResponse(FileResponse):
+    def __init__(self, path: Path, *, media_type: str, filename: str, release: Callable[[], None]):
+        super().__init__(path, filename=filename, media_type=media_type)
+        self.release = release
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await run_in_threadpool(self.release)
 
 
 class ArchiveDownloadResponse(FileResponse):

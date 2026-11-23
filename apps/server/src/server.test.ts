@@ -344,6 +344,44 @@ describe("buildServer", () => {
     }
   });
 
+  it("restores Forge consumers before cache reconciliation and drains cleanup before releasing native sources", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-cache-lifecycle-"));
+    const config = testConfig(root);
+    const services = buildServices(config);
+    const restoringForge = deferred<void>();
+    const releaseForge = deferred<void>();
+    const events: string[] = [];
+    const dashboard = services.forge!.dashboard.bind(services.forge);
+    vi.spyOn(services.forge!, "dashboard").mockImplementationOnce(async () => {
+      restoringForge.resolve(undefined);
+      await releaseForge.promise;
+      return dashboard();
+    });
+    const reconcile = vi.spyOn(services.codexLaunchCaches!, "start");
+    const drainSessions = services.sessions.dispose.bind(services.sessions);
+    vi.spyOn(services.sessions, "dispose").mockImplementation(async () => { await drainSessions(); events.push("sessions drained"); });
+    const drainCaches = services.codexLaunchCaches!.dispose.bind(services.codexLaunchCaches);
+    vi.spyOn(services.codexLaunchCaches!, "dispose").mockImplementation(async () => { await drainCaches(); events.push("caches drained"); });
+    const releaseSources = services.codexStateSources!.dispose.bind(services.codexStateSources);
+    vi.spyOn(services.codexStateSources!, "dispose").mockImplementation(async () => { events.push("sources released"); await releaseSources(); });
+    const starting = buildServer(config, services);
+    let app: Awaited<typeof starting> | undefined;
+    try {
+      await restoringForge.promise;
+      expect(reconcile).not.toHaveBeenCalled();
+      releaseForge.resolve(undefined);
+      app = await starting;
+      expect(reconcile).toHaveResolved();
+      await app.close();
+      expect(events).toEqual(["sessions drained", "caches drained", "sources released"]);
+    } finally {
+      releaseForge.resolve(undefined);
+      app ??= await starting;
+      await app.close();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not expose a Codex source-selection inventory", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-source-route-"));
     const config = testConfig(root);

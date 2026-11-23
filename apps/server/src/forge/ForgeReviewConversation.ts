@@ -14,6 +14,7 @@ type ConversationDirectory = DirectoryIdentity;
 export interface ReviewConversationBinding {
   source: ResolvedCodexStateSource;
   sqliteHome: ConversationDirectory;
+  sqliteHomeVerified?: true;
   originView: OwnedDirectoryIdentity;
   creating: boolean;
   threadId?: string;
@@ -63,10 +64,9 @@ export class ForgeReviewConversation {
         throw new Error("Worker conversation requires the prepared Codex source overlay.");
       const sqlitePath = launch.env.CODEX_SQLITE_HOME?.trim();
       if (!sqlitePath || !path.isAbsolute(sqlitePath)) throw new Error("Worker conversation requires an absolute Codex SQLite home.");
-      const sqliteHome = await directory(sqlitePath);
       const view = await directory(launch.env.CODEX_HOME);
       let binding = options.binding;
-      if (binding && (!sameSource(binding.source, source) || !sameDirectory(binding.sqliteHome, sqliteHome)))
+      if (binding && !sameSource(binding.source, source))
         throw new Error("The worker conversation source changed. Its existing context was preserved.");
       if (binding?.creating) throw new Error("Worker conversation initialization is unresolved. Its pending context was preserved.");
       if (binding) {
@@ -78,8 +78,14 @@ export class ForgeReviewConversation {
       signal?.addEventListener("abort", abort, { once: true });
       signal?.throwIfAborted();
       await client.initialize();
+      const effective = await client.request("config/read", { includeLayers: false });
+      if (!isRecord(effective) || !isRecord(effective.config)) throw new Error("Native SQLite configuration could not be verified.");
+      const effectiveSqlite = effective.config.sqlite_home ?? sqlitePath;
+      if (typeof effectiveSqlite !== "string" || !path.isAbsolute(effectiveSqlite)) throw new Error("Native SQLite configuration requires an absolute home.");
+      const sqliteHome = await directory(effectiveSqlite);
+      if (binding && !sameDirectory(binding.sqliteHome, sqliteHome)) throw new Error("The worker conversation SQLite home changed. Its existing context was preserved.");
       if (!binding) {
-        binding = { source, sqliteHome, originView: view, creating: true };
+        binding = { source, sqliteHome, sqliteHomeVerified: true, originView: view, creating: true };
         await options.save(binding);
         if (signal?.aborted) {
           await options.save(undefined);
@@ -201,6 +207,7 @@ export function isReviewConversationBinding(value: unknown): value is ReviewConv
   if (!isRecord(value) || !isRecord(value.source) || !isRecord(value.sqliteHome) || !isRecord(value.originView)) return false;
   const { source, sqliteHome, originView } = value;
   return [source.durable, sqliteHome.durable, originView.durable].every(value => value === undefined || isDurableDirectoryIdentity(value)) &&
+    (value.sqliteHomeVerified === undefined || value.sqliteHomeVerified === true) &&
     source.sourceId === "shared" && typeof source.home === "string" && path.isAbsolute(source.home) &&
     [source.dev, source.ino, sqliteHome.dev, sqliteHome.ino, originView.dev, originView.ino].every(part => typeof part === "string" && /^\d+$/u.test(part)) &&
     typeof sqliteHome.path === "string" && path.isAbsolute(sqliteHome.path) &&

@@ -41,6 +41,8 @@ import { DirectoryOwnershipReconciler } from "../directoryOwnershipReconciliatio
 import { isClaudeModel } from "../agents/claude/ClaudeLaunch.js";
 import { claudeOverlayPath } from "../agents/claude/ClaudeHomeOverlay.js";
 import { CodexStateSources, type ResolvedCodexStateSource } from "../plugins/CodexStateSources.js";
+import { CodexHistoryMaintenance, type NativeHistoryRetirement } from "../plugins/CodexHistoryMaintenance.js";
+import { CodexConversationRecovery } from "../plugins/CodexConversationRecovery.js";
 import { assertDirectoryIdentity, readDirectoryIdentity, isDurableDirectoryIdentity, type DirectoryIdentity } from "../directoryIdentity.js";
 import { JsonStateFile, openOwnedDirectoryNoFollow, readTextFileNoFollow, requireRegularFile, requireSafeDirectory, stringifyJsonDocument, type OwnedDirectory } from "../jsonStateFile.js";
 import type { PathPolicy } from "../pathPolicy.js";
@@ -99,7 +101,7 @@ export interface ForgeRuntimeDependencies {
     | "executePluginAction"
     | "discardPreparedTab"
     | "getActiveTabId"
-  >;
+  > & Partial<Pick<SessionStore, "withCodexConversationRetirement" | "referencedCodexConversations">>;
   workspaceCommands: Pick<WorkspaceCommandService, "createTab">;
   workspace: Pick<WorkspaceLayoutStore, "state">;
   rulesSkills: Pick<RulesSkillsCatalogService, "list">;
@@ -118,6 +120,7 @@ export interface ForgeRuntimeDependencies {
     environment?: NodeJS.ProcessEnv,
   ) => Promise<string>;
   reviewConversations?: Pick<ForgeReviewConversation, "prepare">;
+  nativeHistory?: Pick<CodexHistoryMaintenance, "retire">;
 }
 
 interface OwnedPublishedSync {
@@ -241,6 +244,59 @@ export class ForgeRuntime {
   async workerHistory(id: string): Promise<ForgeWorkerHistory | undefined> {
     await this.readOwned(id);
     return this.history.read(id);
+  }
+
+  /** Called only after the workflow proves terminal work and archive retention eligibility. */
+  retireNativeHistory(id: string): Promise<NativeHistoryRetirement | undefined> {
+    return this.serialize(id, "retireNativeHistory", undefined, async () => {
+      if (!await this.manifest(id).read<OwnedWorkspace>()) return undefined;
+      const owned = await this.readOwned(id);
+      const binding = owned.reviewConversation ?? owned.batchConversation;
+      if (!binding) return undefined; // Legacy/unbound and interactive conversations have no disposal authority.
+      const assertDisposable = async () => {
+        const current = await this.readOwned(id);
+        if (!current.cleaned || current.launchPending || current.gitPending || current.cleanupRemoval || current.retainedWorkspace
+          || current.diagnosticSnapshots?.some(snapshot => snapshot.state !== "removed" || snapshot.hold)
+          || JSON.stringify(current.reviewConversation ?? current.batchConversation) !== JSON.stringify(binding))
+          throw new Error("The Forge conversation still has working files, recovery needs or a changed owner.");
+        await this.assertCleanupQuiescent(current);
+        if (this.dependencies.sessions.referencedCodexConversations?.().has(binding.threadId!))
+          throw new Error("A saved, starting or recovering tab still references the Forge conversation.");
+        const tabDirectory = path.join(this.dependencies.dataDir, "forge-workers", "tabs");
+        const ownedIds = new Set<string>();
+        if (await requireSafeDirectory(this.dependencies.dataDir, tabDirectory, { create: false, label: "Forge tab ownership directory" })) {
+          for (const name of await fs.readdir(tabDirectory)) {
+            if (!name.endsWith(".json")) continue;
+            const tab = await this.tabManifest(name.slice(0, -5)).read<OwnedTab>();
+            if (!tab || tab.tabId !== name.slice(0, -5)) throw new Error("Forge tab ownership is unknown.");
+            if (tab.workerId !== id) continue;
+            if (!tab.closed || !tab.quiescent) throw new Error("The Forge conversation still has a live or recovering execution.");
+            ownedIds.add(tab.tabId);
+          }
+        }
+        if (this.dependencies.sessions.listTabs().some(tab => tab.nativeWork?.threadId === binding.threadId || tab.recovery?.conversationId === binding.threadId || ownedIds.has(tab.id)))
+          throw new Error("A saved or live tab still references the Forge conversation.");
+        // Preserve even a closed interactive profile that selected this owned thread.
+        const launches = path.join(this.dependencies.dataDir, "codex-launches");
+        if (await requireSafeDirectory(this.dependencies.dataDir, launches, { create: false, label: "Codex launch directory" })) {
+          for (const name of await fs.readdir(launches)) {
+            if (ownedIds.has(name)) continue;
+            const view = path.join(launches, name);
+            if (!await requireSafeDirectory(this.dependencies.dataDir, view, { create: false, label: "Codex conversation view" })) continue;
+            const selected = new CodexConversationRecovery(view).read();
+            if (selected?.sessionId === binding.threadId) throw new Error("An interactive or other worker profile retains this Forge conversation.");
+          }
+        }
+      };
+      const maintenance = this.dependencies.nativeHistory ?? new CodexHistoryMaintenance(this.dependencies.dataDir);
+      const result = await maintenance.retire(id, binding, assertDisposable, task => {
+        const sessions = this.dependencies.sessions;
+        if (!sessions.withCodexConversationRetirement) throw new Error("Native conversation retirement admission is unavailable.");
+        return sessions.withCodexConversationRetirement(binding.threadId!, task);
+      });
+      forgeLog(this.dependencies.logger, "info", "native_history.retirement", { workerId: id, ...result });
+      return result;
+    });
   }
 
   async hardwareOwnerState(owner: AgentOwner): Promise<"confirmed_ended" | "unknown"> {

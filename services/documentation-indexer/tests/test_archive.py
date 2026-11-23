@@ -1804,19 +1804,19 @@ def test_pdf_tables_visuals_and_images_are_extracted_as_portable_artifacts(tmp_p
     assert (extracted / "table_index.tsv").exists()
     assert "POWER GOOD" in (extracted / "tables" / "table-001.csv").read_text(encoding="utf-8")
     assert (extracted / "figure_index.tsv").exists()
-    assert any(path.name.endswith(".png") for path in (extracted / "figures").iterdir())
+    assert all(path.suffix in {".png", ".webp"} for path in (extracted / "figures").iterdir())
     assert archive.search("flowcharts schematics visual layout", source_types=["datasheet"], limit=1)
     pdf_record = archive.get_document(table_result["documentId"])
     figure_artifact = next(artifact for artifact in pdf_record["artifacts"] if artifact["type"] == "figure")
     table_artifact = next(artifact for artifact in pdf_record["artifacts"] if artifact["type"] == "table")
     assert figure_artifact["path"].startswith("figures/")
-    assert figure_artifact["mimeType"] == "image/png"
+    assert figure_artifact["mimeType"] in {"image/png", "image/webp"}
     assert figure_artifact["available"] is True
     assert table_artifact["alternatePaths"][0]["kind"] == "csv"
     assert table_artifact["nonEmptyCells"] >= 3
     assert table_artifact["totalCells"] >= table_artifact["nonEmptyCells"]
     served_figure = archive.document_artifact_file(table_result["documentId"], figure_artifact["path"])
-    assert served_figure.media_type == "image/png"
+    assert served_figure.media_type == figure_artifact["mimeType"]
     assert served_figure.path.is_file()
     with pytest.raises(ArchiveError):
         archive.document_artifact_file(table_result["documentId"], "../catalog.sqlite")
@@ -1824,7 +1824,7 @@ def test_pdf_tables_visuals_and_images_are_extracted_as_portable_artifacts(tmp_p
     client = TestClient(create_app(tmp_path / "archive"))
     artifact_response = client.get(f"/documents/{table_result['documentId']}/artifact", params={"path": figure_artifact["path"]})
     assert artifact_response.status_code == 200
-    assert artifact_response.headers["content-type"].startswith("image/png")
+    assert artifact_response.headers["content-type"].startswith(figure_artifact["mimeType"])
 
     image_result = archive.search("320x160 flowcharts screenshots", source_types=["image"], limit=1)[0]
     image_snapshot = tmp_path / "archive" / image_result["citation"]["snapshotPath"]
@@ -1864,12 +1864,12 @@ def test_schematic_pdf_page_creates_searchable_artifacts(tmp_path: Path) -> None
     record = archive.get_document(document.document_id)
     schematic = next(artifact for artifact in record["artifacts"] if artifact["type"] == "schematic")
     assert schematic["kind"] == "schematic-description"
-    assert schematic["imagePath"] == "figures/figure-001.png"
+    assert schematic["imagePath"] in {"figures/figure-001.png", "figures/figure-001.webp"}
     assert schematic["descriptionPath"] == "schematics/schematic-001/description.md"
     assert schematic["jsonPath"] == "schematics/schematic-001/analysis.json"
     assert schematic["analysisOutputs"][0]["path"] == "schematics/schematic-001/graph.json"
     assert archive.document_artifact_file(document.document_id, schematic["descriptionPath"]).media_type == "text/markdown"
-    assert archive.document_artifact_file(document.document_id, schematic["imagePath"]).media_type == "image/png"
+    assert archive.document_artifact_file(document.document_id, schematic["imagePath"]).media_type in {"image/png", "image/webp"}
 
 
 def test_schematic_image_creates_description_without_overclassifying_generic_images(tmp_path: Path) -> None:

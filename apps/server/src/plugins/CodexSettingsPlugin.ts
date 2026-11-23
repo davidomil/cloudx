@@ -9,6 +9,7 @@ import type { CodexGlobalSettingsUpdate } from "@cloudx/shared";
 import type { CodexSettingsService } from "./CodexSettingsService.js";
 import type { CodexUpdateService } from "./CodexUpdateService.js";
 import type { CodexConfigRepairService } from "./CodexConfigRepairService.js";
+import type { CodexStorageService } from "./CodexStorageService.js";
 
 export class CodexSettingsPlugin implements WorkspacePlugin {
   readonly id = "codex-settings";
@@ -22,7 +23,7 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
   readonly actions = [];
   readonly hooks: HookDefinition[];
 
-  constructor(settings: CodexSettingsService, updates: CodexUpdateService, repairs: CodexConfigRepairService) {
+  constructor(settings: CodexSettingsService, updates: CodexUpdateService, repairs: CodexConfigRepairService, storage?: CodexStorageService) {
     this.hooks = [
       {
         id: "codex-settings.inspect-launch",
@@ -71,6 +72,15 @@ export class CodexSettingsPlugin implements WorkspacePlugin {
       },
     ];
     this.hooks.push(
+      ...(storage ? [{
+        id: "codex-storage.read",
+        owner: { kind: "plugin" as const, pluginId: this.id },
+        title: "Measure Codex storage",
+        description: "Measure native history, databases, retained user data and isolated launch caches without following history links.",
+        exposures: ["ui" as const, "http" as const],
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        execute: async (_input: Record<string, unknown>, context: { signal?: AbortSignal }) => ({ storage: await storage.read(context.signal) }),
+      }] : []),
       {
         id: "codex-config-repair.read",
         owner: { kind: "plugin", pluginId: this.id },

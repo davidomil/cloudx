@@ -8,6 +8,7 @@ import { CodexConfigRepairControl } from "./CodexConfigRepairControl.js";
 import { CodexNativeOptions } from "./CodexNativeOptions.js";
 import { CodexDefaultsPolicy } from "./CodexDefaultsPolicy.js";
 import { CodexLaunchInspection } from "./CodexLaunchInspection.js";
+import { CodexStoragePanel } from "./CodexStoragePanel.js";
 import { CodexSettingsEditor, personalities, reasoningEfforts, serviceTiers, webSearchModes } from "./CodexSettingsEditor.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
 
@@ -24,6 +25,7 @@ export function CodexSettingsPanel({ editor, callHook }: { editor: CodexSettings
     </header>
     <CodexUpdateControl callHook={callHook} />
     <CodexConfigRepairControl callHook={callHook} />
+    <CodexStoragePanel callHook={callHook} />
     {error ? <p className="codex-settings-notice" role="alert">{error}</p> : null}
     {busy === "loading" ? <p role="status">Loading global Codex settings…</p> : null}
     {settings ? <form className="codex-settings-form" onSubmit={event => { event.preventDefault(); void editor.save(); }}>

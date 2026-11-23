@@ -60,8 +60,8 @@ afterEach(async () => {
 async function render(revision = 0) { await act(async () => root!.render(createElement(ForgeResourcesPanel, { revision }))); }
 
 describe("Saved Forge evidence", () => {
-  it("replaces an empty resource history with one automatic-cleanup message and no controls", async () => {
-    vi.mocked(getForgeResources).mockResolvedValue([{ ...resource, evidence: undefined }, { ...resource, id: "discarded", evidence: { state: "discarded", paths: [] } }]);
+  it.each(["discarded", "retired"] as const)("replaces %s resource history with one automatic-cleanup message and no controls", async state => {
+    vi.mocked(getForgeResources).mockResolvedValue([{ ...resource, evidence: undefined }, { ...resource, id: state, evidence: { state, paths: [] } }]);
     await render();
     expect(container.querySelectorAll("p")).toHaveLength(1);
     expect(container.textContent).toContain("Finished Forge workspaces clean automatically.");

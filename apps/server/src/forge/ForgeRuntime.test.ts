@@ -5999,3 +5999,55 @@ describe("Forge completed retained checkout reconciliation", () => {
     expect(await fs.readFile(outside, "utf8")).toBe(compilerCache);
   });
 });
+
+describe("terminal Forge native history eligibility", () => {
+  async function terminalConversation() {
+    const deps = dependencies();
+    let disposable!: () => Promise<void>;
+    const result = { state: "retained" as const, threadId: "01a08470-d118-7b72-b1df-439e72e5c744", selectedVersion: null, reason: "Fixture native version is not verified." };
+    deps.nativeHistory = { retire: vi.fn(async (_id, _binding, check) => { disposable = check; await check(); return result; }) };
+    runtime = new ForgeRuntime(deps);
+    const workspace = await prepare();
+    const home = path.join(root, "shared-codex");
+    await fs.mkdir(home);
+    await fs.mkdir(path.join(deps.dataDir, "codex-launches", "origin"), { recursive: true });
+    const binding = conversationBinding("origin", home);
+    const manifest = path.join(deps.dataDir, "forge-workers", "workspaces", `${workspace.id}.json`);
+    const record = JSON.parse(await fs.readFile(manifest, "utf8"));
+    record.cleaned = true; record.batchConversation = binding; record.batchConversationRequired = true;
+    await fs.writeFile(manifest, JSON.stringify(record));
+    return { deps, workspace, binding, manifest, record, result, disposable: () => disposable() };
+  }
+
+  it("requires a cleaned owned workspace and retains unbound legacy conversations", async () => {
+    const f = await terminalConversation();
+    expect(await runtime.retireNativeHistory(f.workspace.id)).toEqual(f.result);
+    f.record.cleaned = false;
+    await fs.writeFile(f.manifest, JSON.stringify(f.record));
+    await expect(runtime.retireNativeHistory(f.workspace.id)).rejects.toThrow("working files");
+    delete f.record.batchConversation; delete f.record.batchConversationRequired;
+    await fs.writeFile(f.manifest, JSON.stringify(f.record));
+    expect(await runtime.retireNativeHistory(f.workspace.id)).toBeUndefined();
+    expect(await runtime.retireNativeHistory("missing-owner")).toBeUndefined();
+  });
+
+  it("preserves a closed interactive profile that selected the Forge conversation", async () => {
+    const f = await terminalConversation();
+    const view = path.join(f.deps.dataDir, "codex-launches", "interactive");
+    await fs.mkdir(view);
+    await fs.writeFile(path.join(view, ".cloudx-conversation.json"), JSON.stringify({ sessionId: f.binding.threadId, cwd: root }));
+    await expect(runtime.retireNativeHistory(f.workspace.id)).rejects.toThrow("interactive or other worker");
+  });
+
+  it("preserves a saved recovery consumer and an unclosed owned execution", async () => {
+    const f = await terminalConversation();
+    const tab = workerTab(f.workspace);
+    tab.recovery = { state: "missing", message: "Resume saved native work", conversationId: f.binding.threadId };
+    vi.mocked(f.deps.sessions.listTabs).mockReturnValue([tab]);
+    await expect(runtime.retireNativeHistory(f.workspace.id)).rejects.toThrow(/active session|saved or live/);
+    vi.mocked(f.deps.sessions.listTabs).mockReturnValue([]);
+    await fs.mkdir(path.join(f.deps.dataDir, "forge-workers", "tabs"), { recursive: true });
+    await fs.writeFile(path.join(f.deps.dataDir, "forge-workers", "tabs", "origin.json"), JSON.stringify({ tabId: "origin", workerId: f.workspace.id, closed: false, quiescent: true }));
+    await expect(runtime.retireNativeHistory(f.workspace.id)).rejects.toThrow("live or recovering");
+  });
+});

@@ -30,7 +30,7 @@ def extraction_processor() -> dict:
             packages[package] = None
     code = hashlib.sha256()
     root = Path(__file__).parent
-    for path in [root / "source_retention.py", root / "archive.py", root / "extraction.py", root / "vendor_code.py", root / "media_source.py", root / "source_admission.py", root / "pdf_text.py", *sorted((root / "schematics").glob("*.py"))]:
+    for path in [root / "source_retention.py", root / "archive.py", root / "extraction.py", root / "extraction_storage.py", root / "vendor_code.py", root / "media_source.py", root / "source_admission.py", root / "pdf_text.py", *sorted((root / "schematics").glob("*.py"))]:
         code.update(path.name.encode())
         code.update(path.read_bytes())
     ocr_executable_state, ocr_executable_digest = ocr_executable_identity(os.getenv("CLOUDX_SCHEMATIC_OCR_EXECUTABLE"))

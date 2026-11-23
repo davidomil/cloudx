@@ -39,6 +39,7 @@ from PIL import Image
 from turbovec import IdMapIndex
 
 from .catalog_schema import SCHEMA_VERSION, upgrade_catalog
+from .extraction_storage import ExtractionStorage, OWNER_FILE, allocated_bytes
 from .source_retention import canonical_source_key, processor_fingerprint, retained_source_manifest
 from .media_source import MEDIA_SUFFIXES, looks_like_media
 from .source_admission import detected_content_type
@@ -298,20 +299,25 @@ class DocumentationArchive:
         self.manifest_path = self.index_dir / "manifest.json"
         self.index_projection_path = self.index_dir / "current"
         self.index_generations_dir = self.index_dir / INDEX_GENERATIONS_DIRECTORY
-        self._write_lock = threading.RLock()
         self._search_sessions = SearchSessions()
         self._search_index_cache = SearchIndexCache()
         self._extraction_slots = threading.BoundedSemaphore(INGEST_CONCURRENCY)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._extraction_storage = ExtractionStorage(self.root)
+        self._write_lock = self._extraction_storage.lock
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
+        if self.snapshots_dir.is_symlink():
+            raise ArchiveError("Archive snapshots directory must not be a symbolic link.")
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.index_generations_dir.mkdir(parents=True, exist_ok=True)
-        self._init_db()
-        with self._connect() as db:
-            if db.execute("PRAGMA journal_mode = WAL").fetchone()[0] != "wal":
-                raise ArchiveError("Documentation retrieval requires SQLite WAL journal mode.")
-        self._upgrade_retained_sources()
-        self._recover_index_publication()
+        with self._write_lock:
+            self._init_db()
+            with self._connect() as db:
+                if db.execute("PRAGMA journal_mode = WAL").fetchone()[0] != "wal":
+                    raise ArchiveError("Documentation retrieval requires SQLite WAL journal mode.")
+            self._upgrade_retained_sources()
+            self._recover_index_publication()
+            self.extraction_storage_cleanup = self.reconcile_extraction_storage()
 
     def health(self) -> dict:
         with self._write_lock:
@@ -343,6 +349,7 @@ class DocumentationArchive:
                     "projectedGeneration": projected_generation_id,
                 },
                 "archiveLocality": archive_locality,
+                "extractionStorageCleanup": self.extraction_storage_cleanup,
             }
 
     def stats(self) -> dict:
@@ -1012,7 +1019,7 @@ class DocumentationArchive:
             uri=str(path),
             filename=path.name,
             content=source_bytes,
-            extract=lambda artifact_dir: extract_file(path, source_bytes, inferred_type, artifact_dir),
+            extract=lambda artifact_dir, **options: extract_file(path, source_bytes, inferred_type, artifact_dir, **options),
             collection=document_collection,
             tags=tags,
         )]
@@ -1096,7 +1103,7 @@ class DocumentationArchive:
             uri=url,
             filename=final_name,
             content=source_bytes,
-            extract=lambda artifact_dir: extract_bytes(source_bytes, url, inferred_type, content_type, artifact_dir),
+            extract=lambda artifact_dir, **options: extract_bytes(source_bytes, url, inferred_type, content_type, artifact_dir, **options),
             metadata={
                 "url": url,
                 "finalUrl": str(response.url),
@@ -1248,7 +1255,7 @@ class DocumentationArchive:
             uri=f"upload://{safe_name}",
             filename=safe_name,
             content=content,
-            extract=lambda artifact_dir: extract_bytes(content, safe_name, inferred_type, content_type, artifact_dir),
+            extract=lambda artifact_dir, **options: extract_bytes(content, safe_name, inferred_type, content_type, artifact_dir, **options),
             metadata={"filename": filename, "contentType": content_type, "upload": True},
             collection=document_collection,
             tags=tags,
@@ -1262,17 +1269,22 @@ class DocumentationArchive:
         uri: str,
         filename: str,
         content: bytes,
-        extract: Callable[[Path], list[ExtractedSpan]],
+        extract: Callable[..., list[ExtractedSpan]],
         collection: str | None,
         tags: list[str] | None,
         metadata: dict | None = None,
         expected_source: tuple[str, str, str] | None = None,
     ) -> IngestedDocument:
-        with tempfile.TemporaryDirectory(prefix="cloudx-source-extraction-") as temp_dir:
-            artifacts = Path(temp_dir) / "extracted"
+        identity = "doc_" + sha256_bytes(f"{uri}\0{sha256_bytes(content)}".encode("utf-8"))[:24]
+        with self._write_lock, self._connect() as db:
+            existing = db.execute("SELECT snapshot_path FROM documents WHERE document_id = ?", (identity,)).fetchone()
+            paths = retained_pdf_figure_paths(self.root / existing["snapshot_path"]) if existing else {}
+        options = {"pdf_figure_paths": paths} if paths else {}
+        with self._extraction_storage.staging() as temp_dir:
+            artifacts = temp_dir / "extracted"
             with self._extraction_slots:
                 try:
-                    spans = extract(artifacts)
+                    spans = extract(artifacts, **options)
                 except ValueError as error:
                     raise ArchiveError(str(error)) from error
             if not chunk_spans(spans):
@@ -1468,17 +1480,34 @@ class DocumentationArchive:
         return self.invalidate_document(document_id, state="deleted", reason=reason)
 
     def reanalyze_document(self, document_id: str, *, expected_revision: str | None = None, campaign_id: str | None = None) -> IngestedDocument:
-        document = self._document_row(document_id)
-        if expected_revision is not None and document["extraction_revision"] != expected_revision:
-            raise ArchiveError("Campaign extraction revision no longer matches the document.")
-        if document["state"] != ACTIVE_STATE:
-            raise ArchiveError("Only active documents can be reanalyzed.")
-        snapshot_path = (self.root / safe_archive_relative_path(document["snapshot_path"])).resolve()
-        if not is_relative_to(snapshot_path, self.snapshots_dir.resolve()) or not snapshot_path.is_file():
-            raise ArchiveError("The archived source snapshot is missing or outside the snapshots directory.")
+        with self._extraction_storage.staging() as staging_root:
+            with self._write_lock:
+                document = self._document_row(document_id)
+                if expected_revision is not None and document["extraction_revision"] != expected_revision:
+                    raise ArchiveError("Campaign extraction revision no longer matches the document.")
+                if document["state"] != ACTIVE_STATE:
+                    raise ArchiveError("Only active documents can be reanalyzed.")
+                snapshot_path = (self.root / safe_archive_relative_path(document["snapshot_path"])).resolve()
+                if not is_relative_to(snapshot_path, self.snapshots_dir.resolve()) or not snapshot_path.is_file():
+                    raise ArchiveError("The archived source snapshot is missing or outside the snapshots directory.")
+                reader = self._extraction_storage.reader_lease(snapshot_path.parent)
+            try:
+                result = self._reanalyze_document(document_id, document, snapshot_path, staging_root,
+                                                expected_revision=expected_revision, campaign_id=campaign_id)
+            finally:
+                os.close(reader)
+            try:
+                self._discard_unreferenced_snapshot(snapshot_path)
+            except OSError as error:
+                logger.warning("Reanalysis of %s was published, but the previous snapshot could not be removed: %s", document_id, error)
+            return result
+
+    def _reanalyze_document(self, document_id: str, document: Mapping, snapshot_path: Path, staging_root: Path,
+                           *, expected_revision: str | None, campaign_id: str | None) -> IngestedDocument:
         source_bytes = snapshot_path.read_bytes()
         if sha256_bytes(source_bytes) != document["content_sha256"]:
             raise ArchiveError("The archived source snapshot does not match its recorded content hash.")
+        self._retain_snapshot_readers(snapshot_path, document)
         manifest = json.loads(document["source_manifest_json"])
         if manifest.get("rebuildBlocked"):
             raise ArchiveError(manifest["rebuildBlocked"])
@@ -1498,7 +1527,6 @@ class DocumentationArchive:
             raise ArchiveError(f"Invalid retained source metadata: {error}") from error
         filename = manifest.get("original", {}).get("filename", snapshot_path.name)
         metadata = {**metadata, "originalFilename": filename}
-        staging_root = Path(tempfile.mkdtemp(prefix=".documentation-reanalysis-", dir=self.root.parent))
         staged_snapshot = self._store_snapshot(source_bytes, filename, metadata, directory_root=staging_root)
         replacement = self.snapshots_dir / staged_snapshot.parent.name / staged_snapshot.name
         artifacts_root = staged_snapshot.parent / "extracted"
@@ -1531,7 +1559,9 @@ class DocumentationArchive:
                     if (snapshot_path.parent / "extracted").exists():
                         shutil.copytree(snapshot_path.parent / "extracted", artifacts_root, ignore=shutil.ignore_patterns("enrichment"))
                 else:
-                    spans = extract_bytes(source_bytes, filename, document["source_type"], metadata.get("contentType"), artifacts_root)
+                    figure_paths = retained_pdf_figure_paths(snapshot_path)
+                    options = {"pdf_figure_paths": figure_paths} if figure_paths else {}
+                    spans = extract_bytes(source_bytes, filename, document["source_type"], metadata.get("contentType"), artifacts_root, **options)
             chunks = chunk_spans(spans)
             if not chunks:
                 raise ArchiveError("No extractable text was found during reanalysis.")
@@ -1572,12 +1602,6 @@ class DocumentationArchive:
         except Exception:
             self._discard_unreferenced_snapshot(replacement)
             raise
-        finally:
-            shutil.rmtree(staging_root)
-        try:
-            self._discard_unreferenced_snapshot(snapshot_path)
-        except OSError as error:
-            logger.warning("Reanalysis of %s was published, but the previous snapshot could not be removed: %s", document_id, error)
         return IngestedDocument(document_id, document["title"], document["source_type"], ACTIVE_STATE, len(chunks), document["content_sha256"])
 
     def rebuild_index(self) -> dict:
@@ -1963,6 +1987,11 @@ class DocumentationArchive:
                     return IngestedDocument(document_id, existing_document["title"], source_type, ACTIVE_STATE, count, content_sha256)
         now = timestamp()
 
+        if existing_document:
+            previous_snapshot = self.root / safe_archive_relative_path(existing_document["snapshot_path"])
+            if previous_snapshot.parent.parent == self.snapshots_dir and not previous_snapshot.parent.is_symlink():
+                self._retain_snapshot_readers(previous_snapshot, existing_document)
+
         def write_document(db: sqlite3.Connection) -> None:
             require_source_revision(db, expected_source)
             existing = db.execute("SELECT document_id FROM documents WHERE document_id = ?", (document_id,)).fetchone()
@@ -2206,19 +2235,38 @@ class DocumentationArchive:
 
     def _store_snapshot(self, content: bytes, filename: str, metadata: dict | None = None, *, directory_root: Path | None = None) -> Path:
         safe_name = safe_file_name(filename)
-        if safe_name in {"extracted", "metadata.json", "source-spans.json", "source-manifest.json"}:
+        if safe_name in {"extracted", "metadata.json", "source-spans.json", "source-manifest.json", OWNER_FILE}:
             safe_name = "source-" + safe_name
         directory = Path(tempfile.mkdtemp(prefix=sha256_bytes(content)[:16] + "-", dir=directory_root or self.snapshots_dir))
         artifact = directory / safe_name
         try:
+            self._extraction_storage.claim(directory)
             artifact.write_bytes(content)
             write_snapshot_metadata(directory / "metadata.json", {**(metadata or {}), "originalFilename": filename})
         except Exception:
-            shutil.rmtree(directory)
+            if self._extraction_storage.owns(directory):
+                self._extraction_storage.remove(directory)
+            else:
+                shutil.rmtree(directory)
             raise
         return artifact
 
     def _discard_unreferenced_snapshot(self, snapshot_path: Path, *, excluding_purge_id: int | None = None) -> None:
+        with self._write_lock:
+            self._discard_snapshot_under_lock(snapshot_path, excluding_purge_id=excluding_purge_id)
+
+    def _retain_snapshot_readers(self, snapshot_path: Path, document: Mapping) -> None:
+        with self._write_lock, self._connect() as db:
+            readers = [row[0] for row in db.execute(
+                "SELECT run_id FROM enrichment_runs WHERE document_id = ? AND extraction_revision = ? AND status = 'running' AND lease_until > ?",
+                (document["document_id"], document["extraction_revision"], time.time()),
+            )]
+            self._extraction_storage.claim(snapshot_path.parent, reader_run_ids=readers)
+
+    def _discard_snapshot_under_lock(self, snapshot_path: Path, *, excluding_purge_id: int | None = None) -> None:
+        directory = snapshot_path.parent
+        if directory.parent != self.snapshots_dir or directory.is_symlink() or self.snapshots_dir.is_symlink():
+            raise ArchiveError("Snapshot cleanup must stay inside archive snapshots.")
         relative_path = snapshot_path.relative_to(self.root).as_posix()
         relative_directory = snapshot_path.parent.relative_to(self.root).as_posix() + "/"
         with self._connect() as db:
@@ -2232,8 +2280,48 @@ class DocumentationArchive:
                 "SELECT COUNT(*) FROM purge_events WHERE cleanup_status = 'pending' AND (snapshot_path = ? OR substr(snapshot_path, 1, ?) = ?) AND (? IS NULL OR purge_id != ?)",
                 (relative_path, len(relative_directory), relative_directory, excluding_purge_id, excluding_purge_id),
             ).fetchone()[0]
+            for run_id in self._extraction_storage.reader_run_ids(directory):
+                reference_count += db.execute(
+                    "SELECT COUNT(*) FROM enrichment_runs WHERE run_id = ? AND status IN ('running','obsolete') AND lease_until > ?",
+                    (run_id, time.time()),
+                ).fetchone()[0]
         if reference_count == 0 and snapshot_path.parent.exists():
-            shutil.rmtree(snapshot_path.parent)
+            with self._extraction_storage.retirement_lease(directory) as unused:
+                if unused:
+                    if self._extraction_storage.owns(directory):
+                        self._extraction_storage.remove(directory)
+                    else:
+                        shutil.rmtree(directory)
+
+    def reconcile_extraction_storage(self) -> dict[str, Any]:
+        reclaimed = 0
+        preserved_unknown = 0
+        errors = []
+        with self._write_lock:
+            try:
+                reclaimed += self._extraction_storage.reconcile_staging()
+            except OSError as error:
+                errors.append(str(error))
+            with self._connect() as db:
+                referenced = {str(row[0]).split("/")[1] for row in db.execute(
+                    "SELECT snapshot_path FROM documents UNION SELECT snapshot_path FROM purge_events WHERE cleanup_status = 'pending'"
+                ) if str(row[0]).startswith("snapshots/") and len(str(row[0]).split("/")) >= 3}
+            for directory in self.snapshots_dir.iterdir():
+                if directory.name in referenced:
+                    continue
+                if not self._extraction_storage.owns(directory):
+                    preserved_unknown += 1
+                    continue
+                try:
+                    before = allocated_bytes(directory)
+                    self._discard_snapshot_under_lock(directory / "source")
+                    if not directory.exists():
+                        reclaimed += before
+                except OSError as error:
+                    errors.append(str(error))
+        result = {"reclaimedAllocatedBytes": reclaimed, "preservedUnknownDirectories": preserved_unknown, "errors": errors}
+        self.extraction_storage_cleanup = result
+        return result
 
     def _imported_snapshot_paths(self, source_root: Path) -> list[Path]:
         source = sqlite3.connect(source_root / "catalog.sqlite")
@@ -2273,6 +2361,7 @@ class DocumentationArchive:
             for path in sorted(self.root.rglob("*"))
             if path.is_file()
             and path not in stable_index_paths
+            and not (path.name == OWNER_FILE and self._extraction_storage.owns(path.parent))
             and not is_relative_to(path, self.index_dir.parent)
         ]
         generation = generation or self._active_index_generation_record()
@@ -3324,6 +3413,14 @@ def directory_code_files(path: Path) -> tuple[list[Path], list[Path]]:
         elif is_unsupported_code_source_name(file_path.name):
             unsupported_code_files.append(file_path)
     return code_files, unsupported_code_files
+
+
+def retained_pdf_figure_paths(snapshot_path: Path) -> dict[int, str]:
+    index = snapshot_path.parent / "extracted" / "figure_index.tsv"
+    if not index.is_file():
+        return {}
+    with index.open(newline="") as handle:
+        return {int(row["page"]): safe_artifact_relative_path(row["path"]) for row in csv.DictReader(handle, delimiter="\t")}
 
 
 def snapshot_artifacts(document_id: str, snapshot_path: Path) -> list[dict[str, Any]]:

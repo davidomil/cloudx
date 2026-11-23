@@ -69,6 +69,12 @@ export class ForgeWorkerReports {
     );
     return { reportPath, contextPath };
   }
+  async recordOwner(attemptId: string, workerId: string): Promise<void> {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,100}$/u.test(workerId)) throw new Error("Invalid Forge report owner.");
+    await writeNewTextFileNoFollow(this.dataDir, this.ownershipPath(attemptId), JSON.stringify({
+      version: 1, workerId, attemptId, reason: "Forge task context and completion report", createdAt: new Date().toISOString(),
+    }), "Forge report ownership");
+  }
   async read(attemptId: string): Promise<unknown | undefined> {
     if (
       !(await requireSafeDirectory(this.dataDir, this.directory, {
@@ -112,7 +118,7 @@ export class ForgeWorkerReports {
       }))
     )
       return;
-    for (const file of [this.filePath(attemptId), this.contextPath(attemptId)])
+    for (const file of [this.filePath(attemptId), this.contextPath(attemptId), this.ownershipPath(attemptId)])
       await fs.unlink(file).catch((error) => {
         if (!notFound(error)) throw error;
       });
@@ -120,6 +126,7 @@ export class ForgeWorkerReports {
   private contextPath(id: string): string {
     return this.filePath(id).replace(/\.json$/, ".context.json");
   }
+  private ownershipPath(id: string): string { return this.filePath(id).replace(/\.json$/, ".ownership.json"); }
   private filePath(id: string): string {
     if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error("Invalid report attempt.");
     return path.join(this.directory, `${id}.json`);
