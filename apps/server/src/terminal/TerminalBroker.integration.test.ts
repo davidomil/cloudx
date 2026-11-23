@@ -1,9 +1,10 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { startTerminalBroker } from "../../../../scripts/test-terminal-broker.mjs";
 import { DurableTerminalProcessFactory } from "./DurableTerminalProcess.js";
 import { NodePtyTerminalProcessFactory } from "./NodePtyTerminalProcess.js";
 import { TerminalBroker } from "./TerminalBroker.js";
@@ -84,22 +85,19 @@ describe.skipIf(process.platform !== "linux")("broker-owned terminal processes",
     expect(await running(pid)).toBe(false);
   });
 
-  it("survives web-process death and explicitly stops the command plus its detached descendant", async () => {
+  it.each([0, 1_250])("survives web-process death and explicitly stops the command plus its detached descendant after %ims web startup", async startupDelay => {
     const directory = await temporaryDirectory();
     const socketPath = path.join(directory, "broker.sock");
     const brokerScript = path.join(directory, "broker.mjs");
     await fs.writeFile(brokerScript, `
-      import fs from 'node:fs';
       import { TerminalBroker } from ${moduleUrl("TerminalBroker")};
       import { NodePtyTerminalProcessFactory } from ${moduleUrl("NodePtyTerminalProcess")};
       const broker = new TerminalBroker(${JSON.stringify(socketPath)}, new NodePtyTerminalProcessFactory());
       await broker.start();
-      fs.writeFileSync(${JSON.stringify(path.join(directory, "ready"))}, 'ready');
       process.on('SIGTERM', () => void broker.stop());
+      process.send({ type: 'ready' });
     `);
-    const broker = spawn(process.execPath, ["--import", "tsx", brokerScript], { stdio: "ignore" });
-    cleanups.push(() => stopChild(broker));
-    await vi.waitFor(async () => expect(await exists(path.join(directory, "ready"))).toBe(true));
+    const broker = await startOwner(brokerScript);
 
     await fs.writeFile(path.join(directory, "daemon.mjs"), `
       import fs from 'node:fs';
@@ -117,19 +115,17 @@ describe.skipIf(process.platform !== "linux")("broker-owned terminal processes",
     `);
     const webScript = path.join(directory, "web.mjs");
     await fs.writeFile(webScript, `
-      import fs from 'node:fs';
       import { DurableTerminalProcessFactory } from ${moduleUrl("DurableTerminalProcess")};
       import { NodePtyTerminalProcessFactory } from ${moduleUrl("NodePtyTerminalProcess")};
+      await new Promise(resolve => setTimeout(resolve, ${startupDelay}));
       await new DurableTerminalProcessFactory(${JSON.stringify(socketPath)}, new NodePtyTerminalProcessFactory()).spawn(
         process.execPath, [${JSON.stringify(path.join(directory, "command.mjs"))}],
         { cwd: ${JSON.stringify(directory)}, env: process.env, cols: 100, rows: 30, sessionId: 'codex-work' }
       );
-      fs.writeFileSync(${JSON.stringify(path.join(directory, "web-ready"))}, 'ready');
+      process.send({ type: 'ready' });
     `);
-    const web = spawn(process.execPath, ["--import", "tsx", webScript], { stdio: "ignore" });
-    cleanups.push(() => stopChild(web));
-    await vi.waitFor(async () => expect(await exists(path.join(directory, "web-ready"))).toBe(true));
-    await vi.waitFor(async () => expect(await exists(path.join(directory, "daemon-pid"))).toBe(true));
+    const web = await startOwner(webScript);
+    await vi.waitFor(async () => expect(await exists(path.join(directory, "daemon-pid"))).toBe(true), { timeout: 10_000 });
     const commandPid = Number(await fs.readFile(path.join(directory, "command-pid"), "utf8"));
     const daemonPid = Number(await fs.readFile(path.join(directory, "daemon-pid"), "utf8"));
     const supervisorPid = (await processState(commandPid))!.parent;
@@ -149,8 +145,31 @@ describe.skipIf(process.platform !== "linux")("broker-owned terminal processes",
     expect(await running(daemonPid)).toBe(false);
     expect(await running(supervisorPid)).toBe(false);
     expect(broker.exitCode).toBeNull();
-  }, 15_000);
+  }, 30_000);
+
+  it("reports child startup errors instead of waiting for a missing readiness marker", async () => {
+    const directory = await temporaryDirectory();
+    const script = path.join(directory, "failed-owner.mjs");
+    await fs.writeFile(script, "throw new Error('fixture startup failed');");
+    await expect(startOwner(script)).rejects.toThrow("fixture startup failed");
+  });
 });
+
+async function startOwner(script: string): Promise<ChildProcess> {
+  let errors = "";
+  try {
+    return await startTerminalBroker(script, {
+      execArgv: ["--import", "tsx"],
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
+      onSpawn(child: ChildProcess) {
+        cleanups.push(() => stopChild(child));
+        child.stderr!.on("data", data => { errors = (errors + data).slice(-4096); });
+      }
+    });
+  } catch (error) {
+    throw new Error(`${path.basename(script)} failed to start: ${error instanceof Error ? error.message : String(error)}\n${errors}`, { cause: error });
+  }
+}
 
 async function temporaryDirectory() {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-durable-test-"));
