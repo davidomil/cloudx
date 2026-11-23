@@ -5,10 +5,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ManagedUpdate, UpdateHost, validateSavedTransition } from './managed-update.mjs';
 import { BROKER, cleanupUpdates, git, updateFixture, write } from './helpers/managed-update-rollback-fixture.mjs';
 
-afterEach(cleanupUpdates);
+afterEach(() => { cleanupUpdates(); vi.unstubAllEnvs(); });
 
 function directWebUpdate({ originalBroker = 'active' } = {}) {
   const f = updateFixture({ activate: false, originalBroker });
+  vi.stubEnv('XDG_RUNTIME_DIR', path.join(f.host.home, 'runtime'));
+  vi.stubEnv('XDG_CONFIG_HOME', path.join(f.host.home, '.config'));
   const service = 'selected-web.service';
   f.record.service = service;
   f.record.transition.serviceTarget = f.host.target = { kind: 'web', serviceNames: [service] };
@@ -208,6 +210,28 @@ describe('service transitions to targets without persistent terminal brokers', (
       fs.renameSync(f.brokerFile, outside); fs.symlinkSync(outside, f.brokerFile);
     }
     expect(() => f.host.prepareDirectBroker(f.record)).toThrow(/terminal broker/);
+    expect(fs.readFileSync(f.brokerFile, 'utf8')).toBe(f.brokerUnit);
+    expect(f.events).toEqual([]);
+  });
+
+  it('preserves an operator memory policy through direct-target activation and restoration', () => {
+    const f = directWebUpdate();
+    const dropIn = path.join(f.host.paths.systemdDir, `${BROKER}.d/operator-memory.conf`);
+    const memoryPolicy = '[Service]\nMemoryHigh=24G\nMemoryMax=32G\n';
+    write(dropIn, memoryPolicy); f.states[BROKER].DropInPaths = dropIn;
+    snapshotDirectUpdate(f); f.host.activate(f.record);
+    expect(fs.readFileSync(dropIn, 'utf8')).toBe(memoryPolicy);
+    const record = JSON.parse(fs.readFileSync(f.recordPath, 'utf8'));
+    recoveryHost(f, record).restore(record);
+    expect(fs.readFileSync(dropIn, 'utf8')).toBe(memoryPolicy);
+    expect(fs.readFileSync(f.brokerFile, 'utf8')).toBe(f.brokerUnit);
+  });
+
+  it('refuses a drop-in that also changes execution before changing the owned broker', () => {
+    const f = directWebUpdate();
+    const dropIn = path.join(f.host.paths.systemdDir, `${BROKER}.d/operator-memory.conf`);
+    write(dropIn, '[Service]\nMemoryHigh=24G\nExecStart=/another/broker\n'); f.states[BROKER].DropInPaths = dropIn;
+    expect(() => f.host.prepareDirectBroker(f.record)).toThrow(/memory drop-ins/);
     expect(fs.readFileSync(f.brokerFile, 'utf8')).toBe(f.brokerUnit);
     expect(f.events).toEqual([]);
   });

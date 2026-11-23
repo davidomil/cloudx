@@ -11,6 +11,7 @@ import { CloudxUpdatePanel, type CloudxUpdateController } from "./CloudxUpdatePa
 import { ForgeConnections } from "./ForgeConnections.js";
 import { AgentAccountsPanel, type AgentLoginTab } from "./AgentAccountsPanel.js";
 import { TerminalPreferencesPanel } from "./TerminalPreferencesPanel.js";
+import { TerminalMemoryPanel } from "./TerminalMemoryPanel.js";
 import { ClaudeSettingsPanel } from "./ClaudeSettingsPanel.js";
 import { AgentPricingPanel } from "./AgentPricingPanel.js";
 import { LogsPanel } from "./LogsPanel.js";
@@ -174,8 +175,11 @@ export function SettingsDialog({
   categories.push({
     id: "terminal",
     label: "Terminal",
-    description: "Browser host input, links, attachments and terminal display.",
-    entries: [{ id: "host-preferences", searchText: "Terminal host Option Meta font scrollback links citations attachments Shift Enter newline clipboard native shortcuts", content: <TerminalPreferencesPanel />, mountWhenVisible: true }]
+    description: "Terminal display, input and persistent service memory limits.",
+    entries: [
+      { id: "host-preferences", searchText: "Terminal host Option Meta font scrollback links citations attachments Shift Enter newline clipboard native shortcuts", content: <TerminalPreferencesPanel />, mountWhenVisible: true },
+      { id: "service-memory", searchText: "Terminal service broker agent children memory RAM limits MemoryHigh MemoryMax threshold ceiling pressure throttling OOM systemd cgroup inherited effective overrides unlimited GiB", content: <TerminalMemoryPanel />, mountWhenVisible: true }
+    ]
   });
   if (rulesSkillsStore) categories[0].entries.push({
     id: "default-template",
@@ -369,7 +373,7 @@ export function SettingsDialog({
           </div>
         </div>
         <footer className="settings-footer">
-          <small>{callHook ? "Save applies CloudX changes. Save Codex settings in the Codex section." : "Save applies changes across all tabs."}</small>
+          <small>{callHook ? "Save applies CloudX changes. Save Codex settings in the Codex section. Apply terminal memory in the Terminal section." : "Save applies CloudX changes. Apply terminal memory in the Terminal section."}</small>
           <div className="dialog-actions">
             <ControlButton onClick={onCancel} disabled={busy}>Cancel</ControlButton>
             <ControlButton className="primary-button" tone="primary" onClick={() => void save()} disabled={busy}>{busy ? "Saving…" : "Save"}</ControlButton>

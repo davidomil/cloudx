@@ -13,6 +13,7 @@ import { InstallerRunner, prepareManagedRelease, activateManagedServices, waitFo
 import { inspectUpdateTarget, updateCommit, documentationReadinessUrl, updatePort, SERVICE_NAMES } from './install-update.mjs';
 import { inspectRuntimeServices, inspectRuntimeUpdate, prepareRuntimeUpdate, assertUpdaterOutsideServices, assertStoppedService, inspectTerminalService } from './install-runtime.mjs';
 import { assertTerminalMigrationSafe } from './terminal-upgrade-recovery.mjs';
+import { assertTerminalMemoryDropIns } from './terminal-memory-policy.mjs';
 import { parseEnvironmentFile, updateEnvironmentFile } from './installer-environment.mjs';
 import { writeUpdateJson, snapshotTree, verifySnapshot, restoreSnapshot, syncDirectory, hashFile, estimateSnapshot, manifestTree, filesystemCapacity, capacityMessage, publicUpdateCapacity } from './managed-update-store.mjs';
 
@@ -332,11 +333,13 @@ export class UpdateHost {
       const separator = line.indexOf('=');
       return [line.slice(0, separator), line.slice(separator + 1)];
     }));
-    if (config.DropInPaths !== '' || !path.isAbsolute(config.FragmentPath ?? ''))
-      throw publicFailure('services', 'The direct-terminal target requires one owned terminal broker unit without drop-ins.');
+    if (!path.isAbsolute(config.FragmentPath ?? ''))
+      throw publicFailure('services', 'The direct-terminal target requires one owned terminal broker unit.');
+    try { assertTerminalMemoryDropIns(config.DropInPaths, { systemdDir: this.paths.systemdDir, home: this.home }); }
+    catch (error) { throw publicFailure('services', `The direct-terminal target requires safe terminal broker memory drop-ins. ${error.message}`, error); }
     const file = fs.realpathSync(config.FragmentPath);
     if (expectedFile && file !== expectedFile)
-      throw publicFailure('services', 'The direct-terminal target requires one owned terminal broker unit without drop-ins.');
+      throw publicFailure('services', 'The direct-terminal target requires one owned terminal broker unit.');
     assertOwnedBrokerFile(file, this.paths.systemdDir);
     return { file, state: Object.entries(state).map(([key, value]) => `${key}=${value}`).join('\n') };
   }

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   InstallerRunner,
   parseArgs,
@@ -34,11 +34,10 @@ it("reports the Forge worker before staging an update and lets a recovered worke
   fs.writeFileSync(stateFile, JSON.stringify([{ ...worker, mergeAttempted: undefined }]));
   expect(f.updater.start(TARGET_COMMIT)).toMatchObject({ available: true, run: { state: "running" } });
 });
-afterEach(() =>
-  temporary
-    .splice(0)
-    .forEach((dir) => fs.rmSync(dir, { recursive: true, force: true })),
-);
+afterEach(() => {
+  vi.unstubAllEnvs();
+  temporary.splice(0).forEach((dir) => fs.rmSync(dir, { recursive: true, force: true }));
+});
 
 function installation({ home, checkout = "checkout" } = {}) {
   if (!home) {
@@ -46,6 +45,7 @@ function installation({ home, checkout = "checkout" } = {}) {
     temporary.push(home);
   }
   const repoRoot = path.join(home, checkout);
+  vi.stubEnv("XDG_RUNTIME_DIR", path.join(home, "runtime"));
   const dataDir = path.join(repoRoot, ".cloudx");
   const systemdDir = path.join(home, ".config/systemd/user");
   const envPath = path.join(home, ".config/cloudx/cloudx.env");
@@ -111,6 +111,7 @@ function installation({ home, checkout = "checkout" } = {}) {
                   MainPID: "123",
                   ControlGroup: "/user.slice/cloudx.service",
                   ...host.service,
+                  ...host.services?.[name],
                 };
           return Object.entries(state)
             .map(([key, value]) => `${key}=${value}`)
@@ -158,6 +159,34 @@ function installation({ home, checkout = "checkout" } = {}) {
 }
 
 describe("installed Settings updater", () => {
+  it("keeps Settings update preflight available with terminal memory properties", () => {
+    const f = installation();
+    expect(f.updater.preflight()).toBeUndefined();
+    vi.stubEnv("XDG_CONFIG_HOME", path.join(f.home, ".config"));
+    vi.stubEnv("XDG_RUNTIME_DIR", path.join(f.home, "runtime"));
+    const files = [["MemoryHigh", "59055800320"], ["MemoryMax", "68719476736"]].map(([property, value]) => {
+      const file = path.join(f.home, ".config/systemd/user.control/cloudx-terminal.service.d", `50-${property}.conf`);
+      fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, `[Service]\n${property}=${value}\n`);
+      return file;
+    });
+    f.host.services = { "cloudx-terminal.service": { DropInPaths: files.join(" ") } };
+    expect(f.updater.preflight()).toBeUndefined();
+    expect(f.updater.status()).toEqual({ available: true });
+    expect(f.updater.start(TARGET_COMMIT)).toMatchObject({ available: true, run: { state: "running" } });
+  });
+
+  it("disables Settings update preflight for an execution-changing terminal drop-in", () => {
+    const f = installation();
+    vi.stubEnv("XDG_CONFIG_HOME", path.join(f.home, ".config"));
+    vi.stubEnv("XDG_RUNTIME_DIR", path.join(f.home, "runtime"));
+    const file = path.join(f.systemdDir, "cloudx-terminal.service.d/override.conf");
+    fs.mkdirSync(path.dirname(file)); fs.writeFileSync(file, "[Service]\nMemoryHigh=24G\nExecStart=/another/broker\n");
+    f.host.services = { "cloudx-terminal.service": { DropInPaths: file } };
+    expect(f.updater.preflight()).toContain("standard installed");
+    expect(f.updater.start(TARGET_COMMIT)).toMatchObject({ available: false });
+    expect(f.calls.some(([command]) => command === "systemd-run")).toBe(false);
+  });
+
   it("remeasures capacity without advancing a saved failed run or changing its target", () => {
     const { updater, host, calls } = installation();
     const started = updater.start(TARGET_COMMIT);
