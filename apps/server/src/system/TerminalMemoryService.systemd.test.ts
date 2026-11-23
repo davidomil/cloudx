@@ -84,6 +84,37 @@ it.skipIf(!supportedHost)("raises terminal memory limits live with the same brok
   }
 }, 45_000);
 
+it.skipIf(!supportedHost)("verifies unaligned local limits while reporting tighter inherited slice limits", async () => {
+  const inherited = { memoryHigh: String(256 * 1024 ** 2), memoryMax: String(384 * 1024 ** 2) };
+  const fixture = await TerminalMemoryFixture.create({ parentLimits: inherited });
+  try {
+    const pageSize = BigInt(execFileSync("getconf", ["PAGESIZE"], { encoding: "utf8", timeout: 5000, maxBuffer: 1024, killSignal: "SIGKILL" }).trim());
+    expect(pageSize).toBeGreaterThan(1n);
+    const chosen = { memoryHigh: String(512 * 1024 ** 2 + 123), memoryMax: String(768 * 1024 ** 2 + 321) };
+    const rounded = {
+      memoryHigh: String(BigInt(chosen.memoryHigh) / pageSize * pageSize),
+      memoryMax: String(BigInt(chosen.memoryMax) / pageSize * pageSize)
+    };
+    expect(rounded).not.toEqual(chosen);
+    const original = fixture.identity();
+    const memory = new TerminalMemoryService({ repoRoot, unitName: fixture.unit });
+    const applied = await memory.apply(chosen);
+    expect(applied).toMatchObject({ manageable: true, limits: chosen, effective: inherited });
+    expect(fixture.cgroupLimits()).toEqual(rounded);
+    expect(fixture.identity()).toEqual(original);
+
+    await fixture.refreshUnit();
+    expect((await memory.status()).limits).toEqual(chosen);
+    expect(fixture.cgroupLimits()).toEqual(rounded);
+    expect(fixture.identity()).toEqual(original);
+    fixture.systemctl("restart", fixture.unit);
+    expect(fixture.identity().InvocationID).not.toBe(original.InvocationID);
+    const restarted = await new TerminalMemoryService({ repoRoot, unitName: fixture.unit }).status();
+    expect(restarted).toMatchObject({ manageable: true, limits: chosen, effective: inherited });
+    expect(fixture.cgroupLimits()).toEqual(rounded);
+  } finally { fixture.close(); }
+}, 30_000);
+
 it.skipIf(!supportedHost)("refuses a memory change that a later persistent operator override would shadow", async () => {
   const fixture = await TerminalMemoryFixture.create();
   try {
@@ -110,22 +141,31 @@ it.skipIf(!supportedHost)("refuses a memory change that a later persistent opera
 
 class TerminalMemoryFixture {
   private unitInstalled = false;
+  private sliceInstalled = false;
   readonly directory = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-terminal-memory-"));
   readonly unit = `cloudx-terminal-memory-${randomUUID()}.service`;
+  readonly slice = `cloudxmemory${randomUUID().replaceAll("-", "")}.slice`;
   readonly configHome = process.env.XDG_CONFIG_HOME ?? path.join(os.homedir(), ".config");
   readonly unitPath = path.join(this.configHome, "systemd/user", this.unit);
+  readonly slicePath = path.join(this.configHome, "systemd/user", this.slice);
   readonly envPath = path.join(this.directory, "broker.env");
   readonly dataDir = path.join(this.directory, "profile");
   readonly socketPath = terminalSocketPath(this.dataDir);
   readonly terminals = new DurableTerminalProcessFactory(this.socketPath, new NodePtyTerminalProcessFactory());
 
-  static async create(): Promise<TerminalMemoryFixture> {
+  static async create({ parentLimits }: { parentLimits?: { memoryHigh: string; memoryMax: string } } = {}): Promise<TerminalMemoryFixture> {
     const fixture = new TerminalMemoryFixture();
     try {
       if (!fs.existsSync(path.join(repoRoot, "apps/server/dist/terminal/broker.js"))) {
         throw new Error("Build the shared, plugin-api, and server workspaces before running the real systemd terminal memory check.");
       }
       fs.mkdirSync(path.dirname(fixture.unitPath), { recursive: true });
+      if (parentLimits) {
+        fs.writeFileSync(fixture.slicePath,
+          `[Unit]\nDescription=Isolated CloudX terminal memory test slice\n[Slice]\nMemoryHigh=${parentLimits.memoryHigh}\nMemoryMax=${parentLimits.memoryMax}\n`,
+          { mode: 0o600, flag: "wx" });
+        fixture.sliceInstalled = true;
+      }
       fs.writeFileSync(fixture.envPath, `CLOUDX_DATA_DIR=${fixture.dataDir}\n`, { mode: 0o600, flag: "wx" });
       await fixture.refreshUnit();
       fixture.systemctl("start", fixture.unit);
@@ -138,7 +178,8 @@ class TerminalMemoryFixture {
 
   async refreshUnit(): Promise<void> {
     const { renderTerminalService } = await import(new URL("../../../../scripts/install-cloudx.mjs", import.meta.url).href);
-    fs.writeFileSync(this.unitPath, renderTerminalService({ repoRoot, envPath: this.envPath, nodePath: process.execPath }), { mode: 0o600 });
+    const service = renderTerminalService({ repoRoot, envPath: this.envPath, nodePath: process.execPath });
+    fs.writeFileSync(this.unitPath, this.sliceInstalled ? service.replace("[Service]\n", `[Service]\nSlice=${this.slice}\n`) : service, { mode: 0o600 });
     this.unitInstalled = true;
     this.systemctl("daemon-reload");
   }
@@ -157,8 +198,8 @@ class TerminalMemoryFixture {
   }
 
   systemctl(...args: string[]): string {
-    if (["start", "stop", "restart", "set-property", "reset-failed"].includes(args[0]!) && args[1] !== this.unit) {
-      throw new Error("The terminal memory integration check may only mutate its uniquely named fixture service.");
+    if (["start", "stop", "restart", "set-property", "reset-failed"].includes(args[0]!) && ![this.unit, this.slice].includes(args[1]!)) {
+      throw new Error("The terminal memory integration check may only mutate its uniquely named fixture service and slice.");
     }
     return execFileSync("systemctl", ["--user", ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15_000 });
   }
@@ -169,14 +210,16 @@ class TerminalMemoryFixture {
       if (stopped.status !== 0) {
         throw new Error(`Could not stop ${this.unit}. Retained fixture files at ${this.directory} and ${this.unitPath}. ${stopped.stderr?.trim() ?? stopped.error?.message ?? ""}`);
       }
+      if (this.sliceInstalled) this.systemctl("stop", this.slice);
       fs.rmSync(this.unitPath, { force: true });
       fs.rmSync(`${this.unitPath}.d`, { recursive: true, force: true });
       for (const base of [this.configHome, process.env.XDG_RUNTIME_DIR].filter((value): value is string => Boolean(value))) {
         fs.rmSync(path.join(base, "systemd/user.control", `${this.unit}.d`), { recursive: true, force: true });
       }
       spawnSync("systemctl", ["--user", "reset-failed", this.unit], { stdio: "ignore", timeout: 5000 });
-      this.systemctl("daemon-reload");
     }
+    if (this.sliceInstalled) fs.rmSync(this.slicePath);
+    if (this.unitInstalled || this.sliceInstalled) this.systemctl("daemon-reload");
     fs.rmSync(path.dirname(this.socketPath), { recursive: true, force: true });
     fs.rmSync(this.directory, { recursive: true, force: true });
   }

@@ -28,6 +28,7 @@ function fixture() {
     FragmentPath: fragment, DropInPaths: "", MemoryHigh: "18446744073709551615", MemoryMax: "18446744073709551615",
     ControlGroup: "/user.slice/broker", MainPID: "42", InvocationID: "invocation" };
   const execute = vi.fn(async (_file: string, args: string[]) => {
+    if (_file === "getconf") return { stdout: "4096\n" };
     if (args.includes("show")) return { stdout: Object.entries(state).map(([key, value]) => `${key}=${value}`).join("\n") };
     for (const assignment of args.slice(-2)) {
       const [property, value] = assignment.split("=") as [string, string]; state[property] = value;
@@ -60,7 +61,7 @@ describe("terminal memory policy", () => {
     const f = fixture();
     const status = await f.service.apply({ memoryHigh: "55GiB", memoryMax: "64GiB" });
     expect(status.limits).toEqual({ memoryHigh: "59055800320", memoryMax: "68719476736" });
-    expect(f.execute.mock.calls[1]![1]).toEqual(["--user", "--no-pager", "set-property", "cloudx-terminal.service", "MemoryHigh=59055800320", "MemoryMax=68719476736"]);
+    expect(f.execute.mock.calls.find(call => call[1].includes("set-property"))![1]).toEqual(["--user", "--no-pager", "set-property", "cloudx-terminal.service", "MemoryHigh=59055800320", "MemoryMax=68719476736"]);
     expect(f.execute.mock.calls.flatMap(call => call[1])).not.toEqual(expect.arrayContaining(["restart", "--runtime"]));
     const reloaded = new TerminalMemoryService(f.options);
     expect((await reloaded.status()).limits).toEqual(status.limits);
@@ -166,6 +167,81 @@ describe("terminal memory policy", () => {
     await expect(f.service.apply({ memoryHigh: "1GiB", memoryMax: "2GiB" })).rejects.toThrow("effective cgroup memory limits could not be read");
   });
 
+  it.each(["memory.high", "memory.max"])("refuses success when systemd saves the selection but the live %s write fails", async property => {
+    const f = fixture(), execute = f.execute.getMockImplementation()!;
+    const oldLimit = String((property === "memory.high" ? 1 : 2) * 1024 ** 3);
+    f.write(path.join(f.group, property), oldLimit);
+    f.execute.mockImplementation(async (file, args) => {
+      const result = await execute(file, args);
+      if (args.includes("set-property")) f.write(path.join(f.group, property), oldLimit);
+      return result;
+    });
+    await expect(f.service.apply({ memoryHigh: "3GiB", memoryMax: "4GiB" })).rejects.toThrow(`live terminal cgroup ${property}`);
+    expect(f.state.MemoryHigh).toBe(String(3 * 1024 ** 3));
+    expect(f.state.MemoryMax).toBe(String(4 * 1024 ** 3));
+    expect(fs.readFileSync(path.join(f.group, property), "utf8")).toBe(oldLimit);
+    expect(f.execute.mock.calls.some(call => call[1].includes("restart"))).toBe(false);
+  });
+
+  it.each([4096, 65536])("accepts local page rounding at the detected %i-byte page size", async pageSize => {
+    const f = fixture(), execute = f.execute.getMockImplementation()!;
+    const high = 3n * 1024n ** 3n + 123n, max = 4n * 1024n ** 3n + 321n;
+    f.execute.mockImplementation(async (file, args) => {
+      if (file === "getconf") return { stdout: `${pageSize}\n` };
+      const result = await execute(file, args);
+      if (args.includes("set-property")) {
+        f.write(path.join(f.group, "memory.high"), String(high / BigInt(pageSize) * BigInt(pageSize)));
+        f.write(path.join(f.group, "memory.max"), String(max / BigInt(pageSize) * BigInt(pageSize)));
+      }
+      return result;
+    });
+    expect(await f.service.apply({ memoryHigh: String(high), memoryMax: String(max) })).toMatchObject({
+      limits: { memoryHigh: String(high), memoryMax: String(max) },
+      effective: { memoryHigh: String(high / BigInt(pageSize) * BigInt(pageSize)), memoryMax: String(max / BigInt(pageSize) * BigInt(pageSize)) }
+    });
+  });
+
+  it("accepts exact unaligned local byte values", async () => {
+    const f = fixture();
+    const limits = { memoryHigh: String(3n * 1024n ** 3n + 123n), memoryMax: String(4n * 1024n ** 3n + 321n) };
+    expect((await f.service.apply(limits)).limits).toEqual(limits);
+  });
+
+  it("verifies local limits without mistaking tighter ancestor constraints for failed writes", async () => {
+    const f = fixture();
+    f.write(path.join(path.dirname(f.group), "memory.high"), String(256 * 1024 ** 2));
+    f.write(path.join(path.dirname(f.group), "memory.max"), String(512 * 1024 ** 2));
+    expect(await f.service.apply({ memoryHigh: "3GiB", memoryMax: "4GiB" })).toMatchObject({
+      limits: { memoryHigh: String(3 * 1024 ** 3), memoryMax: String(4 * 1024 ** 3) },
+      effective: { memoryHigh: String(256 * 1024 ** 2), memoryMax: String(512 * 1024 ** 2) }
+    });
+  });
+
+  it("requires unlimited to reach the local cgroup even when an ancestor remains constrained", async () => {
+    const f = fixture(), execute = f.execute.getMockImplementation()!;
+    f.write(path.join(path.dirname(f.group), "memory.high"), "4096");
+    f.execute.mockImplementation(async (file, args) => {
+      const result = await execute(file, args);
+      if (args.includes("set-property")) f.write(path.join(f.group, "memory.high"), String(1024 ** 3));
+      return result;
+    });
+    await expect(f.service.apply({ memoryHigh: "infinity", memoryMax: "infinity" })).rejects.toThrow("live terminal cgroup memory.high");
+  });
+
+  it.each(["0", "not-a-page-size", "123"])("refuses a change before mutation when host page size is invalid: %s", async size => {
+    const f = fixture(), execute = f.execute.getMockImplementation()!;
+    f.execute.mockImplementation((file, args) => file === "getconf" ? Promise.resolve({ stdout: size }) : execute(file, args));
+    await expect(f.service.apply({ memoryHigh: "3GiB", memoryMax: "4GiB" })).rejects.toThrow("page size");
+    expect(f.execute.mock.calls.some(call => call[1].includes("set-property"))).toBe(false);
+  });
+
+  it("reports an actionable page-size query failure before changing the service", async () => {
+    const f = fixture(), execute = f.execute.getMockImplementation()!;
+    f.execute.mockImplementation((file, args) => file === "getconf" ? Promise.reject(new Error("ENOENT")) : execute(file, args));
+    await expect(f.service.apply({ memoryHigh: "3GiB", memoryMax: "4GiB" })).rejects.toThrow("getconf PAGESIZE runs for the CloudX service user");
+    expect(f.execute.mock.calls.some(call => call[1].includes("set-property"))).toBe(false);
+  });
+
   it("shows unsupported hosts and user-bus failures as unavailable", async () => {
     const f = fixture();
     expect(await new TerminalMemoryService({ ...f.options, platform: "darwin" }).status()).toMatchObject({ manageable: false, reason: expect.stringContaining("Linux") });
@@ -186,7 +262,7 @@ describe("terminal memory policy", () => {
       return result;
     });
     await expect(f.service.apply({ memoryHigh: "1GiB", memoryMax: "2GiB" })).rejects.toThrow(/refresh to inspect the current values/);
-    expect(f.execute.mock.calls.every(call => call[1].includes("show") || call[1].includes("set-property"))).toBe(true);
+    expect(f.execute.mock.calls.filter(call => call[0] === "systemctl").every(call => call[1].includes("show") || call[1].includes("set-property"))).toBe(true);
   });
 
   it("rejects overlapping changes and releases the guard after failure", async () => {

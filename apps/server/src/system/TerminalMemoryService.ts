@@ -12,7 +12,7 @@ const defaultRepoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 const properties = "LoadState,ActiveState,WorkingDirectory,FragmentPath,DropInPaths,MemoryHigh,MemoryMax,ControlGroup,MainPID,InvocationID";
 const unlimited = "18446744073709551615";
 
-type SystemctlCommand = (file: string, args: string[], options: {
+type HostCommand = (file: string, args: string[], options: {
   encoding: "utf8"; timeout: number; maxBuffer: number; killSignal: "SIGKILL";
 }) => Promise<{ stdout: string }>;
 
@@ -24,7 +24,7 @@ interface TerminalMemoryOptions {
   unitName?: string;
   cgroupRoot?: string;
   platform?: NodeJS.Platform;
-  execute?: SystemctlCommand;
+  execute?: HostCommand;
 }
 
 export class TerminalMemoryError extends Error {
@@ -40,7 +40,7 @@ export class TerminalMemoryService {
   private readonly unitName: string;
   private readonly cgroupRoot: string;
   private readonly platform: NodeJS.Platform;
-  private readonly execute: SystemctlCommand;
+  private readonly execute: HostCommand;
   private changing = false;
 
   constructor(options: TerminalMemoryOptions = {}) {
@@ -81,6 +81,7 @@ export class TerminalMemoryService {
       const before = await this.show();
       this.assertManageable(before);
       this.assertPersistenceOrder(before, limits);
+      const pageSize = before.ActiveState === "active" ? await this.readPageSize() : undefined;
       await this.command(["set-property", this.unitName, `MemoryHigh=${limits.memoryHigh}`, `MemoryMax=${limits.memoryMax}`]);
       const after = await this.show();
       const dropInPaths = this.assertManageable(after);
@@ -90,6 +91,7 @@ export class TerminalMemoryService {
       this.assertPersistenceOrder(after, limits);
       if (before.MainPID !== after.MainPID || before.InvocationID !== after.InvocationID)
         throw new Error("The terminal service changed process identity while the limits were applied.");
+      if (after.ActiveState === "active") this.assertLiveLimits(after, limits, pageSize);
       const status = this.describe(after, dropInPaths);
       if (after.ActiveState === "active" && (status.effective.memoryHigh === null || status.effective.memoryMax === null))
         throw new Error("The effective cgroup memory limits could not be read. Check read access to the service cgroup and its ancestors.");
@@ -106,6 +108,32 @@ export class TerminalMemoryService {
       encoding: "utf8", timeout: 10_000, maxBuffer: 256 * 1024, killSignal: "SIGKILL"
     });
     return result.stdout;
+  }
+
+  private async readPageSize(): Promise<bigint> {
+    let stdout: string;
+    try { ({ stdout } = await this.execute("getconf", ["PAGESIZE"], {
+      encoding: "utf8", timeout: 5_000, maxBuffer: 1024, killSignal: "SIGKILL"
+    })); }
+    catch { throw new Error("Could not read the host page size. Check that getconf PAGESIZE runs for the CloudX service user."); }
+    const value = stdout.trim();
+    const size = /^\d+$/.test(value) ? BigInt(value) : 0n;
+    if (size <= 0n || (size & (size - 1n)) !== 0n)
+      throw new Error("Could not determine the host page size from getconf PAGESIZE.");
+    return size;
+  }
+
+  private assertLiveLimits(state: Record<string, string>, limits: TerminalMemoryLimits, pageSize: bigint | undefined): void {
+    const group = this.groupPath(state.ControlGroup);
+    if (!group || !pageSize) throw new Error("Cannot verify the live terminal cgroup limits without its path and host page size.");
+    for (const [property, requested] of [["memory.high", limits.memoryHigh], ["memory.max", limits.memoryMax]] as const) {
+      const actual = limitValue(readOptional(path.join(group, property))?.trim());
+      // Match systemd's exact-byte or PAGE_ALIGN_DOWN kernel comparison.
+      const rounded = requested === "infinity" ? requested : String(BigInt(requested) / pageSize * pageSize);
+      if (actual !== requested && actual !== rounded)
+        throw new Error(`The live terminal cgroup ${property} is ${actual ?? "unreadable"}; requested ${requested} bytes (${rounded} after page rounding). ` +
+          "Systemd saved the configuration but the kernel limit was not verified. Check memory-controller delegation and the terminal service journal.");
+    }
   }
 
   private async show(): Promise<Record<string, string>> {

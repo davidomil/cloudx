@@ -49,9 +49,15 @@ also checks whether a later operator drop-in would override the selection on
 reload or reboot. A conflict names the file that the operator must inspect;
 CloudX preserves that file and refuses the change.
 After application, CloudX reads back the service values and persistent property
-files, and checks that the broker PID and invocation identity remain unchanged. This operation
-does not request a broker restart. If application or persistence verification
-fails, Settings reports the failure and asks the operator to refresh; some
+files, and checks that the broker PID and invocation identity remain unchanged.
+For a running broker, it also verifies the service's own `memory.high` and
+`memory.max` against the selection. It accepts exact bytes or values rounded down
+to the host page size, matching systemd 255's
+[kernel limit comparison](https://github.com/systemd/systemd/blob/v255/src/core/cgroup.c#L419).
+CloudX reads that page size with `getconf PAGESIZE` before changing an active
+service. Tighter ancestor constraints remain separate effective readings.
+This operation does not request a broker restart. If application or persistence
+verification fails, Settings reports the failure and asks the operator to refresh; some
 properties can already have changed. The systemd 255
 [`set-property` reference](https://www.freedesktop.org/software/systemd/man/255/systemctl.html#set-property%20UNIT%20PROPERTY=VALUE%E2%80%A6)
 specifies immediate application and persistence across boots when `--runtime`
@@ -67,8 +73,9 @@ filename. Persistent `user.control` precedes runtime `user.control`. These are
 systemd's [documented user unit paths](https://www.freedesktop.org/software/systemd/man/255/systemd.unit.html#Unit%20File%20Load%20Path).
 
 The installer refreshes unit fragments and preserves these separate drop-in
-files. Managed updates also preserve them. The direct-terminal update path and
-Settings share `scripts/terminal-memory-policy.mjs` to allow only verified
+files. Managed updates also preserve them. Standard update selection, the
+direct-terminal update path, and Settings share
+`scripts/terminal-memory-policy.mjs` to allow only verified
 memory-only overrides in the terminal unit's user configuration or runtime
 directories. The checks reject foreign owners, linked paths, world-writable
 files/directories, and directives outside `[Service]` `MemoryHigh`/`MemoryMax`.
