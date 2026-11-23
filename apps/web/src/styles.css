@@ -1331,9 +1331,12 @@ a:hover svg {
   padding: 4px;
 }
 
+.pane-tabbar > .tab-strip {
+  flex: 1 1 0;
+}
+
 .tab-strip {
   position: relative;
-  flex: 1 1 0;
   min-width: 0;
   min-height: 44px;
   display: flex;

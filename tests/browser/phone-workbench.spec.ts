@@ -1,9 +1,11 @@
 import { expect, test, type Page, type WebSocketRoute } from "@playwright/test";
 import react from "@vitejs/plugin-react";
 import { createServer as createHttpServer, type Server } from "node:http";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { createServer, type ViteDevServer } from "vite";
+import type { Terminal } from "@xterm/xterm";
 import type {
   PluginDescriptor,
   TabLayoutState,
@@ -19,12 +21,19 @@ const evidenceDirectory = path.join(
 let server: ViteDevServer;
 let httpServer: Server;
 let baseUrl: string;
+let cacheDirectory: string;
+const terminalOutput = [
+  "Phone workbench simulation",
+  "Ready for terminal input > ",
+];
 
 test.beforeAll(async () => {
+  cacheDirectory = await mkdtemp(path.join(os.tmpdir(), "cloudx-phone-vite-"));
   httpServer = createHttpServer();
   server = await createServer({
     configFile: false,
     root: repoRoot,
+    cacheDir: cacheDirectory,
     plugins: [react()],
     resolve: {
       alias: {
@@ -49,12 +58,13 @@ test.afterAll(async () => {
   await new Promise<void>((resolve, reject) =>
     httpServer.close((error) => (error ? reject(error) : resolve())),
   );
+  await rm(cacheDirectory, { recursive: true, force: true });
 });
 
 async function openWorkbench(
   page: Page,
   pluginId = "codex-terminal",
-  options: { multiplePanes?: boolean; voice?: boolean } = {},
+  options: { multiplePanes?: boolean; voice?: boolean; uiScale?: number } = {},
 ) {
   const updatedAt = "2026-11-23T09:00:00Z";
   const tabs: WorkspaceTab[] = Array.from({ length: 8 }, (_, index) => ({
@@ -204,7 +214,7 @@ async function openWorkbench(
           plugins: [],
           values: {
             global: {
-              uiScale: 100,
+              uiScale: options.uiScale ?? 100,
               aiControlEnabled: options.voice === true,
               voiceCommandsEnabled: options.voice === true,
               microphoneEnabled: false,
@@ -257,7 +267,7 @@ async function openWorkbench(
     socket.send(
       JSON.stringify({
         type: "data",
-        data: "Phone workbench simulation\r\nReady for terminal input > ",
+        data: terminalOutput.join("\r\n"),
       }),
     );
     socket.onMessage((message) => {
@@ -343,6 +353,81 @@ async function recordLayout(page: Page, name: string) {
   });
 }
 
+async function expectUsableTerminal(page: Page) {
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
+  const panel = page.locator(".terminal-panel:visible");
+  for (const line of terminalOutput)
+    await expect(panel.locator(".xterm-rows")).toContainText(line.trimEnd());
+  const geometry = await page.evaluate((output) => {
+    const terminal = (window as unknown as { phoneTerminals: Terminal[] })
+      .phoneTerminals[0];
+    const element = terminal.element!;
+    const panel = element.parentElement!.getBoundingClientRect();
+    const screen = element
+      .querySelector(".xterm-screen")!
+      .getBoundingClientRect();
+    const row = element
+      .querySelector(".xterm-rows > div")!
+      .getBoundingClientRect();
+    const padding = getComputedStyle(element);
+    const buffer = terminal.buffer.active;
+    let visibleOutput = "";
+    for (
+      let index = buffer.viewportY;
+      index < buffer.viewportY + terminal.rows;
+      index++
+    ) {
+      const wrapped = buffer.getLine(index + 1)?.isWrapped;
+      visibleOutput += buffer.getLine(index)?.translateToString(!wrapped) ?? "";
+      if (!wrapped) visibleOutput += "\n";
+    }
+    return {
+      fontSize: terminal.options.fontSize,
+      rows: terminal.rows,
+      cols: terminal.cols,
+      renderedRows: element.querySelector(".xterm-rows")!.children.length,
+      cellHeight: row.height,
+      screenHeight: screen.height,
+      screenTop: screen.top,
+      screenBottom: screen.bottom,
+      screenRight: screen.right,
+      paddedTop: panel.top + parseFloat(padding.paddingTop),
+      paddedBottom: panel.bottom - parseFloat(padding.paddingBottom),
+      paddedRight: panel.right - parseFloat(padding.paddingRight),
+      availableHeight:
+        panel.height -
+        parseFloat(padding.paddingTop) -
+        parseFloat(padding.paddingBottom),
+      outputRows: output.reduce(
+        (rows, line) => rows + Math.ceil(line.length / terminal.cols),
+        0,
+      ),
+      visibleOutput,
+    };
+  }, terminalOutput);
+  await test.info().attach(`terminal-geometry-${geometry.fontSize}px`, {
+    body: JSON.stringify(geometry, null, 2),
+    contentType: "application/json",
+  });
+  expect(geometry.rows).toBeGreaterThanOrEqual(geometry.outputRows);
+  expect(geometry.visibleOutput).toContain(terminalOutput.join("\n").trimEnd());
+  expect(geometry.renderedRows).toBe(geometry.rows);
+  expect(geometry.cellHeight).toBeGreaterThan(0);
+  expect(
+    Math.abs(geometry.screenHeight - geometry.rows * geometry.cellHeight),
+  ).toBeLessThanOrEqual(1);
+  expect(geometry.screenTop).toBeGreaterThanOrEqual(geometry.paddedTop - 1);
+  expect(geometry.screenBottom).toBeLessThanOrEqual(geometry.paddedBottom + 1);
+  expect(geometry.screenRight).toBeLessThanOrEqual(geometry.paddedRight + 1);
+  expect(geometry.availableHeight - geometry.screenHeight).toBeLessThan(
+    geometry.cellHeight + 1,
+  );
+  await expect(
+    page.getByRole("group", { name: "Terminal keyboard shortcuts" }),
+  ).toBeInViewport({ ratio: 1 });
+  return geometry;
+}
+
 for (const viewport of [
   { width: 320, height: 568 },
   { width: 390, height: 844 },
@@ -372,13 +457,7 @@ for (const viewport of [
             .evaluate((element) => element.getBoundingClientRect().bottom),
         )
         .toBeLessThanOrEqual(viewport.height + 1);
-      expect(
-        await page.evaluate(
-          () =>
-            (window as unknown as { phoneTerminals: Array<{ rows: number }> })
-              .phoneTerminals[0].rows,
-        ),
-      ).toBeGreaterThanOrEqual(8);
+      await expectUsableTerminal(page);
       await expect(
         page.getByRole("button", { name: "Add tab to this pane", exact: true }),
       ).toBeInViewport();
@@ -393,6 +472,27 @@ for (const viewport of [
     });
   }
 }
+
+test("larger terminal font keeps phone output and controls usable", async ({
+  page,
+  isMobile,
+}) => {
+  test.skip(!isMobile, "Phone terminal font metrics.");
+  await page.setViewportSize({ width: 844, height: 390 });
+  const settings = { uiScale: 100 };
+  const fixture = await openWorkbench(page, "codex-terminal", settings);
+  const normal = await expectUsableTerminal(page);
+  settings.uiScale = 150;
+  await page.reload();
+  const larger = await expectUsableTerminal(page);
+  expect(larger.fontSize).toBeGreaterThan(normal.fontSize);
+  expect(larger.cellHeight).toBeGreaterThan(normal.cellHeight);
+  expect(larger.rows).toBeLessThan(normal.rows);
+  await page.getByRole("button", { name: "Send Escape", exact: true }).tap();
+  await expect
+    .poll(() => fixture.inputs.map((input) => input.data).join(""))
+    .toBe("\x1b");
+});
 
 test("touch swipes reach the last Codex tab while pane actions stay pinned and usage stays dismissed", async ({
   page,
