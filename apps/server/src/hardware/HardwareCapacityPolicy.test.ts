@@ -38,6 +38,14 @@ function reconciliationReceipt(id: string): StoredHardwareReceipt {
   saved.receipt.state = "succeeded"; saved.receipt.finishedAt = at; saved.receipt.result = { reconciled: true };
   return saved;
 }
+function reconciliationNearStateLimit() {
+  const before = heldState(), saved = reconciliationReceipt("near-state-limit");
+  const pending = { ...before, receipts: [saved] };
+  const bookkeepingReserve = policy.accountedBytes(pending, "bookkeeping") - Buffer.byteLength(JSON.stringify(pending)) - 1;
+  const receiptBytes = Buffer.byteLength(JSON.stringify(saved)) + 1;
+  fillToBytes(before, HARDWARE_STATE_BYTES - bookkeepingReserve - receiptBytes - 16 * 1024);
+  return { before, saved, reconciled: { ...before, receipts: [...before.receipts, saved] } };
+}
 
 describe("Hardware completion and cleanup byte allowances", () => {
   it("admits durable reconciliation above ordinary request and byte limits while ordinary work stays blocked", () => {
@@ -57,12 +65,7 @@ describe("Hardware completion and cleanup byte allowances", () => {
   });
 
   it("charges reconciliation as bookkeeping and preserves final cleanup space at the durable state limit", () => {
-    const before = heldState(), saved = reconciliationReceipt("near-state-limit");
-    const pending = { ...before, receipts: [saved] };
-    const bookkeepingReserve = policy.accountedBytes(pending, "bookkeeping") - Buffer.byteLength(JSON.stringify(pending)) - 1;
-    const receiptBytes = Buffer.byteLength(JSON.stringify(saved)) + 1;
-    fillToBytes(before, HARDWARE_STATE_BYTES - bookkeepingReserve - receiptBytes - 16 * 1024);
-    const reconciled = { ...before, receipts: [...before.receipts, saved] };
+    const { before, reconciled } = reconciliationNearStateLimit();
     expect(policy.accountedBytes(reconciled, "bookkeeping")).toBe(HARDWARE_STATE_BYTES - 16 * 1024);
     expect(policy.accountedBytes(reconciled, "cleanup")).toBeGreaterThan(HARDWARE_STATE_BYTES);
     expect(() => policy.assertMutation(before, reconciled)).not.toThrow();
@@ -72,13 +75,18 @@ describe("Hardware completion and cleanup byte allowances", () => {
     acknowledgedOverride(final, "final-after-reconciliation");
     expect(() => policy.assertMutation(reconciled, final)).not.toThrow();
     expect(() => validateHardwareState(final)).not.toThrow();
-    const enlarged = (bytes: number) => ({ ...reconciled, receipts: [...before.receipts, { ...saved, receipt: { ...saved.receipt, result: { reconciled: true, evidence: "x".repeat(bytes) } } }] });
-    const spendsCleanupReserve = enlarged(32 * 1024);
-    expect(Buffer.byteLength(JSON.stringify(spendsCleanupReserve)) + 1).toBeLessThan(HARDWARE_STATE_BYTES);
-    expect(() => policy.assertMutation(before, spendsCleanupReserve)).toThrow(expect.objectContaining({ code: "CAPACITY_EXCEEDED" }));
-    const exceedsStateLimit = enlarged(1024 * 1024);
-    expect(Buffer.byteLength(JSON.stringify(exceedsStateLimit)) + 1).toBeGreaterThan(HARDWARE_STATE_BYTES);
-    expect(() => policy.assertMutation(before, exceedsStateLimit)).toThrow(expect.objectContaining({ code: "CAPACITY_EXCEEDED" }));
+  });
+
+  it.each([
+    { violation: "spends reserved cleanup space", evidenceBytes: 32 * 1024, exceedsStateLimit: false },
+    { violation: "exceeds the durable state limit", evidenceBytes: 1024 * 1024, exceedsStateLimit: true },
+  ])("rejects reconciliation that $violation", ({ evidenceBytes, exceedsStateLimit }) => {
+    const { before, saved, reconciled } = reconciliationNearStateLimit();
+    const enlarged = { ...reconciled, receipts: [...before.receipts, { ...saved, receipt: { ...saved.receipt, result: { reconciled: true, evidence: "x".repeat(evidenceBytes) } } }] };
+    const bytes = Buffer.byteLength(JSON.stringify(enlarged)) + 1;
+    if (exceedsStateLimit) expect(bytes).toBeGreaterThan(HARDWARE_STATE_BYTES);
+    else expect(bytes).toBeLessThan(HARDWARE_STATE_BYTES);
+    expect(() => policy.assertMutation(before, enlarged)).toThrow(expect.objectContaining({ code: "CAPACITY_EXCEEDED" }));
   });
 
   it("leaves completion space for a running result and separately saved status observations", () => {
