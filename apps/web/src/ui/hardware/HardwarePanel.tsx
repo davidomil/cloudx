@@ -38,6 +38,7 @@ import "./hardware.css";
 
 type View =
   "inventory" | "reservations" | "catalogs" | "statuses" | "editor" | "access";
+type PanelState = HardwareStateView & { retainedInventory?: true };
 export interface HardwarePanelProps {
   tab?: WorkspaceTab;
   tabs?: WorkspaceTab[];
@@ -50,7 +51,7 @@ export function HardwarePanel({
   windows,
   onOpenOwner,
 }: HardwarePanelProps) {
-  const [state, setState] = useState<HardwareStateView>();
+  const [state, setState] = useState<PanelState>();
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<{
     message: string;
@@ -68,13 +69,23 @@ export function HardwarePanel({
   const alive = useRef(true);
   const running = useRef(false);
   const observationStopped = useRef(false);
+  const stateRequest = useRef(0);
   const drafts = useRef(new Map<string, ItemEditDraft>());
   const statusDrafts = useRef(new Map<string, StatusEditDraft>());
-  const install = useCallback((next: HardwareStateView) => {
-    if (alive.current) {
-      setState((current) =>
-        current && current.revision > next.revision ? current : next,
-      );
+  const install = useCallback((next: HardwareStateView, request: number) => {
+    if (alive.current && request === stateRequest.current) {
+      setState((current) => {
+        if (!current || current.revision <= next.revision) return next;
+        if (next.readiness.state === "unavailable")
+          return {
+            ...current,
+            readiness: next.readiness,
+            currentOwner: next.currentOwner,
+            agentReadiness: next.agentReadiness,
+            retainedInventory: true,
+          };
+        return current.retainedInventory ? next : current;
+      });
       setConnected(true);
     }
   }, []);
@@ -90,13 +101,18 @@ export function HardwarePanel({
     let timer: ReturnType<typeof setTimeout>;
     async function observe() {
       if (observationStopped.current) return;
+      const request = ++stateRequest.current;
       try {
         const next = await getHardwareState(abort.signal);
         if (abort.signal.aborted || observationStopped.current) return;
-        install(next);
+        install(next, request);
         timer = setTimeout(() => void observe(), 2000);
       } catch (cause) {
         if (!abort.signal.aborted) {
+          if (request !== stateRequest.current) {
+            timer = setTimeout(() => void observe(), 2000);
+            return;
+          }
           observationStopped.current = true;
           setConnected(false);
           setError({
@@ -124,7 +140,8 @@ export function HardwarePanel({
       action: string,
       input: Record<string, unknown>,
     ): Promise<OperationReceipt | undefined> => {
-      if (running.current || !connected) return;
+      if (running.current || !connected || state?.readiness.state !== "ready")
+        return;
       const requestId = hardwareRequestId();
       running.current = true;
       setBusy(true);
@@ -149,9 +166,11 @@ export function HardwarePanel({
             code: result.receipt.error?.code,
             requestId,
           });
+        const request = ++stateRequest.current;
         try {
-          install(await getHardwareState());
+          install(await getHardwareState(), request);
         } catch (cause) {
+          if (request !== stateRequest.current) return result.receipt;
           observationStopped.current = true;
           setConnected(false);
           setError({
@@ -181,7 +200,7 @@ export function HardwarePanel({
         if (alive.current) setBusy(false);
       }
     },
-    [connected, install],
+    [connected, install, state?.readiness.state],
   );
   async function inspectReceipt(requestId: string) {
     setBusy(true);
@@ -209,17 +228,21 @@ export function HardwarePanel({
     running.current = true;
     setBusy(true);
     setError(undefined);
+    const request = ++stateRequest.current;
     try {
-      install(await reconcileHardwareStorage(hardwareRequestId()));
+      install(await reconcileHardwareStorage(hardwareRequestId()), request);
     } catch (cause) {
+      if (request !== stateRequest.current) return;
       if (alive.current)
         setError({
           message: cause instanceof Error ? cause.message : String(cause),
           code: cause instanceof HardwareApiError ? cause.code : undefined,
         });
+      const refreshedRequest = ++stateRequest.current;
       try {
-        install(await getHardwareState());
+        install(await getHardwareState(), refreshedRequest);
       } catch {
+        if (refreshedRequest !== stateRequest.current) return;
         observationStopped.current = true;
         if (alive.current) setConnected(false);
       }
@@ -256,6 +279,7 @@ export function HardwarePanel({
             size="compact"
             disabled={busy}
             onClick={() => {
+              stateRequest.current++;
               setError(undefined);
               setConnected(false);
               setConnectionEpoch((value) => value + 1);
@@ -351,6 +375,13 @@ export function HardwarePanel({
           {!connected ? (
             <p className="hardware-banner warning" role="status">
               Disconnected. Current values are a saved view. Reconnect before
+              making changes.
+            </p>
+          ) : null}
+          {state.retainedInventory ? (
+            <p className="hardware-banner warning" role="status">
+              Retained inventory is shown for inspection. The current Hardware
+              service could not confirm this inventory. Reconcile storage before
               making changes.
             </p>
           ) : null}
@@ -470,7 +501,7 @@ export function HardwarePanel({
           <footer className="hardware-footer">
             <span>
               {connected
-                ? `Current snapshot · revision ${state.revision}`
+                ? `${state.retainedInventory ? "Retained inventory" : "Current snapshot"} · revision ${state.revision}`
                 : "Offline snapshot"}
             </span>
             <span>Skills support Codex, Claude, and Forge executions.</span>

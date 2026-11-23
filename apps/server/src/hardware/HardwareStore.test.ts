@@ -197,6 +197,150 @@ describe("durable Hardware authority", () => {
     await expect(broken.init()).rejects.toMatchObject({ code: "STORE_UNAVAILABLE" });
   });
 
+  it.each([false, true])("rejects an outside directory symlink without touching files or acquiring its writer lock (existing lock: %s)", async existingLock => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "hardware-directory-")); roots.push(root);
+    const data = path.join(root, "data"), outside = path.join(root, "outside"), lock = path.join(outside, ".writer-lock");
+    await fs.mkdir(data); await fs.mkdir(outside);
+    if (existingLock) await fs.writeFile(lock, "outside writer evidence");
+    await fs.symlink(outside, path.join(data, "hardware"));
+    const store = new HardwareStore(data); stores.push(store);
+    const acquire = vi.spyOn(HardwareWriterLease.prototype, "acquire");
+    await expect(store.init()).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { phase: "directory_open" } });
+    await expect(store.reconcile()).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { phase: "directory_open" } });
+    expect(acquire).not.toHaveBeenCalled();
+    expect(() => store.assertHeld()).toThrow(expect.objectContaining({ code: "WRITER_LOST" }));
+    expect(await fs.readdir(outside)).toEqual(existingLock ? [".writer-lock"] : []);
+    if (existingLock) {
+      expect(await fs.readFile(lock, "utf8")).toBe("outside writer evidence");
+      const probe = new HardwareWriterLease();
+      try { await expect(probe.acquire(lock)).resolves.toBe(true); }
+      finally { await probe.release(); }
+    }
+  });
+
+  it.each(["parent", "hardware"])("rejects a %s symlink replacement between validation and directory open", async replaced => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "hardware-directory-race-")); roots.push(root);
+    const data = path.join(root, "data"), directory = path.join(data, "hardware"), outside = path.join(root, "outside");
+    await fs.mkdir(directory, { recursive: true }); await fs.mkdir(outside);
+    const store = new HardwareStore(data); stores.push(store);
+    const original = fs.open;
+    const opened: Awaited<ReturnType<typeof fs.open>>[] = [];
+    let swapped = false;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      if (!swapped && typeof args[0] === "string" && args[0].endsWith("/hardware")) {
+        swapped = true;
+        const target = replaced === "parent" ? data : directory;
+        await fs.rename(target, `${target}-original`); await fs.symlink(outside, target);
+      }
+      const handle = await original(...args); opened.push(handle); return handle;
+    });
+    await expect(store.reconcile()).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { phase: "directory_open" } });
+    expect(swapped).toBe(true);
+    expect(await fs.readdir(outside)).toEqual([]);
+    for (const handle of opened) await expect(handle.stat()).rejects.toMatchObject({ code: "EBADF" });
+    expect(() => store.assertHeld()).toThrow(expect.objectContaining({ code: "WRITER_LOST" }));
+  });
+
+  it.each([".writer-lock", "state.json"])("keeps recovery anchored and releases its new lease when the directory changes during %s open", async changedAt => {
+    const { root, store } = await fixture();
+    const state = emptyHardwareState(); state.revision = 17; await store.write(state); await store.dispose();
+    const directory = path.join(root, "hardware"), saved = path.join(root, "hardware-original"), outside = path.join(root, "outside");
+    await fs.mkdir(outside);
+    const outsideState = JSON.stringify({ ...state, revision: 99 }); await fs.writeFile(path.join(outside, "state.json"), outsideState);
+    const original = fs.open;
+    const opened: Awaited<ReturnType<typeof fs.open>>[] = [];
+    let swapped = false;
+    const open = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      if (!swapped && typeof args[0] === "string" && args[0].endsWith(`/${changedAt}`)) {
+        swapped = true;
+        expect(args[0]).toMatch(/^\/proc\/self\/fd\/\d+\//);
+        await fs.rename(directory, saved); await fs.symlink(outside, directory);
+      }
+      const handle = await original(...args); opened.push(handle); return handle;
+    });
+    await expect(store.reconcile()).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { phase: "directory_assert" } });
+    expect(swapped).toBe(true);
+    expect(await fs.readdir(outside)).toEqual(["state.json"]);
+    expect(await fs.readFile(path.join(outside, "state.json"), "utf8")).toBe(outsideState);
+    expect(JSON.parse(await fs.readFile(path.join(saved, "state.json"), "utf8"))).toEqual(state);
+    for (const handle of opened) await expect(handle.stat()).rejects.toMatchObject({ code: "EBADF" });
+    expect(() => store.assertHeld()).toThrow(expect.objectContaining({ code: "WRITER_LOST" }));
+    open.mockRestore();
+    const probe = new HardwareWriterLease();
+    try { await expect(probe.acquire(path.join(saved, ".writer-lock"))).resolves.toBe(true); }
+    finally { await probe.release(); }
+  });
+
+  it.each(["temporary_sync", "directory_sync"])("rejects a directory replacement during %s before reporting a durable write", async changedAt => {
+    const { root, store } = await fixture();
+    const before = emptyHardwareState(); before.revision = 1; await store.write(before);
+    const directory = path.join(root, "hardware"), saved = path.join(root, "hardware-original");
+    const replacement = { ...before, revision: 99 };
+    const original = fs.open;
+    let swapped = false;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await original(...args);
+      if (typeof args[0] === "string" && args[0].endsWith(changedAt === "temporary_sync" ? ".tmp" : "/hardware")) {
+        const sync = handle.sync.bind(handle);
+        vi.spyOn(handle, "sync").mockImplementationOnce(async () => {
+          await sync();
+          await fs.rename(directory, saved); await fs.mkdir(directory);
+          await fs.writeFile(path.join(directory, "state.json"), JSON.stringify(replacement));
+          swapped = true;
+        });
+      }
+      return handle;
+    });
+    const afterRename = changedAt === "directory_sync";
+    await expect(store.write({ ...before, revision: 2 })).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { phase: "directory_assert", authorityReplaced: afterRename, durability: afterRename ? "confirmed" : "unchanged" } });
+    expect(swapped).toBe(true);
+    expect(JSON.parse(await fs.readFile(path.join(directory, "state.json"), "utf8"))).toEqual(replacement);
+    expect(JSON.parse(await fs.readFile(path.join(saved, "state.json"), "utf8"))).toEqual({ ...before, revision: afterRename ? 2 : 1 });
+    expect((await fs.readdir(saved)).sort()).toEqual([".writer-lock", "state.json"]);
+    store.assertHeld();
+    await expect(store.reconcile()).rejects.toMatchObject({ code: "WRITER_LOST", details: { phase: "writer_acquire" } });
+  });
+
+  it.each(["missing", "corrupt"])("releases newly acquired writer authority when recovery state is %s", async broken => {
+    const { root, store } = await fixture(); await store.dispose();
+    if (broken === "corrupt") await fs.writeFile(path.join(root, "hardware/state.json"), "retained corrupt evidence");
+    await expect(store.reconcile()).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { phase: broken === "missing" ? "state_read" : "state_validate" } });
+    expect(() => store.assertHeld()).toThrow(expect.objectContaining({ code: "WRITER_LOST" }));
+    const probe = new HardwareWriterLease();
+    try { await expect(probe.acquire(path.join(root, "hardware/.writer-lock"))).resolves.toBe(true); }
+    finally { await probe.release(); }
+    if (broken === "corrupt") expect(await fs.readFile(path.join(root, "hardware/state.json"), "utf8")).toBe("retained corrupt evidence");
+  });
+
+  it("retains previously held writer authority after failed recovery validation", async () => {
+    const { root, store } = await fixture();
+    const stateFile = path.join(root, "hardware/state.json");
+    await fs.writeFile(stateFile, "retained corrupt evidence");
+    await expect(store.reconcile()).rejects.toMatchObject({ code: "STORE_UNAVAILABLE", details: { phase: "state_validate" } });
+    store.assertHeld();
+    const probe = new HardwareWriterLease();
+    try { await expect(probe.acquire(path.join(root, "hardware/.writer-lock"))).rejects.toMatchObject({ code: "WRITER_LOST" }); }
+    finally { await probe.release(); }
+    await fs.writeFile(stateFile, JSON.stringify(emptyHardwareState()));
+    expect(await store.reconcile()).toEqual(emptyHardwareState());
+  });
+
+  it("does not treat the old directory writer as authority over a replacement directory", async () => {
+    const { root, store } = await fixture();
+    const state = emptyHardwareState(); await store.write(state);
+    const directory = path.join(root, "hardware"), saved = path.join(root, "hardware-original");
+    await fs.rename(directory, saved); await fs.mkdir(directory); await fs.writeFile(path.join(directory, "state.json"), JSON.stringify(state));
+    await expect(store.reconcile()).rejects.toMatchObject({ code: "WRITER_LOST", details: { phase: "writer_acquire" } });
+    await expect(store.write({ ...state, revision: 1 })).rejects.toMatchObject({ code: "WRITER_LOST", details: { phase: "writer_assert" } });
+    expect(await fs.readdir(directory)).toEqual(["state.json"]);
+    store.assertHeld();
+    const probe = new HardwareWriterLease();
+    try { await expect(probe.acquire(path.join(saved, ".writer-lock"))).rejects.toMatchObject({ code: "WRITER_LOST" }); }
+    finally { await probe.release(); }
+    await store.dispose();
+    expect(await store.reconcile()).toEqual(state);
+  });
+
   it("closes writer authority immediately when the helper exits unexpectedly", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "hardware-lease-")); roots.push(root);
     const lost = vi.fn();

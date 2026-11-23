@@ -8,8 +8,8 @@ export class HardwareWriterLease {
   private held = false;
   constructor(private readonly onLost?: (error: HardwareError) => void) {}
 
-  async acquire(file: string): Promise<void> {
-    if (this.held) return;
+  async acquire(file: string): Promise<boolean> {
+    if (this.held) return false;
     requireHardware(process.platform === "linux", "STORE_UNAVAILABLE", "Hardware storage requires the Linux writer lease.");
     const handle = await fs.open(file, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
     try {
@@ -22,8 +22,13 @@ export class HardwareWriterLease {
         child.once("exit", code => reject(new HardwareError("WRITER_LOST", code === 73 ? "Another CloudX service owns this hardware inventory." : "Hardware writer ownership could not be acquired.")));
         child.stdout!.once("data", () => { this.held = true; resolve(); });
       });
-    } catch (error) { await handle.close().catch(() => undefined); throw error; }
-    await handle.close();
+      await handle.close();
+      return true;
+    } catch (error) {
+      await handle.close().catch(() => undefined);
+      await this.release().catch(() => undefined);
+      throw error;
+    }
   }
 
   assertHeld(): void { requireHardware(this.held, "WRITER_LOST", "Hardware writer ownership was lost. Run operator reconciliation to reacquire saved claims."); }

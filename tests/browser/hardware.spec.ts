@@ -2434,6 +2434,181 @@ test("storage failure keeps evidence and reconciliation available while hardware
   }
 });
 
+test("a retained panel exposes corrupt-startup recovery despite a lower server revision", async ({
+  page,
+}, info) => {
+  const statePath = path.join(lab.root, "hardware", "state.json");
+  const repairSource = await fs.readFile(statePath, "utf8");
+  await lab.mutate("hardware.items.update", {
+    hardwareId: lab.ssh.id,
+    expectedItemRevision: lab.ssh.revision,
+    patch: { name: "Retained Atlas SSH" },
+  });
+  for (let index = 0; index < 3; index++)
+    await lab.mutate("hardware.groups.create", {
+      name: `Later revision ${index}`,
+    });
+  await refresh(page);
+  await expect(button(page, "Select Retained Atlas SSH")).toBeEnabled();
+  const retainedRevision = (await lab.service.snapshot(operator)).revision;
+  const serviceRoot = lab.root;
+  await lab.service.dispose();
+  await fs.writeFile(statePath, "{corrupt-state");
+  lab = new HardwareBrowserService(serviceRoot, sshPasswords);
+  await expect(lab.service.init()).rejects.toMatchObject({
+    code: "STORE_UNAVAILABLE",
+  });
+  expect(await lab.service.snapshot(operator)).toMatchObject({
+    revision: 0,
+    readiness: { state: "unavailable" },
+  });
+
+  await button(page, "Refresh inventory").click();
+  const recovery = page.getByRole("region", {
+    name: "Hardware storage recovery",
+  });
+  await expect(recovery).toContainText("state_validate");
+  await expect(button(page, "Select Retained Atlas SSH")).toBeVisible();
+  await expect(button(page, "Select Retained Atlas SSH")).toBeDisabled();
+  await expect(button(page, "Add hardware")).toBeDisabled();
+  await expect(page.locator(".hardware-content")).toHaveAttribute(
+    "disabled",
+    "",
+  );
+  await expect(page.locator(".hardware-footer")).toContainText(
+    `Retained inventory · revision ${retainedRevision}`,
+  );
+  await expect(button(page, "Inspect diagnostics")).toBeEnabled();
+  await expect(button(page, "Reconcile storage")).toBeEnabled();
+  const downloadPromise = page.waitForEvent("download");
+  await button(page, "Download evidence").click();
+  const download = await downloadPromise;
+  const evidencePath = info.outputPath("corrupt-startup-evidence.json");
+  await download.saveAs(evidencePath);
+  await info.attach("corrupt-startup-evidence", {
+    path: evidencePath,
+    contentType: "application/json",
+  });
+  expect(JSON.parse(await fs.readFile(evidencePath, "utf8"))).toMatchObject({
+    lastConfirmedState: false,
+    state: { revision: 0, items: [] },
+    readiness: { state: "unavailable", recovery: { phase: "state_validate" } },
+  });
+  await screenshot(page, info, "retained-panel-corrupt-startup");
+  await button(page, "Reconcile storage").click();
+  await expect(page.getByRole("alert")).toContainText("STORE_UNAVAILABLE");
+  await expect(button(page, "Reconcile storage")).toBeEnabled();
+  await button(page, "Refresh inventory").click();
+  await expect(recovery).toBeVisible();
+  await expect(button(page, "Select Retained Atlas SSH")).toBeDisabled();
+
+  await fs.writeFile(statePath, repairSource);
+  await button(page, "Refresh inventory").click();
+  await expect(recovery).toBeVisible();
+  await expect(button(page, "Add hardware")).toBeDisabled();
+  await button(page, "Reconcile storage").click();
+  await expect(recovery).toHaveCount(0);
+  const recovered = await lab.service.snapshot(operator);
+  expect(recovered.readiness.state).toBe("ready");
+  expect(recovered.revision).toBeLessThan(retainedRevision);
+  await expect(button(page, "Select Atlas SSH")).toBeEnabled();
+  await expect(button(page, "Select Retained Atlas SSH")).toHaveCount(0);
+  await expect(page.locator(".hardware-footer")).toContainText(
+    `Current snapshot · revision ${recovered.revision}`,
+  );
+  expect(lab.invocations).toHaveLength(0);
+});
+
+test("a stale ready reconciliation cannot supersede a newer unavailable snapshot", async ({
+  page,
+}, info) => {
+  const serviceRoot = lab.root;
+  const statePath = path.join(serviceRoot, "hardware", "state.json");
+  const repairSource = await fs.readFile(statePath, "utf8");
+  const retainedRevision = (await lab.service.snapshot(operator)).revision;
+  await lab.service.dispose();
+  await fs.writeFile(statePath, "{corrupt-state");
+  lab = new HardwareBrowserService(serviceRoot, sshPasswords);
+  await expect(lab.service.init()).rejects.toMatchObject({
+    code: "STORE_UNAVAILABLE",
+  });
+  await button(page, "Refresh inventory").click();
+  const recovery = page.getByRole("region", {
+    name: "Hardware storage recovery",
+  });
+  await expect(recovery).toBeVisible();
+  await fs.writeFile(statePath, repairSource);
+
+  let releaseResponse!: () => void;
+  const heldResponse = new Promise<void>((resolve) => {
+    releaseResponse = resolve;
+  });
+  let capturedResponse!: () => void;
+  const captured = new Promise<void>((resolve) => {
+    capturedResponse = resolve;
+  });
+  let delayed = false;
+  await page.route("**/api/hardware/actions", async (route) => {
+    if (
+      route.request().postDataJSON().action !== "hardware.reconcile" ||
+      delayed
+    ) {
+      await route.continue();
+      return;
+    }
+    delayed = true;
+    const response = await route.fetch({
+      url: route.request().url().replace("hardware.test", "127.0.0.1"),
+    });
+    const body = await response.json();
+    expect(body.result.readiness.state).toBe("ready");
+    expect(body.result.revision).toBeGreaterThan(retainedRevision);
+    const evidencePath = info.outputPath("stale-ready-response.json");
+    await fs.writeFile(evidencePath, JSON.stringify(body, null, 2));
+    await info.attach("stale-ready-response", {
+      path: evidencePath,
+      contentType: "application/json",
+    });
+    capturedResponse();
+    await heldResponse;
+    await route.fulfill({ response });
+  });
+  try {
+    await button(page, "Reconcile storage").click();
+    await captured;
+    await lab.service.dispose();
+    await fs.writeFile(statePath, "{corrupt-again");
+    lab = new HardwareBrowserService(serviceRoot, sshPasswords);
+    await expect(lab.service.init()).rejects.toMatchObject({
+      code: "STORE_UNAVAILABLE",
+    });
+    await page.waitForResponse(
+      async (response) =>
+        response.url().endsWith("/api/hardware/state") &&
+        response.status() === 200 &&
+        (await response.json()).revision === 0,
+    );
+    await expect(recovery).toBeVisible();
+    const oldResponse = page.waitForResponse((response) =>
+      response.url().endsWith("/api/hardware/actions"),
+    );
+    releaseResponse();
+    await oldResponse;
+    await expect(button(page, "Refresh inventory")).toBeEnabled();
+    expect(await recovery.isVisible()).toBe(true);
+    await expect(button(page, "Add hardware")).toBeDisabled();
+    await expect(button(page, "Select Atlas SSH")).toBeDisabled();
+    await expect(button(page, "Reconcile storage")).toBeEnabled();
+    await screenshot(page, info, "stale-ready-response-rejected");
+    await fs.writeFile(statePath, repairSource);
+    await button(page, "Reconcile storage").click();
+    await expect(recovery).toHaveCount(0);
+    await expect(button(page, "Select Atlas SSH")).toBeEnabled();
+  } finally {
+    releaseResponse();
+  }
+});
+
 test("an external catalog reference cannot be deleted through the UI", async ({
   page,
 }) => {

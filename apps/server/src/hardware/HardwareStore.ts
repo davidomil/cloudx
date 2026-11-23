@@ -27,25 +27,48 @@ export interface HardwareStoredState {
 
 export const emptyHardwareState = (): HardwareStoredState => ({ schemaVersion: 1, revision: 0, nextGeneration: 1, items: [], tags: [], groups: [], statusDefinitions: [], observations: {}, endpointKeys: {}, reservations: [], checkHolds: [], receipts: [], history: [] });
 
+interface HardwareDirectory {
+  fd: number;
+  identity: { dev: bigint; ino: bigint };
+  assertCurrent(): Promise<void>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+}
+
 export class HardwareStore {
   private readonly directory: string;
   private readonly writer: HardwareWriterLease;
+  private writerDirectory?: HardwareDirectory["identity"];
   constructor(private readonly dataDir: string, onWriterLost?: (error: HardwareError) => void) { this.directory = path.join(path.resolve(dataDir), "hardware"); this.writer = new HardwareWriterLease(onWriterLost); }
 
   async init(): Promise<HardwareStoredState> {
     try { await requireSafeDirectory(this.dataDir, this.directory, { create: true, label: "Hardware data directory" }); }
     catch (error) { throw storeFailure(error, "directory_open"); }
-    await this.acquireWriter();
-    try { return await this.read(); }
-    catch (error) { await this.writer.release().catch(() => undefined); throw error; }
+    return this.readAuthority(true);
   }
 
-  async reconcile(): Promise<HardwareStoredState> {
-    await this.acquireWriter();
-    this.assertHeld();
-    const state = await this.readState(false);
-    this.assertHeld();
-    return state;
+  reconcile(): Promise<HardwareStoredState> { return this.readAuthority(false); }
+
+  private async readAuthority(allowMissing: boolean): Promise<HardwareStoredState> {
+    let directory: HardwareDirectory | undefined;
+    let acquired = false;
+    let phase = "directory_open";
+    try {
+      directory = await this.openDirectory();
+      acquired = await this.acquireWriter(directory);
+      this.assertHeld();
+      phase = "directory_assert";
+      await directory.assertCurrent();
+      const opened = directory; directory = undefined;
+      const state = await this.readState(allowMissing, opened);
+      this.assertHeld();
+      return state;
+    } catch (error) {
+      const failure = error instanceof HardwareError && error.details?.phase ? error : storeFailure(error, phase);
+      await directory?.close().catch(() => undefined);
+      if (acquired) await this.writer.release().catch(() => undefined);
+      throw failure;
+    }
   }
 
   assertHeld(): void {
@@ -56,12 +79,12 @@ export class HardwareStore {
 
   read(): Promise<HardwareStoredState> { return this.readState(true); }
 
-  private async readState(allowMissing: boolean): Promise<HardwareStoredState> {
-    let directory: Awaited<ReturnType<typeof fs.open>> | undefined;
+  private async readState(allowMissing: boolean, opened?: HardwareDirectory): Promise<HardwareStoredState> {
+    let directory: HardwareDirectory | undefined = opened;
     let file: Awaited<ReturnType<typeof fs.open>> | undefined;
     let phase = "directory_open";
     try {
-      directory = await this.openDirectory();
+      directory ??= await this.openDirectory();
       phase = "state_read";
       try { file = await fs.open(`/proc/self/fd/${directory.fd}/state.json`, constants.O_RDONLY | constants.O_NOFOLLOW); }
       catch (error) { if (!allowMissing || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
@@ -77,6 +100,8 @@ export class HardwareStore {
         phase = "state_close";
         await file.close(); file = undefined;
       }
+      phase = "directory_assert";
+      await directory.assertCurrent();
       phase = "directory_close";
       await directory.close(); directory = undefined;
       return state;
@@ -89,7 +114,7 @@ export class HardwareStore {
   }
 
   async write(state: HardwareStoredState): Promise<void> {
-    let directory: Awaited<ReturnType<typeof fs.open>> | undefined;
+    let directory: HardwareDirectory | undefined;
     let file: Awaited<ReturnType<typeof fs.open>> | undefined;
     let temporary: string | undefined;
     let temporaryCreated = false;
@@ -105,6 +130,8 @@ export class HardwareStore {
       requireHardware(Buffer.byteLength(text) <= HARDWARE_STATE_BYTES, "LIMIT_EXCEEDED", "Hardware state exceeds its 64 MiB bound.");
       phase = "directory_open";
       directory = await this.openDirectory();
+      phase = "writer_assert";
+      this.assertDirectoryAuthority(directory);
       temporary = `/proc/self/fd/${directory.fd}/.state-${randomUUID()}.tmp`;
       const destination = `/proc/self/fd/${directory.fd}/state.json`;
       phase = "destination_check";
@@ -119,8 +146,10 @@ export class HardwareStore {
       await file.sync();
       phase = "temporary_close";
       await file.close(); file = undefined;
+      phase = "directory_assert";
+      await directory.assertCurrent();
       phase = "writer_assert";
-      this.writer.assertHeld();
+      this.assertDirectoryAuthority(directory);
       phase = "state_rename";
       await fs.rename(temporary, destination);
       renamed = true;
@@ -128,6 +157,8 @@ export class HardwareStore {
       phase = "directory_sync";
       await directory.sync();
       durability = "confirmed";
+      phase = "directory_assert";
+      await directory.assertCurrent();
       phase = "directory_close";
       await directory.close(); directory = undefined;
     } catch (error) {
@@ -139,14 +170,46 @@ export class HardwareStore {
     }
   }
 
-  private async acquireWriter(): Promise<void> {
-    try { await this.writer.acquire(path.join(this.directory, ".writer-lock")); }
-    catch (error) { throw storeFailure(error, "writer_acquire"); }
+  private assertDirectoryAuthority(directory: HardwareDirectory): void {
+    this.writer.assertHeld();
+    requireHardware(this.writerDirectory?.dev === directory.identity.dev && this.writerDirectory?.ino === directory.identity.ino,
+      "WRITER_LOST", "Hardware writer authority belongs to a different directory. Restore the owned directory before reconciliation.");
   }
 
-  private async openDirectory() {
+  private async acquireWriter(directory: HardwareDirectory): Promise<boolean> {
+    try {
+      const acquired = await this.writer.acquire(`/proc/self/fd/${directory.fd}/.writer-lock`);
+      if (acquired) this.writerDirectory = directory.identity;
+      else this.assertDirectoryAuthority(directory);
+      return acquired;
+    } catch (error) { throw storeFailure(error, "writer_acquire"); }
+  }
+
+  private async openDirectory(): Promise<HardwareDirectory> {
     await requireSafeDirectory(this.dataDir, this.directory, { create: false, label: "Hardware data directory" });
-    return fs.open(this.directory, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    const flags = constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW;
+    const parent = await fs.open(path.resolve(this.dataDir), flags);
+    let directory: Awaited<ReturnType<typeof fs.open>> | undefined;
+    try {
+      const anchored = `/proc/self/fd/${parent.fd}/hardware`;
+      directory = await fs.open(anchored, flags);
+      const [rootIdentity, identity] = await Promise.all([parent.stat({ bigint: true }), directory.stat({ bigint: true })]);
+      const assertCurrent = async () => {
+        const [root, current] = await Promise.all([fs.lstat(path.resolve(this.dataDir), { bigint: true }), fs.lstat(anchored, { bigint: true })]);
+        requireHardware(root.isDirectory() && root.dev === rootIdentity.dev && root.ino === rootIdentity.ino && current.isDirectory() && current.dev === identity.dev && current.ino === identity.ino,
+          "STORE_UNAVAILABLE", "Hardware data directory changed. Preserve both directories and restore the owned directory before reconciliation.");
+      };
+      await assertCurrent();
+      const handle = directory;
+      return { fd: handle.fd, identity, assertCurrent, sync: () => handle.sync(), async close() {
+        const results = await Promise.allSettled([handle.close(), parent.close()]);
+        const failed = results.find(result => result.status === "rejected");
+        if (failed?.status === "rejected") throw failed.reason;
+      } };
+    } catch (error) {
+      await Promise.allSettled([directory?.close(), parent.close()]);
+      throw error;
+    }
   }
 }
 

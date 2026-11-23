@@ -19,6 +19,7 @@ export interface HardwareServiceOptions {
   resolveCredential?: (id: string) => Promise<string>;
   discardCredential?: (id: string) => Promise<void>;
   discardSavedPassword?: (id: string) => Promise<void>;
+  clearRegistrationPasswords?: () => Promise<void>;
   ownerState?: (owner: HardwareOwner) => "active" | "confirmed_ended" | "unknown" | Promise<"active" | "confirmed_ended" | "unknown">;
   retention?: Partial<HardwareRetentionSettings>;
 }
@@ -63,6 +64,7 @@ export class HardwareService {
   private readonly connectionChecks = new Map<string, HardwareConnectionObservation>();
   private readonly connectionRuns = new Map<string, ConnectionCheckRun>();
   private ready = false;
+  private registrationPasswordsCleared = false;
   private stopping = false;
   private unavailableReason?: string;
   private storageRecovery?: HardwareStateView["readiness"]["recovery"];
@@ -104,6 +106,7 @@ export class HardwareService {
       next.revision++;
       this.pruneDetails(next);
       await this.store.write(next);
+      await this.clearInterruptedPasswords();
       this.state = next; this.ready = true;
       const ended = new Map(next.reservations.filter(claim => claim.lastOwnerObservation === "confirmed_ended").map(claim => [ownerKey(claim.owner), claim.owner]));
       for (const owner of ended.values()) await this.ownerEnded(owner);
@@ -184,6 +187,8 @@ export class HardwareService {
     const durability = details?.durability === "confirmed" || details?.durability === "unchanged" ? details.durability : "unconfirmed";
     const nextAction = failedPhase === "local_cleanup"
       ? "Wait for local hardware work to stop, inspect its activity, then select Reconcile storage again. Keep uncertain remote activity held."
+      : failedPhase === "registration_password_cleanup"
+      ? "Repair storage and permissions for secrets/config-secrets.json, then select Reconcile storage. Interrupted registration passwords must be discarded under the writer lease before Hardware effects resume."
       : failedPhase.startsWith("writer_")
       ? "Stop the competing CloudX writer or repair the Linux flock helper, then select Reconcile storage. Do not delete the writer lock."
       : ["state_read", "state_validate"].includes(failedPhase)
@@ -201,6 +206,19 @@ export class HardwareService {
     if (this.scheduler) clearInterval(this.scheduler);
     this.scheduler = setInterval(() => { void this.checkScheduledStatuses().catch(() => undefined); }, 1000);
     this.scheduler.unref();
+  }
+
+  private async clearInterruptedPasswords(): Promise<void> {
+    if (this.registrationPasswordsCleared) return;
+    this.store.assertHeld();
+    try { await this.options.clearRegistrationPasswords?.(); }
+    catch (error) {
+      const code = error instanceof HardwareError ? error.details?.errno : isRecord(error) ? error.code : undefined;
+      const errno = typeof code === "string" && /^E[A-Z0-9_]{1,63}$/.test(code) ? code : undefined;
+      throw new HardwareError("STORE_UNAVAILABLE", "Interrupted SSH registration passwords could not be discarded. Hardware admission remains closed.", { phase: "registration_password_cleanup", ...(errno ? { errno } : {}), durability: "unconfirmed", authorityReplaced: false });
+    }
+    this.store.assertHeld();
+    this.registrationPasswordsCleared = true;
   }
 
   private async reconcile(input: Record<string, unknown>, owner: HardwareOwner): Promise<HardwareStateView> {
@@ -225,6 +243,7 @@ export class HardwareService {
         this.unavailableReason = undefined; this.startScheduler();
         return;
       }
+      await this.clearInterruptedPasswords();
       for (const [reservationId, access] of this.access) {
         const previous = this.state.reservations.find(claim => claim.reservationId === reservationId);
         requireHardware(previous && next.reservations.some(claim => claim.reservationId === reservationId && claim.generation >= access.generation && sameOwner(claim.owner, previous.owner) && canonical(claim.acquiredItem) === canonical(previous.acquiredItem)), "STORE_UNAVAILABLE", "A local managed connection does not match the saved reservation. Keep the hardware isolated and stop this CloudX instance for managed cleanup before operator repair.", { phase: "state_validate", durability: "unconfirmed", authorityReplaced: false });

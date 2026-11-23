@@ -363,7 +363,6 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
         if (!(error instanceof HardwareError)) throw error;
         app.log.error({ code: error.code, details: error.details }, "Hardware admission is closed. Use Hardware storage recovery after host repair.");
       }
-      await services.hardwarePasswords?.clearRegistrationPasswords();
       await services.hardwareMonitor?.start();
     }
     if (services.cooperation && services.cooperationContexts) {
@@ -1635,6 +1634,7 @@ export function buildServices(config: AppConfig, logger?: StructuredVoiceLogger)
   hardware = new HardwareService({ dataDir: config.dataDir, pathPolicy, registry: new HardwareTypeRegistry(plugins.values()), resolveCredential: hardwareCredentialResolver(process.env, hardwarePasswords),
     discardCredential: id => hardwarePasswords.discardRegistration(id),
     discardSavedPassword: id => hardwarePasswords.discardSavedPassword(id),
+    clearRegistrationPasswords: () => hardwarePasswords.clearRegistrationPasswords(),
     ownerState: async owner => {
       if (owner.kind === "user") return "active";
       if (owner.ownerPluginId === "forge" && await forgeRuntime?.hardwareOwnerState(owner) === "confirmed_ended") return "confirmed_ended";
