@@ -35,6 +35,8 @@ import type {
   CloudxNotification,
   SearchWorkspaceWindowsResponse,
   TabLayoutState,
+  TerminalMemoryLimits,
+  TerminalMemoryStatus,
   TriggerEvent,
   TriggerDescriptor,
   TriggerListResponse,
@@ -45,7 +47,7 @@ import type {
   WorkspaceStateResponse,
   WorkspaceTab
 } from "@cloudx/shared";
-import { parseTerminalCapabilities, type TerminalCapabilities, parseCodexCommandDetailsSnapshot, parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
+import { parseTerminalCapabilities, type TerminalCapabilities, parseTerminalMemoryStatus, parseCodexCommandDetailsSnapshot, parseCreateTabResponse, parseVoiceExecutionResult } from "@cloudx/shared";
 
 export interface HealthResponse {
   status: string;
@@ -70,6 +72,14 @@ export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> 
     throw new HttpError(response.status, errorMessageFromResponse(text, response.status));
   }
   return (await response.json()) as T;
+}
+
+export async function getTerminalMemory(signal?: AbortSignal): Promise<TerminalMemoryStatus> {
+  return parseTerminalMemoryStatus(await fetchJson("/api/terminal-memory", { signal, cache: "no-store" }));
+}
+
+export async function setTerminalMemory(limits: TerminalMemoryLimits, signal?: AbortSignal): Promise<TerminalMemoryStatus> {
+  return parseTerminalMemoryStatus(await fetchJson("/api/terminal-memory", { method: "PUT", body: JSON.stringify(limits), signal }));
 }
 
 export function errorMessageFromResponse(text: string, status: number): string {

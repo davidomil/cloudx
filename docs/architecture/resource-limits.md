@@ -11,6 +11,82 @@ They are operational budgets, not measurements of a machine's physical capacity.
 The values below record the current contracts. Tests establish the stated
 behavior; they do not prove that each chosen value is optimal.
 
+## Terminal service memory
+
+`apps/server/src/system/TerminalMemoryService.ts` owns the Settings integration
+for `cloudx-terminal.service`. Systemd owns the persisted policy. CloudX does not
+copy the selected limits to application settings, environment variables, or the
+generated unit fragment. It does not install a universal RAM limit. Existing
+operator choices remain in effect until the operator applies a new selection.
+
+Settings exposes `MemoryHigh` and `MemoryMax` with explicit binary units and an
+unlimited option. These limits cover the persistent broker and all child
+workloads in its cgroup, including terminal shells and agents. They are separate
+from the `cloudx.service` web process, the Node.js JavaScript heap, and the
+application/parser budgets below. `MemoryHigh` causes reclaim and throttling;
+`MemoryMax` is a hard ceiling that can cause an OOM kill. The systemd 255
+[resource-control reference](https://www.freedesktop.org/software/systemd/man/255/systemd.resource-control.html)
+defines these controls and their cgroup v2 semantics.
+
+The status response reads the current service settings and cgroup usage. It
+also reports effective limits after ancestor constraints, memory pressure
+(`memory.pressure` ten-second averages), and cumulative high-limit, OOM, and
+OOM-kill events from `memory.events`. Machine-wide available RAM alone cannot
+show whether the terminal cgroup is throttled. The UI shows drop-in paths from
+the manager and the approved unit directories on disk so operators can identify
+existing overrides, including files not yet loaded by systemd.
+Effective limits use the kernel's page-rounded values, include the visible
+cgroup mount root, and are capped by physical RAM.
+
+Applying a selection sends both properties in one command:
+
+```sh
+systemctl --user set-property cloudx-terminal.service MemoryHigh=<bytes-or-infinity> MemoryMax=<bytes-or-infinity>
+```
+
+CloudX validates finite threshold/ceiling relationships before the command. It
+also checks whether a later operator drop-in would override the selection on
+reload or reboot. A conflict names the file that the operator must inspect;
+CloudX preserves that file and refuses the change.
+After application, CloudX reads back the service values and persistent property
+files, and checks that the broker PID and invocation identity remain unchanged. This operation
+does not request a broker restart. If application or persistence verification
+fails, Settings reports the failure and asks the operator to refresh; some
+properties can already have changed. The systemd 255
+[`set-property` reference](https://www.freedesktop.org/software/systemd/man/255/systemctl.html#set-property%20UNIT%20PROPERTY=VALUE%E2%80%A6)
+specifies immediate application and persistence across boots when `--runtime`
+is omitted.
+
+Persistent property files live under
+`$XDG_CONFIG_HOME/systemd/user.control/cloudx-terminal.service.d/`, or
+`~/.config/systemd/user.control/cloudx-terminal.service.d/` when
+`XDG_CONFIG_HOME` is unset. Runtime overrides can also exist under
+`$XDG_RUNTIME_DIR/systemd/user.control/`. Systemd applies different drop-in
+filenames in lexical order; the earlier user unit load path wins for the same
+filename. Persistent `user.control` precedes runtime `user.control`. These are
+systemd's [documented user unit paths](https://www.freedesktop.org/software/systemd/man/255/systemd.unit.html#Unit%20File%20Load%20Path).
+
+The installer refreshes unit fragments and preserves these separate drop-in
+files. Managed updates also preserve them. The direct-terminal update path and
+Settings share `scripts/terminal-memory-policy.mjs` to allow only verified
+memory-only overrides in the terminal unit's user configuration or runtime
+directories. The checks reject foreign owners, linked paths, world-writable
+files/directories, and directives outside `[Service]` `MemoryHigh`/`MemoryMax`.
+The existing broker unit ownership checks remain in place. Other service
+customizations require operator inspection before CloudX can manage the
+memory settings.
+
+CloudX checks the persistence destination before changing properties, including
+empty or not-yet-created override directories. It refuses linked, foreign-owned,
+or world-writable destination directories before invoking `set-property`.
+
+`scripts/terminal-memory-policy.test.mjs` covers override ownership, syntax,
+quoted paths, and preservation through installer unit refresh.
+`scripts/managed-update-direct-services.test.mjs` covers direct-target
+activation and restoration with memory overrides. Server, shared-contract, UI,
+and isolated systemd tests cover the remaining settings behavior. The
+completion report identifies the checks actually run for issue #291.
+
 ## Audit scope and method
 
 The repository-wide discovery covered `apps`, `packages`, `services`, `scripts`,

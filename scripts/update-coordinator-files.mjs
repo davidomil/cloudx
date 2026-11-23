@@ -4,6 +4,6 @@ export const COORDINATOR_SCRIPT_FILES = [
   "managed-update-data.mjs", "managed-update-terminals.mjs", "managed-update-readiness.mjs",
   "managed-update-integration.mjs", "managed-runtime-launch.mjs", "write-runtime-build.mjs",
   "install-cloudx.mjs", "codex-updater.mjs", "codex-selection.mjs", "codex-state-errors.mjs", "codex-runtime-errors.mjs", "install-update.mjs", "install-runtime.mjs",
-  "install-terminal-upgrade.mjs", "terminal-upgrade-recovery.mjs", "installer-environment.mjs",
+  "install-terminal-upgrade.mjs", "terminal-upgrade-recovery.mjs", "terminal-memory-policy.mjs", "installer-environment.mjs",
   "update-coordinator.mjs", "update-coordinator-files.mjs",
 ].map(file => `scripts/${file}`);
