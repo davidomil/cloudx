@@ -1316,20 +1316,43 @@ a:hover svg {
   box-shadow: var(--shadow-neon-tertiary);
 }
 
+.pane-tabbar {
+  display: flex;
+  min-width: 0;
+  border-bottom: 1px solid rgb(42 42 58 / 0.92);
+  background: rgb(10 10 15 / 0.86);
+}
+
+.pane-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+}
+
+.pane-tabbar > .tab-strip {
+  flex: 1 1 0;
+}
+
 .tab-strip {
+  position: relative;
+  min-width: 0;
   min-height: 44px;
   display: flex;
   align-items: center;
   gap: 6px;
   padding: 6px;
-  border-bottom: 1px solid rgb(42 42 58 / 0.92);
   background:
     repeating-linear-gradient(90deg, rgb(0 255 136 / 0.018) 0 1px, transparent 1px 28px),
     rgb(10 10 15 / 0.86);
   overflow-x: auto;
+  overscroll-behavior-x: contain;
+  touch-action: pan-x;
 }
 
 .tab-button {
+  flex: none;
   position: relative;
   max-width: 210px;
   min-width: 126px;
@@ -7244,14 +7267,15 @@ a:hover svg {
   .topbar {
     width: 100%;
     min-width: 0;
-    min-height: 60px;
-    align-items: stretch;
-    flex-direction: column;
-    padding: 10px;
+    min-height: 56px;
+    align-items: center;
+    gap: 6px;
+    padding: max(6px, env(safe-area-inset-top)) max(6px, env(safe-area-inset-right)) 6px max(6px, env(safe-area-inset-left));
   }
 
   .topbar-actions {
-    width: 100%;
+    flex: 1 1 0;
+    width: auto;
     max-width: 100%;
     min-width: 0;
     justify-content: space-between;
@@ -7269,7 +7293,7 @@ a:hover svg {
 
   .mobile-action-menu-popover {
     position: fixed;
-    top: max(116px, calc(env(safe-area-inset-top) + 116px));
+    top: max(60px, calc(env(safe-area-inset-top) + 60px));
     right: max(10px, env(safe-area-inset-right));
     left: max(10px, env(safe-area-inset-left));
     display: grid;
@@ -7283,11 +7307,11 @@ a:hover svg {
 
   .mobile-action-menu-popover .notification-center-popover {
     position: fixed;
-    top: max(238px, calc(env(safe-area-inset-top) + 238px));
+    top: max(112px, calc(env(safe-area-inset-top) + 112px));
     right: max(10px, env(safe-area-inset-right));
     left: max(10px, env(safe-area-inset-left));
     width: auto;
-    max-height: min(520px, calc(100dvh - 258px));
+    max-height: min(520px, calc(100dvh - 132px));
   }
 
   .mobile-action-menu-popover.template-open {
@@ -7332,12 +7356,11 @@ a:hover svg {
   .window-menu,
   .template-menu {
     position: fixed;
-    top: max(96px, env(safe-area-inset-top));
+    top: max(60px, calc(env(safe-area-inset-top) + 60px));
     right: 10px;
     left: 10px;
     width: auto;
-    max-height: calc(100vh - 116px);
-    max-height: calc(100svh - 116px);
+    max-height: calc(100svh - 76px);
     z-index: 260;
   }
 
@@ -7367,22 +7390,43 @@ a:hover svg {
   }
 
   .brand {
-    width: 100%;
-    gap: 8px;
+    flex: none;
+    gap: 4px;
   }
 
-  .brand-active-tab {
-    max-width: min(44vw, 220px);
+  .brand > svg,
+  .brand-mark,
+  .brand-active-tab,
+  .persistence-status > span {
+    display: none;
   }
 
   .tab-button {
     min-width: 136px;
     height: 44px;
+    gap: 4px;
+    padding-right: 2px;
   }
 
   .tab-strip {
-    min-height: 56px;
-    padding: 6px;
+    min-height: 52px;
+    padding: 4px;
+  }
+
+  .tab-close,
+  .tab-actions > button {
+    min-width: 28px;
+    min-height: 44px;
+  }
+
+  .terminal-input-help {
+    flex-shrink: 0;
+  }
+
+  .terminal-input-help > details[open] {
+    max-height: max(44px, min(120px, calc((100svh - var(--terminal-mobile-keyboard-inset, 0px)) / 5)));
+    overflow: auto;
+    overscroll-behavior: contain;
   }
 
   .voice-console {
@@ -7433,10 +7477,16 @@ a:hover svg {
     grid-auto-rows: minmax(430px, 1fr);
     align-content: start;
     gap: 8px;
-    padding: 6px 6px max(0px, var(--terminal-mobile-keyboard-inset, env(keyboard-inset-height, 0px)));
+    padding: 4px max(4px, env(safe-area-inset-right)) max(env(safe-area-inset-bottom), var(--terminal-mobile-keyboard-inset, env(keyboard-inset-height, 0px))) max(4px, env(safe-area-inset-left));
     overflow: auto;
     scroll-padding-bottom: calc(var(--terminal-mobile-keyboard-inset, env(keyboard-inset-height, 0px)) + 16px);
     -webkit-overflow-scrolling: touch;
+  }
+
+  .pane-root.single-pane,
+  .pane-root.maximized {
+    grid-auto-rows: minmax(0, 1fr);
+    overflow: hidden;
   }
 
   .pane-root.terminal-touch-scroll-lock {

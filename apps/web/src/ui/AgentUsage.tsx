@@ -1,7 +1,10 @@
-import { useEffect, useState, type FocusEvent, type MouseEvent } from "react";
+import { useEffect, useId, useRef, useState, type FocusEvent, type PointerEvent } from "react";
+import { createPortal } from "react-dom";
+import { CircleDollarSign, X } from "lucide-react";
 import { AGENT_USAGE_HOOKS, type AgentUsageReadRequest, type AgentUsageReadResult, type AgentUsageSummary, type AgentUsageTotals } from "@cloudx/shared";
 
 import type { UiContributionRenderContext } from "./uiContributions.js";
+import "./UsagePopover.css";
 
 type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
 
@@ -81,6 +84,7 @@ function UsageDetails({ title, summary }: { title: string; summary?: AgentUsageS
 }
 
 interface HoverTarget {
+  id?: string;
   title: string;
   request: AgentUsageReadRequest;
   left: number;
@@ -90,20 +94,114 @@ interface HoverTarget {
 // Shows a usage card next to the element under the pointer or keyboard focus.
 export function useUsageHover() {
   const [target, setTarget] = useState<HoverTarget>();
+  const id = useId();
+  const trigger = useRef<HTMLElement>(null);
+  const pointerFocus = useRef(false);
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    const hide = () => setTarget(undefined);
+    const pointerDown = (event: globalThis.PointerEvent) => {
+      pointerFocus.current = true;
+      if (event.pointerType !== "mouse" || !trigger.current?.contains(event.target as Node)) hide();
+    };
+    const keyDown = (event: KeyboardEvent) => {
+      pointerFocus.current = false;
+      if (event.key === "Escape") hide();
+    };
+    document.addEventListener("pointerdown", pointerDown, true);
+    document.addEventListener("keydown", keyDown, true);
+    window.addEventListener("scroll", hide, true);
+    window.addEventListener("resize", hide);
+    viewport?.addEventListener("scroll", hide);
+    viewport?.addEventListener("resize", hide);
+    return () => {
+      document.removeEventListener("pointerdown", pointerDown, true);
+      document.removeEventListener("keydown", keyDown, true);
+      window.removeEventListener("scroll", hide, true);
+      window.removeEventListener("resize", hide);
+      viewport?.removeEventListener("scroll", hide);
+      viewport?.removeEventListener("resize", hide);
+    };
+  }, []);
   function handlers(title: string, request: AgentUsageReadRequest) {
-    const show = (event: MouseEvent<HTMLElement> | FocusEvent<HTMLElement>) => {
+    const show = (event: PointerEvent<HTMLElement> | FocusEvent<HTMLElement>) => {
       const rect = event.currentTarget.getBoundingClientRect();
-      setTarget({ title, request, left: Math.max(8, Math.min(rect.left, window.innerWidth - CARD_WIDTH_PX - 8)), top: rect.bottom + 6 });
+      trigger.current = event.currentTarget;
+      setTarget({ id, title, request, left: Math.max(8, Math.min(rect.left, window.innerWidth - CARD_WIDTH_PX - 8)), top: rect.bottom + 6 });
     };
     const hide = () => setTarget(undefined);
-    return { onMouseEnter: show, onFocus: show, onMouseLeave: hide, onBlur: hide };
+    return {
+      "aria-describedby": target?.title === title && JSON.stringify(target.request) === JSON.stringify(request) ? id : undefined,
+      onPointerEnter: (event: PointerEvent<HTMLElement>) => { if (event.pointerType === "mouse") show(event); else hide(); },
+      onFocus: (event: FocusEvent<HTMLElement>) => { if (!pointerFocus.current) show(event); },
+      onPointerLeave: hide,
+      onBlur: hide,
+    };
   }
   return { target, handlers };
 }
 
 export function UsageHoverCard({ target, callHook }: { target: HoverTarget; callHook: CallHook }) {
   const usage = useAgentUsage(callHook, target.request);
-  return <div className="usage-card" role="tooltip" style={{ left: target.left, top: target.top, width: CARD_WIDTH_PX }}>
+  return <div id={target.id} className="usage-card" role="tooltip" style={{ left: target.left, top: target.top, width: CARD_WIDTH_PX }}>
     <UsageDetails title={target.title} summary={usage?.total} />
   </div>;
+}
+
+export function UsageButton({ title, request, callHook }: { title: string; request: AgentUsageReadRequest; callHook: CallHook }) {
+  const [position, setPosition] = useState<{ left: number; top: number; maxWidth: number; maxHeight: number }>();
+  const trigger = useRef<HTMLButtonElement>(null);
+  const popover = useRef<HTMLDivElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const id = useId();
+  const usage = useAgentUsage(callHook, position ? request : undefined);
+  const owner = JSON.stringify(request);
+  useEffect(() => setPosition(undefined), [owner]);
+  useEffect(() => {
+    if (!position) return;
+    const viewport = window.visualViewport;
+    closeButton.current?.focus({ preventScroll: true });
+    const pointerDown = (event: globalThis.PointerEvent) => {
+      if (!trigger.current?.contains(event.target as Node) && !popover.current?.contains(event.target as Node)) setPosition(undefined);
+    };
+    const keyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setPosition(undefined);
+      trigger.current?.focus({ preventScroll: true });
+    };
+    const dismiss = () => setPosition(undefined);
+    const scroll = (event: Event) => { if (!(event.target instanceof Node) || !popover.current?.contains(event.target)) dismiss(); };
+    document.addEventListener("pointerdown", pointerDown, true);
+    document.addEventListener("keydown", keyDown, true);
+    window.addEventListener("resize", dismiss);
+    window.addEventListener("scroll", scroll, true);
+    viewport?.addEventListener("resize", dismiss);
+    viewport?.addEventListener("scroll", dismiss);
+    return () => {
+      document.removeEventListener("pointerdown", pointerDown, true);
+      document.removeEventListener("keydown", keyDown, true);
+      window.removeEventListener("resize", dismiss);
+      window.removeEventListener("scroll", scroll, true);
+      viewport?.removeEventListener("resize", dismiss);
+      viewport?.removeEventListener("scroll", dismiss);
+    };
+  }, [position]);
+  return <>
+    <button ref={trigger} type="button" className="usage-button" title={`Usage for ${title}`} aria-label={`Usage for ${title}`} aria-haspopup="dialog" aria-expanded={!!position} aria-controls={position ? id : undefined} onClick={event => {
+      event.stopPropagation();
+      if (position) { setPosition(undefined); return; }
+      const rect = event.currentTarget.getBoundingClientRect();
+      const viewport = window.visualViewport;
+      const minLeft = (viewport?.offsetLeft ?? 0) + 8;
+      const minTop = (viewport?.offsetTop ?? 0) + 8;
+      const maxWidth = (viewport?.width ?? window.innerWidth) - 16;
+      const bottom = minTop + (viewport?.height ?? window.innerHeight) - 16;
+      const top = Math.max(minTop, Math.min(rect.bottom + 6, bottom - 112));
+      setPosition({ left: Math.max(minLeft, Math.min(rect.right - CARD_WIDTH_PX, minLeft + maxWidth - CARD_WIDTH_PX)), top, maxWidth, maxHeight: bottom - top });
+    }}><CircleDollarSign size={16} /></button>
+    {position ? createPortal(<div ref={popover} id={id} className="usage-popover" role="dialog" aria-label={`Usage for ${title}`} style={position} onClick={event => event.stopPropagation()}>
+      <div className="usage-popover-header"><strong>Usage</strong><button ref={closeButton} type="button" aria-label="Close usage" title="Close usage" onClick={() => { setPosition(undefined); trigger.current?.focus({ preventScroll: true }); }}><X size={18} /></button></div>
+      <UsageDetails title={title} summary={usage?.total} />
+    </div>, document.body) : null}
+  </>;
 }

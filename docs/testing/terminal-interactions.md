@@ -14,10 +14,28 @@ npx playwright test tests/browser/terminal-copy.spec.ts --workers=1
 
 The desktop and Pixel 7 projects test browser transport and rendering. Pixel 7
 emulation does not verify a physical phone's keyboard, long-press selection or
-clipboard. The terminal's **Select visible terminal text** action saves the
+clipboard. The terminal's **Select text** action saves the
 visible screen into a stable browser text area. Users can select and copy that
 snapshot while native output continues, then close it to resume scrolling and
 typing. Scroll to older output before taking another snapshot.
+
+On phones, swipe the workspace tabs horizontally. Add stays beside the tab list.
+Tap the usage icon to inspect the active agent tab's cost, then use Close or tap
+outside to dismiss it. Voice input opens the transcript only when needed.
+The terminal key row provides Esc, Tab, Ctrl+C, arrows and Enter. Agent tabs also
+provide Newline, using the configured Shift+Enter preference. Swipe the key row
+to reach controls beyond the screen edge. Ctrl+C sends an interrupt directly.
+
+Run the phone layout and input checks through the production App and xterm:
+
+```sh
+npx playwright test tests/browser/phone-workbench.spec.ts --workers=1
+```
+
+The fixture uses synthetic API/WebSocket responses. It checks portrait and
+landscape geometry, touch tab scrolling, terminal input, usage dismissal and a
+simulated VisualViewport keyboard inset. It does not launch a native agent or
+open a real device keyboard.
 
 Run native Codex cases separately with an explicitly selected executable/version:
 
