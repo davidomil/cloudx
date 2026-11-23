@@ -78,23 +78,28 @@ describe("native Codex storage accounting", () => {
     expect(await fs.readFile(config, "utf8")).toContain('private_token = "secret"');
   });
 
-  it("classifies configured nested SQLite files and sidecars before counting their hard-linked aliases", async () => {
+  it.each(["sqlite", "db.sqlite"])("classifies configured SQLite directory %s, its sidecars and hard-linked aliases once", async directory => {
     const f = await fixture();
-    const sqlite = path.join(f.home, "sqlite");
+    const sqlite = path.join(f.home, directory);
     const config = await f.write("native/config.toml", `sqlite_home = ${JSON.stringify(sqlite)}\n`);
-    const database = await f.write("native/sqlite/thread_history_1.sqlite", "d".repeat(1_048_576));
-    const wal = await f.write("native/sqlite/thread_history_1.sqlite-wal", "w".repeat(8_192));
-    const shm = await f.write("native/sqlite/thread_history_1.sqlite-shm", "s".repeat(4_096));
-    const journal = await f.write("native/sqlite/thread_history_1.sqlite-journal", "j".repeat(4_096));
+    const database = await f.write(`native/${directory}/thread_history_1.sqlite`, "d".repeat(1_048_576));
+    const wal = await f.write(`native/${directory}/thread_history_1.sqlite-wal`, "w".repeat(8_192));
+    const shm = await f.write(`native/${directory}/thread_history_1.sqlite-shm`, "s".repeat(4_096));
+    const journal = await f.write(`native/${directory}/thread_history_1.sqlite-journal`, "j".repeat(4_096));
     const artifact = await f.write("native/keep.sqlite-artifact", "user artifact");
+    const notes = await f.write(`native/${directory}/notes.txt`, "retained notes");
     await fs.link(database, path.join(f.home, "history-alias"));
+    await fs.link(database, path.join(sqlite, "database-alias.sqlite"));
     const result = await f.service.read();
+    const userFiles = await Promise.all([config, artifact, notes].map(file => fs.lstat(file)));
     expect(result.warnings).toEqual([]);
+    expect(result.sqliteHomes).toEqual([f.home, sqlite]);
     expect(result.native.nativeDatabases).toMatchObject({ files: 4, logicalBytes: 1_064_960 });
-    expect(result.native.userData.files).toBe(2);
-    const allocations = await Promise.all([f.home, sqlite, config, database, wal, shm, journal, artifact].map(file => fs.lstat(file)));
+    expect(result.native.userData).toMatchObject({ files: 3, logicalBytes: userFiles.reduce((bytes, stat) => bytes + stat.size, 0) });
+    const allocations = [...userFiles, ...await Promise.all([f.home, sqlite, database, wal, shm, journal].map(file => fs.lstat(file)))];
     expect(result.total.allocatedBytes).toBe(allocations.reduce((bytes, stat) => bytes + stat.blocks * 512, 0));
-    expect(result.total.files).toBe(6);
+    expect(result.total.logicalBytes).toBe(allocations.reduce((bytes, stat) => bytes + (stat.isFile() ? stat.size : 0), 0));
+    expect(result.total.files).toBe(7);
   });
 
   it("does not traverse a history symlink into unrelated storage and supports cancellation", async () => {

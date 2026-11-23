@@ -156,8 +156,8 @@ async function scanStorage(root: string, totals: CodexStorageCategories, seen: S
     if (databasesOnly && relative && category(relative) !== "nativeDatabases") return;
     const key = `${stat.dev}:${stat.ino}`;
     if (seen.has(key)) return;
-    // A database-only pass does not consume its root: the source scan still owns its directory allocation and other contents.
-    if (!databasesOnly || relative) seen.add(key);
+    // Database-only passes leave directories available for configured roots and the full source scan.
+    if (!databasesOnly || !stat.isDirectory()) seen.add(key);
     if (stat.isDirectory()) {
       const handle = await fs.open(file, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       try {
