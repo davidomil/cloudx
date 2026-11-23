@@ -1507,7 +1507,6 @@ class DocumentationArchive:
         source_bytes = snapshot_path.read_bytes()
         if sha256_bytes(source_bytes) != document["content_sha256"]:
             raise ArchiveError("The archived source snapshot does not match its recorded content hash.")
-        self._retain_snapshot_readers(snapshot_path, document)
         manifest = json.loads(document["source_manifest_json"])
         if manifest.get("rebuildBlocked"):
             raise ArchiveError(manifest["rebuildBlocked"])
@@ -1581,6 +1580,7 @@ class DocumentationArchive:
                 current = db.execute("SELECT state, extraction_revision FROM documents WHERE document_id = ?", (document_id,)).fetchone()
                 if not current or current["state"] != ACTIVE_STATE or current["extraction_revision"] != document["extraction_revision"]:
                     raise ArchiveError("Source changed while reanalysis was running; this result was not published.")
+                self._retain_snapshot_readers(db, snapshot_path, document)
                 staged_snapshot.parent.rename(replacement.parent)
                 db.execute("DELETE FROM document_enrichment_outcomes WHERE document_id = ?", (document_id,))
                 db.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
@@ -1987,14 +1987,13 @@ class DocumentationArchive:
                     return IngestedDocument(document_id, existing_document["title"], source_type, ACTIVE_STATE, count, content_sha256)
         now = timestamp()
 
-        if existing_document:
-            previous_snapshot = self.root / safe_archive_relative_path(existing_document["snapshot_path"])
-            if previous_snapshot.parent.parent == self.snapshots_dir and not previous_snapshot.parent.is_symlink():
-                self._retain_snapshot_readers(previous_snapshot, existing_document)
-
         def write_document(db: sqlite3.Connection) -> None:
             require_source_revision(db, expected_source)
-            existing = db.execute("SELECT document_id FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+            existing = db.execute("SELECT * FROM documents WHERE document_id = ?", (document_id,)).fetchone()
+            if existing:
+                previous_snapshot = self.root / safe_archive_relative_path(existing["snapshot_path"])
+                if previous_snapshot.parent.parent == self.snapshots_dir and not previous_snapshot.parent.is_symlink():
+                    self._retain_snapshot_readers(db, previous_snapshot, existing)
             superseded_documents = db.execute(
                 "SELECT document_id, state FROM documents WHERE source_key = ? AND document_id != ? AND state = ?",
                 (source_key, document_id, ACTIVE_STATE),
@@ -2251,22 +2250,23 @@ class DocumentationArchive:
             raise
         return artifact
 
-    def _discard_unreferenced_snapshot(self, snapshot_path: Path, *, excluding_purge_id: int | None = None) -> None:
+    def _discard_unreferenced_snapshot(self, snapshot_path: Path, *, purging: bool = False) -> bool:
         with self._write_lock:
-            self._discard_snapshot_under_lock(snapshot_path, excluding_purge_id=excluding_purge_id)
+            return self._discard_snapshot_under_lock(snapshot_path, purging=purging)
 
-    def _retain_snapshot_readers(self, snapshot_path: Path, document: Mapping) -> None:
-        with self._write_lock, self._connect() as db:
-            readers = [row[0] for row in db.execute(
-                "SELECT run_id FROM enrichment_runs WHERE document_id = ? AND extraction_revision = ? AND status = 'running' AND lease_until > ?",
-                (document["document_id"], document["extraction_revision"], time.time()),
-            )]
-            self._extraction_storage.claim(snapshot_path.parent, reader_run_ids=readers)
+    def _retain_snapshot_readers(self, db: sqlite3.Connection, snapshot_path: Path, document: Mapping) -> None:
+        readers = [row[0] for row in db.execute(
+            "SELECT run_id FROM enrichment_runs WHERE document_id = ? AND extraction_revision = ? AND status = 'running' AND lease_until > ?",
+            (document["document_id"], document["extraction_revision"], time.time()),
+        )]
+        self._extraction_storage.claim(snapshot_path.parent, reader_run_ids=readers)
 
-    def _discard_snapshot_under_lock(self, snapshot_path: Path, *, excluding_purge_id: int | None = None) -> None:
+    def _discard_snapshot_under_lock(self, snapshot_path: Path, *, purging: bool = False) -> bool:
         directory = snapshot_path.parent
         if directory.parent != self.snapshots_dir or directory.is_symlink() or self.snapshots_dir.is_symlink():
             raise ArchiveError("Snapshot cleanup must stay inside archive snapshots.")
+        if not directory.exists():
+            return True
         relative_path = snapshot_path.relative_to(self.root).as_posix()
         relative_directory = snapshot_path.parent.relative_to(self.root).as_posix() + "/"
         with self._connect() as db:
@@ -2276,22 +2276,27 @@ class DocumentationArchive:
                     (relative_path, len(relative_directory), relative_directory),
                 ).fetchone()[0]
             )
-            reference_count += db.execute(
-                "SELECT COUNT(*) FROM purge_events WHERE cleanup_status = 'pending' AND (snapshot_path = ? OR substr(snapshot_path, 1, ?) = ?) AND (? IS NULL OR purge_id != ?)",
-                (relative_path, len(relative_directory), relative_directory, excluding_purge_id, excluding_purge_id),
-            ).fetchone()[0]
+            # Pending purges protect payloads from reconciliation, but do not block
+            # another authorized purge of the same directory after its last source.
+            if not purging:
+                reference_count += db.execute(
+                    "SELECT COUNT(*) FROM purge_events WHERE cleanup_status = 'pending' AND (snapshot_path = ? OR substr(snapshot_path, 1, ?) = ?)",
+                    (relative_path, len(relative_directory), relative_directory),
+                ).fetchone()[0]
             for run_id in self._extraction_storage.reader_run_ids(directory):
                 reference_count += db.execute(
                     "SELECT COUNT(*) FROM enrichment_runs WHERE run_id = ? AND status IN ('running','obsolete') AND lease_until > ?",
                     (run_id, time.time()),
                 ).fetchone()[0]
-        if reference_count == 0 and snapshot_path.parent.exists():
+        if reference_count == 0:
             with self._extraction_storage.retirement_lease(directory) as unused:
                 if unused:
                     if self._extraction_storage.owns(directory):
                         self._extraction_storage.remove(directory)
                     else:
                         shutil.rmtree(directory)
+                    return True
+        return False
 
     def reconcile_extraction_storage(self) -> dict[str, Any]:
         reclaimed = 0

@@ -137,6 +137,7 @@ it.each(["0.156.1", "0.157.1", "0.166.0"])("runs the complete serial native suit
     "apps/server/src/rulesSkills/CodexSkillOverrides.native.test.ts",
     "apps/server/src/plugins/CodexVersionSelection.native.test.ts",
     "apps/server/src/plugins/CodexFirstSelection.native.test.ts",
+    "apps/server/src/plugins/CodexHistoryMaintenance.native.test.ts",
     "scripts/codex-updater.native.test.mjs"
   ]);
   expect(result.commands[1].args).toContain("--maxWorkers=1");

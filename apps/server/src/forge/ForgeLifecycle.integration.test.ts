@@ -69,6 +69,7 @@ describe.skipIf(process.platform !== "linux")("Forge lifecycle through real Code
   it("retires held issue and reviewer snapshots across attempts after merge and restart", async () => {
     const fixture = await LifecycleFixture.create();
     const issue = await fixture.workflow.startIssue(repository, 1, fixture.placement);
+    expect(await fixture.sessionRequests("config/read")).toEqual([{ includeLayers: false }]);
     const implementation = await fixture.completedAssistantTurn(issue);
     await fs.mkdir(path.join(issue.worktreePath!, ".git/info"), { recursive: true });
     await fs.appendFile(path.join(issue.worktreePath!, ".git/info/exclude"), "\n.cloudx/\nnode_modules/\n");
@@ -2788,6 +2789,12 @@ if (args.includes("app-server")) {
     try {
       let result;
       if (request.method === "initialize") result = { userAgent: "Forge native CLI fixture", codexHome: process.env.CODEX_HOME };
+      else if (request.method === "config/read") {
+        if (Object.keys(request.params ?? {}).length !== 1 || request.params.includeLayers !== false)
+          throw new Error("Forge requires effective configuration without layers.");
+        const config = parse(fs.readFileSync(path.join(process.env.CODEX_HOME, "config.toml"), "utf8"));
+        result = { config, origins: {}, layers: null };
+      }
       else if (request.method === "thread/start") {
         if (request.params.ephemeral !== false) throw new Error("Forge must create a durable conversation.");
         fs.mkdirSync(path.join(process.env.CODEX_HOME, "sessions"), { recursive: true });

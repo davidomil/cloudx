@@ -31,21 +31,21 @@ make this differ from a filesystem free-space measurement. Incomplete scans
 report warnings.
 
 Only authoritative terminal Forge work can request `CodexHistoryMaintenance`.
-Its recorded native version, executable, source, effective SQLite home and launch
-identity must still match. Session admission excludes pending resume and recovery
-consumers throughout retirement. Recovery needs, user adoption, retained files,
-references, spawned descendants and attachments preserve history.
+Session admission and the terminal-work owner still check consumers and holds.
+The service records the selected native version and a retention reason.
 
-Deletion is enabled only for Codex **0.166.0**, whose
-[native lifecycle and locks](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/thread-store/src/local/delete_thread.rs)
-were verified with isolated real processes. The service calls native
-`thread/delete`, which owns writer/reference locks and projection removal. It
-never edits native schemas, truncates JSONL, or deletes database files. A durable
-intent receipt precedes deletion. An uncertain acknowledgement or process exit
-remains held across restart. Settings exposes those reasons and unsupported
-versions. Legacy bindings without an effective SQLite-home receipt remain held.
-No supported foreground compaction or deduplication of retained native history
-was verified.
+Automatic native deletion is unavailable for every current version. Codex
+**0.166.0** has native mutation locks, but its
+[`thread/delete` request](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server-protocol/schema/typescript/v2/ThreadDeleteParams.ts)
+has no condition that protects newly added attachments or descendants. Separate
+preflight requests cannot reserve that eligibility against another native client.
+A real two-client regression confirms the concurrent attachment remains readable
+and its conversation can resume while maintenance retains history.
+
+CloudX does not issue native deletion requests, edit native schemas, truncate
+JSONL, or delete database files. Earlier uncertain removal receipts remain held
+across restart. Settings exposes the limitation and retention reasons. No safe
+foreground compaction or deduplication of retained native history was verified.
 
 ## Forge archives
 

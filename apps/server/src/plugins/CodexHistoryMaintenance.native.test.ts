@@ -60,7 +60,7 @@ async function fixture(providerUrl = "http://127.0.0.1:9/v1") {
   return { root, data, home, version, env, launch, native, sources, connect, createThread, bind, maintenance };
 }
 
-it.skipIf(!binary)("reclaims an owned native rollout through lifecycle locks while retained history still resumes and forks", async () => {
+it.skipIf(!binary)("retains owned native history and projections while native eligibility cannot be atomic", async () => {
   const f = await fixture(await syntheticProvider(false));
   const owned = await f.createThread("Disposable terminal Forge history. ".repeat(12_000));
   const retained = await f.createThread("Retained interactive user conversation.");
@@ -87,20 +87,15 @@ it.skipIf(!binary)("reclaims an owned native rollout through lifecycle locks whi
     await fs.writeFile(path.join(f.home, "config.toml"), `sqlite_home = ${JSON.stringify(foreign)}\n${originalConfig}`);
   }
   const result = await f.maintenance.retire("native-worker", binding, async () => {}, admit);
-  if (f.version !== "0.166.0") {
-    expect(result.state).toBe("retained");
-    expect(result.reason).toContain("unverified Codex");
-    expect((await fs.stat(owned.path)).size).toBeGreaterThan(0);
-  } else {
-    expect(result).toMatchObject({ state: "removed", selectedVersion: "0.166.0" });
-    expect(result.reclaimedBytes).toBeGreaterThan(100_000);
+  expect(result).toMatchObject({ state: "retained", selectedVersion: f.version });
+  expect(result.reason).toMatch(/atomic/);
+  expect(result.reclaimedBytes).toBeUndefined();
+  expect((await fs.stat(owned.path)).size).toBeGreaterThan(0);
+  if (f.version === "0.166.0") {
     expect(projectionBefore).toBeGreaterThan(0);
-    expect(await projectionRows(f.home, owned.id)).toBe(0);
+    expect(await projectionRows(f.home, owned.id)).toBe(projectionBefore);
     expect(await projectionRows(f.home, retained.id)).toBeGreaterThan(0);
     expect(await fs.readFile(path.join(foreign, "state_5.sqlite"), "utf8")).toBe("Unrelated database sentinel; must never be opened for maintenance");
-    await expect(fs.stat(owned.path)).rejects.toMatchObject({ code: "ENOENT" });
-    expect(await f.maintenance.retire("native-worker", binding, async () => {}, admit)).toEqual(result);
-    console.log(JSON.stringify({ nativeVersion: f.version, ...result }));
   }
   await fs.writeFile(path.join(f.home, "config.toml"), originalConfig);
   const reader = await f.connect();
@@ -170,12 +165,12 @@ it.skipIf(!binary)("retains roots with native spawned descendants, including arc
   await f.native.close();
   const binding = await f.bind(root.id);
   const result = await f.maintenance.retire("descendant-worker", binding, async () => {}, admit);
-  expect(result).toMatchObject({ state: "retained", reason: expect.stringContaining("spawned descendants") });
+  expect(result).toMatchObject({ state: "retained", reason: expect.stringContaining("atomically") });
   const archiver = await f.connect();
   await archiver.client.request("thread/archive", { threadId: child.id });
   await archiver.transport.finish(); await archiver.close();
   const archived = await f.maintenance.retire("descendant-worker", binding, async () => {}, admit);
-  expect(archived).toMatchObject({ state: "retained", reason: expect.stringContaining("spawned descendants") });
+  expect(archived).toMatchObject({ state: "retained", reason: expect.stringContaining("atomically") });
   expect((await fs.stat(root.path)).size).toBeGreaterThan(0);
 }, 45_000);
 
@@ -192,5 +187,38 @@ it.skipIf(!binary)("preserves native history when another process still holds it
   const result = await f.maintenance.retire("live-native-worker", await f.bind(owned.id), async () => {}, admit);
   expect(result.state).not.toBe("removed");
   expect((await fs.stat(owned.path)).size).toBeGreaterThan(0);
-  if (f.version === "0.166.0") expect(result.reason).toMatch(/writer|in use|owned|lock|loaded/iu);
+  if (f.version === "0.166.0") expect(result.reason).toContain("atomically");
+}, 45_000);
+
+it.skipIf(!binary)("preserves an attachment acknowledged by another native client during maintenance eligibility", async () => {
+  const f = await fixture();
+  const owned = await f.createThread("A terminal Forge conversation is still accessible to native attachment clients.");
+  if (f.version !== "0.166.0") {
+    expect((await f.maintenance.retire("attachment-worker", await f.bind(owned.id), async () => {}, admit)).state).toBe("retained");
+    return;
+  }
+  await f.native.client.request("thread/unsubscribe", { threadId: owned.id });
+  await f.native.transport.finish(); await f.native.close();
+  const external = await f.connect();
+  let entered!: () => void;
+  let release!: () => void;
+  const checking = new Promise<void>(resolve => { entered = resolve; });
+  const attached = new Promise<void>(resolve => { release = resolve; });
+  const pending = f.maintenance.retire("attachment-worker", await f.bind(owned.id), async () => {
+    entered(); await attached;
+  }, admit);
+  await checking;
+  const payload = { review: "User attachment created during maintenance eligibility." };
+  try {
+    await external.client.request("thread/attachment/add", {
+      threadId: owned.id, attachmentType: "review", identityKey: "late-user-attachment", payload,
+    });
+  } finally { release(); }
+  const result = await pending;
+  expect(result).toMatchObject({ state: "retained", reason: expect.stringContaining("atomically") });
+  expect((await fs.stat(owned.path)).size).toBeGreaterThan(0);
+  const attachments = await external.client.request("thread/attachment/list", { threadId: owned.id }) as { data: Array<{ payload: unknown }> };
+  expect(attachments.data.map(item => item.payload)).toContainEqual(payload);
+  const resumed = await external.client.request("thread/resume", { threadId: owned.id }) as { thread: { id: string } };
+  expect(resumed.thread.id).toBe(owned.id);
 }, 45_000);

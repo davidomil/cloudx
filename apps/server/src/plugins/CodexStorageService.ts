@@ -8,9 +8,11 @@ import { readCodexVersion } from "../../../../scripts/codex-updater.mjs";
 import { buildToolEnv, resolveAssistantCommand } from "../terminal/ShellLaunch.js";
 import type { CodexStateSources } from "./CodexStateSources.js";
 
-// The native lifecycle implementations and writer/reference checks were reviewed at these tags.
-// https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/thread-store/src/local/delete_thread.rs
-export const CODEX_HISTORY_MAINTENANCE_VERSIONS = new Set(["0.166.0"]);
+export function codexHistoryMaintenanceLimitation(version: string | null): string {
+  return version === "0.166.0"
+    ? "Codex 0.166.0 cannot atomically require no attachments or descendants when deleting a thread. Automatic history deletion is unavailable; conversations and artifacts are retained."
+    : `No atomic history-retirement operation has been verified for Codex ${version ?? "unknown"}. Conversations and artifacts are retained.`;
+}
 
 export const emptyStorageBytes = (): CodexStorageBytes => ({ logicalBytes: 0, allocatedBytes: 0, files: 0 });
 const categories = (): CodexStorageCategories => ({ sessionHistory: emptyStorageBytes(), nativeDatabases: emptyStorageBytes(), userData: emptyStorageBytes(), rebuildableCaches: emptyStorageBytes() });
@@ -53,15 +55,15 @@ export class CodexStorageService {
     const seen = new Set<string>();
     const canonicalSources = await canonicalRoots(sourceHomes, warnings);
     const canonicalSqlite = await canonicalRoots(sqliteHomes, warnings);
+    // Configured database identities take precedence over source-relative classification.
+    for (const home of canonicalSqlite) await scanStorage(home, native, seen, signal, warnings, true);
     for (const home of canonicalSources) await scanStorage(home, native, seen, signal, warnings);
-    for (const home of canonicalSqlite) if (!canonicalSources.includes(home)) await scanStorage(home, native, seen, signal, warnings, true);
     for (const name of await optionalDirectory(launchesPath)) await scanStorage(path.join(launchesPath, name), launches, seen, signal, warnings);
     let selectedVersion: string | null = null;
     try {
       const env = buildToolEnv(this.env);
       selectedVersion = await readCodexVersion(resolveAssistantCommand(env), { env, signal });
     } catch { signal?.throwIfAborted(); }
-    const supported = selectedVersion !== null && CODEX_HISTORY_MAINTENANCE_VERSIONS.has(selectedVersion);
     const retainedHistory: CodexStorageInventory["maintenance"]["retainedHistory"] = [];
     const retirements = path.join(this.sources.dataDir, "codex-history-retirement");
     for (const name of await optionalDirectory(retirements)) {
@@ -83,10 +85,9 @@ export class CodexStorageService {
       native, launches, total, warnings,
       measurementNote: "Allocated bytes use st_blocks × 512. Hard links are counted once and launch history links are not followed. Shared filesystem extents and concurrent writes can change physical free-space results.",
       maintenance: {
-        selectedVersion, ownedHistoryDeletion: supported ? "supported" : "unavailable",
-        reason: supported ? "Only terminal Forge-owned conversations with verified source identity and no recovery need, consumer, reference or hold are eligible. Interactive and unknown history is retained. Native thread/delete owns locking and projection removal."
-          : `Native history maintenance has not been verified for Codex ${selectedVersion ?? "unknown"}. All history is retained.`,
-        projectionReclamation: "Native thread/delete removes an eligible conversation's projections. No supported foreground operation was verified to compact live history databases or deduplicate retained payloads. No JSONL truncation, database deletion, direct schema edits or backup copies are used.",
+        selectedVersion, ownedHistoryDeletion: "unavailable",
+        reason: codexHistoryMaintenanceLimitation(selectedVersion),
+        projectionReclamation: "Native thread/delete can remove projections, but its eligibility checks cannot exclude concurrent attachment or descendant changes. No supported foreground operation was verified to compact live history databases or deduplicate retained payloads. CloudX does not delete native history, truncate JSONL, edit schemas or make backup copies.",
         retainedHistory,
       },
     };
@@ -155,7 +156,8 @@ async function scanStorage(root: string, totals: CodexStorageCategories, seen: S
     if (databasesOnly && relative && category(relative) !== "nativeDatabases") return;
     const key = `${stat.dev}:${stat.ino}`;
     if (seen.has(key)) return;
-    seen.add(key);
+    // A database-only pass does not consume its root: the source scan still owns its directory allocation and other contents.
+    if (!databasesOnly || relative) seen.add(key);
     if (stat.isDirectory()) {
       const handle = await fs.open(file, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
       try {

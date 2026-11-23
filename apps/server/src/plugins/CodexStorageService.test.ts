@@ -41,7 +41,8 @@ describe("native Codex storage accounting", () => {
     expect(result.launches.rebuildableCaches).toMatchObject({ files: 2, logicalBytes: 100_000 });
     expect(result.native.userData.files).toBe(2);
     expect(JSON.stringify(result)).not.toContain("private-value");
-    expect(result.maintenance.ownedHistoryDeletion).toBe("supported");
+    expect(result.maintenance.ownedHistoryDeletion).toBe("unavailable");
+    expect(result.maintenance.reason).toContain("atomically");
     expect(result.maintenance.projectionReclamation).toContain("No supported foreground operation");
   });
 
@@ -75,6 +76,25 @@ describe("native Codex storage accounting", () => {
     expect(result.maintenance).toMatchObject({ selectedVersion: "0.156.1", ownedHistoryDeletion: "unavailable" });
     expect(JSON.stringify(result)).not.toContain('private_token');
     expect(await fs.readFile(config, "utf8")).toContain('private_token = "secret"');
+  });
+
+  it("classifies configured nested SQLite files and sidecars before counting their hard-linked aliases", async () => {
+    const f = await fixture();
+    const sqlite = path.join(f.home, "sqlite");
+    const config = await f.write("native/config.toml", `sqlite_home = ${JSON.stringify(sqlite)}\n`);
+    const database = await f.write("native/sqlite/thread_history_1.sqlite", "d".repeat(1_048_576));
+    const wal = await f.write("native/sqlite/thread_history_1.sqlite-wal", "w".repeat(8_192));
+    const shm = await f.write("native/sqlite/thread_history_1.sqlite-shm", "s".repeat(4_096));
+    const journal = await f.write("native/sqlite/thread_history_1.sqlite-journal", "j".repeat(4_096));
+    const artifact = await f.write("native/keep.sqlite-artifact", "user artifact");
+    await fs.link(database, path.join(f.home, "history-alias"));
+    const result = await f.service.read();
+    expect(result.warnings).toEqual([]);
+    expect(result.native.nativeDatabases).toMatchObject({ files: 4, logicalBytes: 1_064_960 });
+    expect(result.native.userData.files).toBe(2);
+    const allocations = await Promise.all([f.home, sqlite, config, database, wal, shm, journal, artifact].map(file => fs.lstat(file)));
+    expect(result.total.allocatedBytes).toBe(allocations.reduce((bytes, stat) => bytes + stat.blocks * 512, 0));
+    expect(result.total.files).toBe(6);
   });
 
   it("does not traverse a history symlink into unrelated storage and supports cancellation", async () => {

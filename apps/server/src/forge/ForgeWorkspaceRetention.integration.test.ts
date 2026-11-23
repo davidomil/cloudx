@@ -16,6 +16,7 @@ import { ForgeWorkflowService, type ForgeWorkflowDependencies } from "./ForgeWor
 import { ForgeWorkerReports, ForgeWorkflowStore } from "./ForgeWorkflowStore.js";
 import { ForgeCheckoutEvidence } from "./ForgeCheckoutEvidence.js";
 import { ForgeGitHistory } from "./ForgeGitHistory.js";
+import { ForgeArchiveRetirement } from "./ForgeArchiveRetirement.js";
 import { createHash } from "node:crypto";
 import type { ForgeIssueCompletionReport } from "@cloudx/shared";
 
@@ -29,6 +30,71 @@ afterEach(async () => {
 });
 
 describe("Forge workflow retention after completed workspace discard", () => {
+  it("retires reports after real runtime cleanup when an issue closes before publication", async () => {
+    const fixture = await RetentionFixture.create("issue", false, { initiallyRetained: false });
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    fixture.worker.headSha = undefined;
+    fixture.worker.status = "paused";
+    await fixture.store.write([fixture.worker]);
+    const archives = new ForgeArchiveRetirement(fixture.dataDir);
+    fixture.workflowDependencies.retireArchives = async (worker, workers) => { await archives.retire(worker, workers, []); };
+    fixture.workflowDependencies.reconcileArchives = async workers => { await archives.reconcile(workers, []); };
+    await fixture.restart();
+
+    await fixture.service.poll();
+
+    expect(await fixture.store.read()).toEqual([]);
+    expect(await fixture.receipt()).toMatchObject({ cleaned: true, snapshotRetirement: true });
+    expect((await fixture.receipt()).evidenceRetirement).toBeUndefined();
+    expect(await fixture.reports.read(fixture.worker.attemptId!)).toBeUndefined();
+    await expect(fs.lstat(path.join(fixture.dataDir, "forge-reports", `${fixture.worker.attemptId}.context.json`))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(fs.lstat(fixture.workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await archives.audit()).payloads.every(payload => payload.state === "retired")).toBe(true);
+    await fixture.restart();
+    await expect(fixture.service.poll()).resolves.toBeUndefined();
+  });
+
+  it("reconciles another eligible owner after rediscovering an unpublished closed issue", async () => {
+    const fixture = await RetentionFixture.create("issue", false, { initiallyRetained: false });
+    await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));
+    const headSha = fixture.worker.headSha!;
+    fixture.worker.headSha = undefined;
+    fixture.worker.status = "paused";
+    await fixture.store.write([fixture.worker]);
+    const archives = new ForgeArchiveRetirement(fixture.dataDir);
+    fixture.workflowDependencies.retireArchives = async (worker, workers) => { await archives.retire(worker, workers, []); };
+    fixture.workflowDependencies.reconcileArchives = async workers => { await archives.reconcile(workers, []); };
+    await fixture.restart();
+    await fixture.service.poll();
+    const journal = await archives.audit();
+    delete journal.owners[0]!.discovered;
+    await fs.writeFile(path.join(fixture.dataDir, "forge-archive-retirement.json"), JSON.stringify(journal));
+
+    const id = randomUUID();
+    const runtime = fixture.workflowDependencies.runtime as ForgeRuntime;
+    const workspace = await runtime.prepareWorkspace({ id, expectedRepository: repository, baseBranch: "main", review: false });
+    const worker: ForgeWorker = { ...fixture.worker, id, number: 179, headSha, status: "completed", attemptId: randomUUID(),
+      repositoryPath: workspace.repositoryPath, worktreePath: workspace.worktreePath, branch: workspace.branch };
+    const report = await fixture.reports.prepare(worker.attemptId!, { issue: 179 });
+    await fixture.reports.recordOwner(worker.attemptId!, worker.id);
+    await fs.writeFile(report.reportPath, JSON.stringify(fixture.report));
+    await fixture.restart();
+    await fixture.store.write([worker]);
+
+    await fixture.service.poll();
+
+    expect(await fixture.store.read()).toEqual([]);
+    const retired = await archives.audit();
+    expect(retired.owners.map(owner => owner.workerId).sort()).toEqual([fixture.worker.id, worker.id].sort());
+    expect(retired.payloads.filter(payload => payload.state !== "retired")).toEqual([]);
+    expect(await fixture.reports.read(worker.attemptId!)).toBeUndefined();
+    await expect(fs.lstat(workspace.worktreePath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(retired.owners.every(owner => owner.discovered)).toBe(true);
+    expect(retired.payloads.every(payload => payload.state === "retired")).toBe(true);
+    await fixture.restart();
+    await expect(fixture.service.poll()).resolves.toBeUndefined();
+  });
+
   it.each([16 * 1024 * 1024 + 1, 32 * 1024 * 1024 + 1, 34_048_143])("hands off a named %i-byte checkout report before retiring the worker, and serves it after restart", async bytes => {
     const fixture = await RetentionFixture.create();
     await fs.unlink(path.join(fixture.workspace.worktreePath, "research.txt"));

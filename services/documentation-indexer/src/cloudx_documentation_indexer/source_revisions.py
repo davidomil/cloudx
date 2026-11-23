@@ -239,7 +239,9 @@ class SourceRevisions:
             if not snapshot.resolve().is_relative_to(self.archive.snapshots_dir.resolve()) or snapshot.parent.resolve() == self.archive.snapshots_dir.resolve():
                 raise ArchiveError("Pending purge cleanup is outside archive snapshots.")
             try:
-                self.archive._discard_unreferenced_snapshot(snapshot, excluding_purge_id=purge_id)
+                removed = self.archive._discard_unreferenced_snapshot(snapshot, purging=True)
+                if not removed:
+                    error = "Source snapshot cleanup is deferred while it is referenced or has active readers."
             except OSError as failure:
                 error = str(failure)[:4000]
             with self.archive._connect() as db:

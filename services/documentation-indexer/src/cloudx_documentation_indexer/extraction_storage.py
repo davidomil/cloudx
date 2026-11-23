@@ -14,6 +14,8 @@ import threading
 import uuid
 import weakref
 
+from .enrichment_runs import valid_run_id
+
 
 STORAGE_DIRECTORY = ".extraction-storage"
 OWNER_FILE = ".cloudx-extraction-owner.json"
@@ -112,16 +114,28 @@ class ExtractionStorage:
         os.replace(temporary.name, marker)
 
     def owns(self, directory: Path) -> bool:
+        return self._owned_receipt(directory) is not None
+
+    def _owned_receipt(self, directory: Path) -> dict | None:
         try:
             if directory.is_symlink() or not directory.is_dir() or (directory / OWNER_FILE).is_symlink():
-                return False
+                return None
             receipt = json.loads((directory / OWNER_FILE).read_text())
+            if not isinstance(receipt, dict) or receipt.keys() - {"owner", "device", "inode", "readerRunIds"}:
+                return None
+            if type(receipt.get("device")) is not int or type(receipt.get("inode")) is not int:
+                return None
+            readers = receipt.get("readerRunIds", [])
+            if not isinstance(readers, list) or any(not valid_run_id(run_id) for run_id in readers):
+                return None
             status = directory.stat()
-            return all(receipt.get(key) == value for key, value in {
+            if all(receipt.get(key) == value for key, value in {
                 "owner": self.identity, "device": status.st_dev, "inode": status.st_ino,
-            }.items())
+            }.items()):
+                return receipt
         except (OSError, ValueError):
-            return False
+            pass
+        return None
 
     @contextmanager
     def staging(self):
@@ -175,10 +189,8 @@ class ExtractionStorage:
         directory.rmdir()
 
     def reader_run_ids(self, directory: Path) -> list[str]:
-        if self.owns(directory):
-            receipt = json.loads((directory / OWNER_FILE).read_text())
-            return receipt.get("readerRunIds", [])
-        return []
+        receipt = self._owned_receipt(directory)
+        return receipt.get("readerRunIds", []) if receipt is not None else []
 
     def reader_lease(self, directory: Path) -> int:
         lease = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { buffer } from "node:stream/consumers";
-import { describe, expect, it, onTestFinished } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import type { DisposableResource, ForgeCheckoutEvidenceReceipt, ForgeWorker } from "@cloudx/shared";
 import { readDirectoryIdentity } from "../directoryIdentity.js";
 import { JsonStateFile } from "../jsonStateFile.js";
@@ -87,6 +87,51 @@ describe("Forge archive retirement", () => {
     expect((await buffer(stream)).toString()).toBe("passed\n".repeat(2000));
     if (!stream.closed) await once(stream, "close");
     expect((await fixture.retirement.reconcile([], [])).eligible).toBe(true);
+  });
+
+  it.each(["checkout", "Git history", "container", "legacy container"] as const)("retains a %s download while manifest verification is paused", async kind => {
+    const fixture = await downloadFixture(kind);
+    let entered!: () => void;
+    let resume!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { resume = resolve; });
+    const open = fs.open.bind(fs);
+    let waiting = true;
+    const pause = vi.spyOn(fs, "open").mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+      if (waiting && String(args[0]) === fixture.manifestFile) {
+        waiting = false;
+        entered();
+        await gate;
+      }
+      return open(...args);
+    });
+    let stream: Readable | undefined;
+    const request = fixture.download().then(value => { stream = value; return { stream: value, error: undefined }; }, error => ({ stream: undefined, error }));
+    onTestFinished(async () => { resume(); pause.mockRestore(); await request; stream?.destroy(); });
+    await paused;
+    let retirement;
+    try { retirement = await fixture.retirement.retire(fixture.worker, [], fixture.resources); }
+    finally { resume(); pause.mockRestore(); }
+    const outcome = await request;
+    expect(retirement.eligible).toBe(false);
+    expect(retirement.heldPaths).toEqual([fixture.archivePath]);
+    expect(outcome.error).toBeUndefined();
+    expect((await buffer(outcome.stream!)).toString()).toBe(fixture.contents);
+    if (!outcome.stream!.closed) await once(outcome.stream!, "close");
+    expect((await fixture.retirement.reconcile([], fixture.resources)).eligible).toBe(true);
+    await expect(fs.lstat(path.join(fixture.root, fixture.archivePath))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["checkout", "Git history", "container", "legacy container"] as const)("releases %s download retention when verification fails", async kind => {
+    const fixture = await downloadFixture(kind);
+    const open = fs.open.bind(fs);
+    const failure = vi.spyOn(fs, "open").mockImplementationOnce(async (...args: Parameters<typeof fs.open>) => {
+      if (String(args[0]) === fixture.manifestFile) throw new Error("Manifest verification unavailable");
+      return open(...args);
+    });
+    try { await expect(fixture.download()).rejects.toThrow("Manifest verification unavailable"); }
+    finally { failure.mockRestore(); }
+    expect((await fixture.retirement.retire(fixture.worker, [], fixture.resources)).eligible).toBe(true);
   });
 
   it("holds active reviewers and shared consumers until each has terminal authority", async () => {
@@ -372,4 +417,47 @@ async function allocated(target: string): Promise<number> {
   const stat = await fs.lstat(target);
   if (!stat.isDirectory()) return stat.blocks * 512;
   return stat.blocks * 512 + (await Promise.all((await fs.readdir(target)).map(name => allocated(path.join(target, name))))).reduce((a, b) => a + b, 0);
+}
+
+async function downloadFixture(kind: "checkout" | "Git history" | "container" | "legacy container") {
+  const fixture = await setup();
+  const resources: DisposableResource[] = [];
+  if (kind === "checkout") {
+    const receipt = await fixture.checkoutEvidence();
+    const archivePath = `forge-checkout-evidence/${receipt.archiveId}`;
+    return { ...fixture, resources, archivePath, manifestFile: path.join(fixture.root, archivePath, "manifest.json"),
+      contents: "passed\n".repeat(2000), download: () => new ForgeCheckoutEvidence(fixture.root).fileStream(receipt.archiveId, "validation.log") };
+  }
+  if (kind === "Git history") {
+    const archiveId = randomUUID();
+    const writer = await new ForgeEvidenceFiles(fixture.root).begin("forge-git-history", archiveId);
+    const contents = "Generated history fixture\n";
+    await writer.add("history.bundle", [Buffer.from(contents)]);
+    const refs = [{ name: `refs/cloudx/before-rebase/${commitSha}`, commitSha }];
+    const manifest = { archiveId, workerId: fixture.worker.id, attemptId: fixture.worker.attemptId!, commitSha,
+      checkoutIdentity: { dev: fixture.workspace.worktree.dev, ino: fixture.workspace.worktree.ino }, refs,
+      exportedAt: new Date().toISOString(), files: writer.files, bytes: writer.bytes };
+    const receipt = { archiveId, attemptId: fixture.worker.attemptId!, commitSha, refs, publication: "complete",
+      manifestSha256: createHash("sha256").update(JSON.stringify(manifest)).digest("hex") };
+    await writer.commit(manifest, () => new JsonStateFile(fixture.root, `forge-workers/workspaces/${fixture.worker.id}.json`, "Fixture ownership")
+      .write({ ...fixture.workspace, gitHistory: receipt }));
+    await writer.abort();
+    const archivePath = `forge-git-history/${archiveId}`;
+    return { ...fixture, resources, archivePath, contents, manifestFile: path.join(fixture.root, archivePath, "manifest.json"),
+      download: () => new ForgeGitHistory(fixture.root).fileStream(archiveId) };
+  }
+  const resource = await fixture.containerEvidence(fixture.worker);
+  resources.push(resource);
+  const contents = "passed";
+  let archivePath = `forge-evidence/${resource.id}`;
+  let manifestFile = path.join(fixture.root, archivePath, "manifest.json");
+  if (kind === "legacy container") {
+    const { manifest } = await new ForgeContainerEvidence(fixture.root).read(resource);
+    archivePath = `forge-evidence/${resource.id}.json`;
+    manifestFile = path.join(fixture.root, archivePath);
+    await fs.writeFile(manifestFile, JSON.stringify({ manifest, contents: { "work/validation.log": Buffer.from(contents).toString("base64") } }));
+    resource.evidence!.archivePath = archivePath;
+  }
+  return { ...fixture, resources, archivePath, contents, manifestFile,
+    download: () => new ForgeContainerEvidence(fixture.root).fileStream(resource, "work/validation.log") };
 }

@@ -7,6 +7,7 @@ import type { DirectoryIdentity } from "../directoryIdentity.js";
 import { JsonStateFile, openOwnedDirectoryNoFollow, requireSafeDirectory } from "../jsonStateFile.js";
 import { ForgeEvidenceFiles, maxEvidenceBytes, maxEvidenceFiles } from "./ForgeEvidenceFiles.js";
 import { isGeneratedForgeLink } from "./ForgeGeneratedArtifacts.js";
+import { retainForgeArchive, retainForgeArchiveStream } from "./ForgeArchiveAccess.js";
 
 const namespace = "forge-checkout-evidence";
 const generatedTrees = new Set(["node_modules", "dist", "build", ".venv", "__pycache__", ".pytest_cache", ".vite"]);
@@ -109,9 +110,12 @@ export class ForgeCheckoutEvidence {
   }
 
   async fileStream(archiveId: string, filePath: string) {
-    const manifest = await this.read(archiveId);
-    if (!manifest.files.some(file => file.path === filePath)) throw new Error("Unknown checkout evidence file.");
-    return this.storage.fileStream(namespace, archiveId, filePath);
+    const release = retainForgeArchive(path.resolve(this.dataDir, namespace, archiveId));
+    try {
+      const manifest = await this.read(archiveId);
+      if (!manifest.files.some(file => file.path === filePath)) throw new Error("Unknown checkout evidence file.");
+      return retainForgeArchiveStream(await this.storage.fileStream(namespace, archiveId, filePath), release);
+    } catch (error) { release(); throw error; }
   }
 
   private async verifyReceipt(workerId: string, identity: DirectoryIdentity, receipt: ForgeCheckoutEvidenceReceipt,

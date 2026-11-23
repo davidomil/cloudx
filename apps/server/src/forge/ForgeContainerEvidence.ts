@@ -9,6 +9,7 @@ import type { DisposableResource, ForgeEvidenceManifest, ForgeResourceEvidence }
 import { JsonStateFile, requireSafeDirectory } from "../jsonStateFile.js";
 import { isForgeDependencyOrBuildPath, isGeneratedForgePath } from "./ForgeGeneratedArtifacts.js";
 import { evidenceLinkContents, ForgeEvidenceFiles, maxEvidenceBytes, maxEvidenceFiles, maxEvidenceCollectionBytes, maxEvidenceCollectionFiles } from "./ForgeEvidenceFiles.js";
+import { retainForgeArchive, retainForgeArchiveStream } from "./ForgeArchiveAccess.js";
 
 export type EvidenceSink = (filePath: string, data: AsyncIterable<Uint8Array>, expectedBytes: number, symbolicLink?: string) => Promise<void>;
 export type ContainerEvidenceSource = (write: EvidenceSink) => Promise<void>;
@@ -223,11 +224,16 @@ export class ForgeContainerEvidence {
   }
 
   async fileStream(resource: DisposableResource, filePath: string) {
-    const archive = await this.read(resource);
-    if (!archive.manifest.files.some(file => file.path === filePath)) throw new Error("Unknown evidence file.");
-    if (archive.contents) return Readable.from([Buffer.from(archive.contents[filePath]!, "base64")]);
-    const batch = archive.manifest.batches?.findIndex(batch => batch.files.some(file => file.path === filePath));
-    return this.storage.fileStream(namespace, resource.id, filePath, batch);
+    const location = resource.evidence?.archivePath === legacyArchivePath(resource.id) ? legacyArchivePath(resource.id) : `${namespace}/${resource.id}`;
+    const release = retainForgeArchive(path.resolve(this.dataDir, location));
+    try {
+      const archive = await this.read(resource);
+      if (!archive.manifest.files.some(file => file.path === filePath)) throw new Error("Unknown evidence file.");
+      const stream = archive.contents ? Readable.from([Buffer.from(archive.contents[filePath]!, "base64")])
+        : await this.storage.fileStream(namespace, resource.id, filePath,
+          archive.manifest.batches?.findIndex(batch => batch.files.some(file => file.path === filePath)));
+      return retainForgeArchiveStream(stream, release);
+    } catch (error) { release(); throw error; }
   }
 
   private async readArchive(resource: DisposableResource): Promise<EvidenceArchive | undefined> {

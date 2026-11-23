@@ -63,6 +63,7 @@ interface Workspace {
   cleanupRemoval?: unknown;
   retainedWorkspace?: unknown;
   explicitRetainedPaths?: string[];
+  snapshotRetirement?: true;
   evidenceRetirement?: { attemptId: string; commitSha: string; paths: string[] };
   checkoutEvidence?: ForgeCheckoutEvidenceReceipt;
   additionalCheckoutEvidence?: ForgeCheckoutEvidenceReceipt[];
@@ -128,12 +129,12 @@ export class ForgeArchiveRetirement {
     const candidates: Candidate[] = [];
     if (workspace) {
       if (workspace.id !== owner.workerId || workspace.cleaned !== true || workspace.gitPending || workspace.launchPending ||
-          workspace.cleanupRemoval || workspace.retainedWorkspace || !workspace.worktree || !workspace.evidenceRetirement)
+          workspace.cleanupRemoval || workspace.retainedWorkspace || !workspace.worktree || !(workspace.evidenceRetirement || workspace.snapshotRetirement === true))
         throw new Error("Forge archive owner still has recoverable or unrecognized workspace state; its archives were preserved.");
       const archive = new ForgeCheckoutEvidence(this.dataDir);
       for (const receipt of [workspace.checkoutEvidence, ...workspace.additionalCheckoutEvidence ?? []]) {
         if (!receipt) continue;
-        const named = [...workspace.explicitRetainedPaths ?? [], ...workspace.evidenceRetirement.paths];
+        const named = [...workspace.explicitRetainedPaths ?? [], ...workspace.evidenceRetirement?.paths ?? []];
         candidates.push({ path: `forge-checkout-evidence/${receipt.archiveId}`, sourcePaths: receipt.paths, attemptId: receipt.attemptId,
           reason: "Completed checkout evidence", retained: receipt.paths.some(file => named.some(named => overlaps(file, named)))
             ? "The completion handoff deliberately retains this evidence." : undefined,
