@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import { isIP } from "node:net";
 import path from "node:path";
+import { assertTerminalMemoryDropIns } from "./terminal-memory-policy.mjs";
 
 export const UPDATE_SERVICE_NAMES = [
   "cloudx-asr.service",
@@ -144,7 +145,7 @@ export function inspectUpdateTarget({ paths, commands, service, port, host }) {
         properties.EnvironmentFiles ?? "",
       )?.[1] ?? "";
     if (
-      properties.DropInPaths ||
+      (properties.DropInPaths && name !== TERMINAL_SERVICE_NAME) ||
       !samePath(
         properties.FragmentPath ?? "",
         path.join(paths.systemdDir, name),
@@ -155,6 +156,11 @@ export function inspectUpdateTarget({ paths, commands, service, port, host }) {
         `${name} does not match the standard Cloudx unit and environment file. Use --service and --port to preserve a custom web service definition.`,
       );
     }
+    if (name === TERMINAL_SERVICE_NAME)
+      assertTerminalMemoryDropIns(properties.DropInPaths ?? "", {
+        systemdDir: paths.systemdDir,
+        configHome: path.dirname(path.dirname(paths.systemdDir)),
+      });
   }
   return {
     kind: "standard",

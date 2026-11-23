@@ -58,7 +58,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install --yes ripgrep
       - run: npm run build
       - name: Verify host-only systemd and cgroup lifecycle
-        run: npx vitest run scripts/managed-update-history.systemd.test.mjs scripts/managed-update-host.systemd.test.mjs scripts/managed-update-systemd.test.mjs scripts/install-runtime-caller.integration.test.mjs --maxWorkers=2 --reporter=dot --reporter=json --outputFile.json=test-results/timings/systemd.json
+        run: npx vitest run scripts/managed-update-history.systemd.test.mjs scripts/managed-update-host.systemd.test.mjs scripts/managed-update-systemd.test.mjs scripts/install-runtime-caller.integration.test.mjs apps/server/src/system/TerminalMemoryService.systemd.test.ts --maxWorkers=2 --reporter=dot --reporter=json --outputFile.json=test-results/timings/systemd.json
       - name: Upload host lifecycle diagnostics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

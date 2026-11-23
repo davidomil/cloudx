@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { execFileSync, spawnSync } from "node:child_process";
-import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { InstallerRunner, runInstaller, parseArgs } from "./install-cloudx.mjs";
 import {
   inspectUpdateTarget,
@@ -12,11 +12,11 @@ import {
 } from "./install-update.mjs";
 
 const scratch = [];
-afterEach(() =>
-  scratch
-    .splice(0)
-    .forEach((dir) => fs.rmSync(dir, { recursive: true, force: true })),
-);
+beforeEach(() => vi.stubEnv("XDG_RUNTIME_DIR", directory()));
+afterEach(() => {
+  vi.unstubAllEnvs();
+  scratch.splice(0).forEach((dir) => fs.rmSync(dir, { recursive: true, force: true }));
+});
 function directory() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-update-test-"));
   scratch.push(dir);
@@ -91,6 +91,7 @@ function checkout({ includeInstaller = false } = {}) {
       "codex-state-errors.mjs",
       "codex-runtime-errors.mjs",
       "install-update.mjs",
+      "terminal-memory-policy.mjs",
       "install-terminal-upgrade.mjs",
       "install-runtime.mjs",
       "terminal-upgrade-recovery.mjs",
@@ -402,10 +403,10 @@ function installation() {
   const root = directory();
   const paths = {
     repoRoot: root,
-    systemdDir: path.join(root, "units"),
+    systemdDir: path.join(root, ".config/systemd/user"),
     envPath: path.join(root, "cloudx.env"),
   };
-  fs.mkdirSync(paths.systemdDir);
+  fs.mkdirSync(paths.systemdDir, { recursive: true });
   fs.writeFileSync(paths.envPath, "CLOUDX_PORT=3001\n");
   const unitPath = path.join(paths.systemdDir, "cloudx.service");
   fs.writeFileSync(unitPath, "[Service]\n");
@@ -433,6 +434,24 @@ function installation() {
   return { paths, properties, commands, extraUnits };
 }
 
+function terminalMemory(fixture) {
+  const name = "cloudx-terminal.service";
+  const configHome = path.join(fixture.paths.repoRoot, ".config");
+  vi.stubEnv("XDG_CONFIG_HOME", configHome);
+  vi.stubEnv("XDG_RUNTIME_DIR", path.join(fixture.paths.repoRoot, "runtime"));
+  const files = [
+    ["MemoryHigh", "59055800320"], ["MemoryMax", "68719476736"],
+  ].map(([property, value]) => {
+    const file = path.join(configHome, "systemd/user.control", `${name}.d`, `50-${property}.conf`);
+    writeFile(path.dirname(file), path.basename(file), `[Service]\n${property}=${value}\n`);
+    return file;
+  });
+  const unitPath = path.join(fixture.paths.systemdDir, name);
+  fs.writeFileSync(unitPath, "[Service]\n");
+  fixture.extraUnits[name] = { ...fixture.properties, Id: name, FragmentPath: unitPath, DropInPaths: files.join(" ") };
+  return files;
+}
+
 describe("choosing the service owned by this checkout", () => {
   it("accepts the matching standard installation", () => {
     const fixture = installation();
@@ -440,6 +459,43 @@ describe("choosing the service owned by this checkout", () => {
       kind: "standard",
       servicesInstalled: true,
     });
+  });
+  it("accepts generated terminal memory properties in a standard installation", () => {
+    const fixture = installation();
+    expect(inspectUpdateTarget(fixture).kind).toBe("standard");
+    terminalMemory(fixture);
+    expect(inspectUpdateTarget(fixture)).toMatchObject({ kind: "standard", servicesInstalled: true });
+  });
+  it("refuses execution-changing terminal drop-ins alongside generated memory properties", () => {
+    const fixture = installation(), files = terminalMemory(fixture);
+    fs.appendFileSync(files[0], "ExecStart=/another/broker\n");
+    expect(() => inspectUpdateTarget(fixture)).toThrow();
+  });
+  it("refuses an execution-changing terminal override not yet reported by systemd", () => {
+    const fixture = installation(), files = terminalMemory(fixture);
+    fixture.extraUnits["cloudx-terminal.service"].DropInPaths = "";
+    fs.appendFileSync(files[0], "ExecStart=/another/broker\n");
+    expect(() => inspectUpdateTarget(fixture)).toThrow("MemoryHigh and MemoryMax");
+  });
+  it.each(["cloudx.service", "cloudx-asr.service", "cloudx-documentation.service"])(
+    "keeps memory-only drop-ins unsupported for %s", name => {
+      const fixture = installation(), files = terminalMemory(fixture);
+      const properties = { ...fixture.properties, Id: name, FragmentPath: path.join(fixture.paths.systemdDir, name), DropInPaths: files.join(" ") };
+      fs.writeFileSync(properties.FragmentPath, "[Service]\n");
+      if (name === fixture.properties.Id) Object.assign(fixture.properties, properties);
+      else fixture.extraUnits[name] = properties;
+      expect(() => inspectUpdateTarget(fixture)).toThrow("does not match the standard Cloudx unit");
+    },
+  );
+  it.each([
+    { WorkingDirectory: "/another-checkout" },
+    { EnvironmentFiles: "/another/cloudx.env (ignore_errors=no)" },
+    { FragmentPath: "/another/cloudx-terminal.service" },
+    { NeedDaemonReload: "yes" },
+  ])("keeps terminal ownership checks with memory properties: %j", overrides => {
+    const fixture = installation(); terminalMemory(fixture);
+    Object.assign(fixture.extraUnits["cloudx-terminal.service"], overrides);
+    expect(() => inspectUpdateTarget(fixture)).toThrow();
   });
   it.each([
     ["another checkout", { WorkingDirectory: "/another-checkout" }],

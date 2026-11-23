@@ -149,8 +149,11 @@ import { hardwareCredentialResolver } from "./hardware/hardwareCredentials.js";
 import { HardwareSshPasswords } from "./hardware/HardwareSshPasswords.js";
 import { hardwareAgentReadiness } from "./hardware/HardwareAgentReadiness.js";
 import { AgentLaunchRecords } from "./agents/AgentLaunchRecords.js";
+import { TerminalMemoryService } from "./system/TerminalMemoryService.js";
+import { registerTerminalMemoryRoutes } from "./system/TerminalMemoryRoutes.js";
 
 export interface AppServices {
+  terminalMemory?: TerminalMemoryService;
   hardware?: HardwareService;
   hardwarePasswords?: HardwareSshPasswords;
   hardwareContexts?: AgentHardwareContext;
@@ -465,6 +468,7 @@ export async function buildServer(config: AppConfig, services?: AppServices): Pr
   });
 
   registerLogRoutes(app, logs);
+  registerTerminalMemoryRoutes(app, services.terminalMemory ?? new TerminalMemoryService(), config.trustedOrigins);
 
   app.get("/api/plugins", async () => ({ plugins: services.plugins.list() }));
   registerCloudxUpdateRoutes(app, services.updates ?? new CloudxUpdateService(config.dataDir, undefined, undefined, undefined, services.forge), config.trustedOrigins);
