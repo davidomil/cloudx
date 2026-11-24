@@ -6672,10 +6672,10 @@ describe("Forge issue auto review", () => {
     const evidence = realCiDiagnostics(f, "github", "AssertionError: SshKeyRegistrationPhases.test.ts:90 expected inspecting key\n", "Isolated verifier (coverage-3)", true);
     const workflow = await fs.readFile(new URL("../../../../.github/workflows/ci.yml", import.meta.url));
     const names = ["Repository policy", "TypeScript (build, type-check, test)", "Pinned lifecycle revisions",
-      "Clean installation", "Installed previous-version upgrade", "Claude Code native contract",
+      "Clean installation", "Installed previous-version upgrade", "Claude Code native contract (2.1.325)", "Claude Code native contract (2.1.331)",
       "Terminal stress (Node 22, 2 CPUs, 7 GiB)", "Python services (pytest)",
       "Browser smoke (desktop and mobile)", "Isolated full verifier", "Trusted merge identity",
-      ...["installer", "0.156.1", "0.166.0"].map(version => `Codex native recovery (${version})`),
+      ...["installer", "0.156.1", "0.166.0", "0.172.0"].map(version => `Codex native recovery (${version})`),
       ...["coverage-1", "coverage-2", "coverage-4", "static", "asr", "documentation", "browser-1", "browser-2"].map(lane => `Isolated verifier (${lane})`),
       "Merged isolated coverage", "Superseded merge identity", "Pending merge identity"];
     const jobs = [evidence.gate, evidence.job, ...names.map((name, index) => ({ ...evidence.job, id: index + 12, name,

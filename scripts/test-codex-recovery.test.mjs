@@ -93,19 +93,21 @@ childProcess.spawnSync = (command, args, options) => {
   fs.appendFileSync(${JSON.stringify(commandLog)}, JSON.stringify({ command, args, timeout: options.timeout }) + "\\n");
   if (args[0] === "--version") return { status: 0, stdout: "codex-cli " + (scenario.version ?? "0.157.1") + "\\n" };
   if (args[1] === "run") {
-    if ((scenario.durationMs ?? 60_000) > options.timeout)
+    const reportPath = args.find(arg => arg.startsWith("--outputFile.json=")).slice("--outputFile.json=".length);
+    const phase = path.basename(reportPath, ".json");
+    const selected = { ...scenario, ...scenario.phases?.[phase] };
+    if ((selected.durationMs ?? 60_000) > options.timeout)
       return { error: Object.assign(new Error("Native suite deadline exceeded"), { code: "ETIMEDOUT" }), status: null, signal: "SIGTERM" };
     const suites = args.slice(2, args.indexOf("--maxWorkers=1"));
-    const reportPath = args.find(arg => arg.startsWith("--outputFile.json=")).slice("--outputFile.json=".length);
     const testResults = suites.map(name => ({ name: path.join(options.cwd, name), assertionResults: [{ status: "passed" }] }));
     const report = { numTotalTests: suites.length, numPassedTests: suites.length, numPendingTests: 0, numFailedTests: 0, testResults };
-    if (scenario.result === "skipped") { report.numPendingTests = 1; report.numPassedTests--; testResults[0].assertionResults[0].status = "pending"; }
-    if (scenario.result === "failed") { report.numFailedTests = 1; report.numPassedTests--; testResults[0].assertionResults[0].status = "failed"; }
-    if (scenario.result === "missing") { report.testResults.pop(); report.numTotalTests--; report.numPassedTests--; }
-    if (scenario.result === "empty") { report.numTotalTests = 0; report.numPassedTests = 0; report.testResults = []; }
-    if (scenario.result === "unreported-skip") testResults[0].assertionResults[0].status = "pending";
+    if (selected.result === "skipped") { report.numPendingTests = 1; report.numPassedTests--; testResults[0].assertionResults[0].status = "pending"; }
+    if (selected.result === "failed") { report.numFailedTests = 1; report.numPassedTests--; testResults[0].assertionResults[0].status = "failed"; }
+    if (selected.result === "missing") { report.testResults.pop(); report.numTotalTests--; report.numPassedTests--; }
+    if (selected.result === "empty") { report.numTotalTests = 0; report.numPassedTests = 0; report.testResults = []; }
+    if (selected.result === "unreported-skip") testResults[0].assertionResults[0].status = "pending";
     fs.writeFileSync(reportPath, JSON.stringify(report));
-    return { status: scenario.suiteExit ?? 0 };
+    return { status: selected.suiteExit ?? 0 };
   }
   if (path.basename(args[0]) === "codex-runtime-verification.mjs") return { status: scenario.runtimeExit ?? 0 };
   throw new Error("Unexpected native validation command: " + JSON.stringify(args));
@@ -123,11 +125,18 @@ syncBuiltinESMExports();
   return { ...result, commands };
 }
 
-it.each(["0.156.1", "0.157.1", "0.166.0", "0.172.0"])("runs the complete serial native suite and built verifier for supported %s", async version => {
+it.each(["0.156.1", "0.157.1", "0.166.0", "0.172.0"])("runs every required suite once in bounded native phases before the built verifier for %s", async version => {
   const result = await runNativeValidation({ version, durationMs: 180_000 });
   expect(result.status, result.stderr).toBe(0);
-  const suiteArgs = result.commands[1].args;
-  expect(suiteArgs.slice(2, suiteArgs.indexOf("--maxWorkers=1"))).toEqual([
+  const suiteCommands = result.commands.filter(command => command.args[1] === "run");
+  const hasConfiguration = ["0.166.0", "0.172.0"].includes(version);
+  expect(suiteCommands).toHaveLength(hasConfiguration ? 2 : 1);
+  const suites = command => command.args.slice(2, command.args.indexOf("--maxWorkers=1"));
+  if (hasConfiguration) expect(suites(suiteCommands[0])).toEqual([
+    "packages/shared/src/codexConfiguration.native.test.ts",
+    "apps/server/src/plugins/CodexConfiguration.native.test.ts"
+  ]);
+  expect(suites(suiteCommands.at(-1))).toEqual([
     "apps/server/src/plugins/CodexConversationRecovery.native.test.ts",
     "apps/server/src/plugins/CodexWorkerBridge.native.test.ts",
     "apps/server/src/cooperationAgent/CodexCooperation.native.test.ts",
@@ -138,22 +147,45 @@ it.each(["0.156.1", "0.157.1", "0.166.0", "0.172.0"])("runs the complete serial 
     "apps/server/src/plugins/CodexVersionSelection.native.test.ts",
     "apps/server/src/plugins/CodexFirstSelection.native.test.ts",
     "apps/server/src/plugins/CodexHistoryMaintenance.native.test.ts",
-    "scripts/codex-updater.native.test.mjs",
-    ...(["0.166.0", "0.172.0"].includes(version) ? [
-      "packages/shared/src/codexConfiguration.native.test.ts",
-      "apps/server/src/plugins/CodexConfiguration.native.test.ts"
-    ] : [])
+    "scripts/codex-updater.native.test.mjs"
   ]);
-  expect(result.commands[1].args).toContain("--maxWorkers=1");
-  expect(result.commands[1].timeout).toBeLessThanOrEqual(300_000);
-  expect(result.commands).toHaveLength(3);
-  expect(result.commands[2]).toMatchObject({ timeout: 60_000 });
-  expect(path.basename(result.commands[2].args[0])).toBe("codex-runtime-verification.mjs");
+  expect(new Set(suiteCommands.flatMap(suites)).size).toBe(hasConfiguration ? 13 : 11);
+  for (const command of suiteCommands) {
+    expect(command.args).toContain("--maxWorkers=1");
+    expect(command.timeout).toBe(300_000);
+  }
+  expect(result.commands).toHaveLength(hasConfiguration ? 4 : 3);
+  expect(result.commands.at(-1)).toMatchObject({ timeout: 60_000 });
+  expect(path.basename(result.commands.at(-1).args[0])).toBe("codex-runtime-verification.mjs");
+});
+
+it.each(["configuration", "recovery"].flatMap(phase =>
+  ["skipped", "failed", "empty", "unreported-skip", "missing"].map(result => ({ phase, result }))
+))("rejects $result $phase evidence before the built verifier", async ({ phase, result }) => {
+  const validation = await runNativeValidation({ version: "0.172.0", phases: { [phase]: { result } } });
+  expect(validation.status).toBe(1);
+  expect(validation.stderr).toMatch(/every selected case|every case/);
+  expect(validation.commands).toHaveLength(phase === "configuration" ? 2 : 3);
+  expect(validation.commands.some(command => path.basename(command.args[0]) === "codex-runtime-verification.mjs")).toBe(false);
+});
+
+it.each(["configuration", "recovery"])("rejects a failed %s process before any later phase", async phase => {
+  const validation = await runNativeValidation({ version: "0.172.0", phases: { [phase]: { suiteExit: 1 } } });
+  expect(validation.status).toBe(1);
+  expect(validation.stderr).toContain(`Native Codex ${phase} validation exited 1`);
+  expect(validation.commands).toHaveLength(phase === "configuration" ? 2 : 3);
+});
+
+it.each(["configuration", "recovery"])("keeps the existing liveness deadline for %s instead of retrying", async phase => {
+  const validation = await runNativeValidation({ version: "0.172.0", phases: { [phase]: { durationMs: 310_000 } } });
+  expect(validation.status).toBe(1);
+  expect(validation.stderr).toContain(`Native Codex ${phase} validation failed: Native suite deadline exceeded`);
+  expect(validation.commands).toHaveLength(phase === "configuration" ? 2 : 3);
 });
 
 it.each([
   [{ durationMs: 310_000 }, "Native suite deadline exceeded"],
-  [{ suiteExit: 1 }, "Native Codex validation exited 1"],
+  [{ suiteExit: 1 }, "Native Codex recovery validation exited 1"],
   [{ result: "skipped" }, "skipped tests are not accepted"],
   [{ result: "failed" }, "must run every selected case successfully"],
   [{ result: "empty" }, "must run every selected case successfully"],

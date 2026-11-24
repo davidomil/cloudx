@@ -137,6 +137,9 @@ Build the server with `npm run typecheck`, then run
 `CLOUDX_NATIVE_CODEX=/absolute/path/to/codex CLOUDX_NATIVE_CODEX_VERSION=0.172.0 npm run test:codex-recovery`.
 The runner records the installed version in CI logs and rejects missing binaries,
 unsupported or mismatched versions, failures and skipped native cases.
+Configuration and recovery run as separate serial phases. Each phase keeps
+its five-minute process deadline and checks every required suite and case.
+The final built runtime verifier runs only after both applicable phases pass.
 For 0.166.0 and 0.172.0, it also requires native option save, reload, unset
 and CLI inventory coverage. The 0.172.0 model cases inspect its bundled
 6.2 model metadata and run isolated interactive, resume and Forge turns

@@ -21,7 +21,6 @@ if (!supportedVersions.includes(installedVersion) || process.env.CLOUDX_NATIVE_C
   process.exit(1);
 }
 const resultsDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cloudx-codex-native-results-"));
-const resultsPath = path.join(resultsDirectory, "results.json");
 console.log(`Validating native conversation recovery with ${version.stdout.trim()}`);
 const root = fileURLToPath(new URL("..", import.meta.url));
 const requiredSuites = [
@@ -37,25 +36,33 @@ const requiredSuites = [
   "apps/server/src/plugins/CodexHistoryMaintenance.native.test.ts",
   "scripts/codex-updater.native.test.mjs"
 ];
-if (["0.166.0", "0.172.0"].includes(installedVersion)) requiredSuites.push(
-  "packages/shared/src/codexConfiguration.native.test.ts",
-  "apps/server/src/plugins/CodexConfiguration.native.test.ts"
-);
-const result = spawnSync(process.execPath, [
-  fileURLToPath(new URL("vitest.mjs", import.meta.resolve("vitest/package.json"))), "run",
-  ...requiredSuites,
-  "--maxWorkers=1", "--reporter=default", "--reporter=json", `--outputFile.json=${resultsPath}`
-], { cwd: root, env: { ...process.env, CLOUDX_CODEX_CONFIGURATION_BIN: binary }, stdio: "inherit", timeout: 300_000 });
+const phases = [];
+if (["0.166.0", "0.172.0"].includes(installedVersion)) phases.push({
+  name: "configuration", suites: [
+    "packages/shared/src/codexConfiguration.native.test.ts",
+    "apps/server/src/plugins/CodexConfiguration.native.test.ts"
+  ]
+});
+phases.push({ name: "recovery", suites: requiredSuites });
 try {
-  if (result.error) throw result.error;
-  if (result.status !== 0) throw new Error(`Native Codex validation exited ${result.status ?? result.signal}.`);
-  const report = JSON.parse(fs.readFileSync(resultsPath, "utf8"));
-  if (!report.numTotalTests || report.numPendingTests || report.numFailedTests || report.numPassedTests !== report.numTotalTests)
-    throw new Error("Native Codex validation must run every selected case successfully; skipped tests are not accepted.");
-  for (const suite of requiredSuites) {
-    const result = report.testResults.find(value => value.name === path.join(root, suite));
-    if (!result?.assertionResults?.length || result.assertionResults.some(value => value.status !== "passed"))
-      throw new Error(`Required native suite did not pass every case: ${suite}`);
+  for (const phase of phases) {
+    const resultsPath = path.join(resultsDirectory, `${phase.name}.json`);
+    console.log(`Validating native ${phase.name}: ${phase.suites.length} required suites.`);
+    const result = spawnSync(process.execPath, [
+      fileURLToPath(new URL("vitest.mjs", import.meta.resolve("vitest/package.json"))), "run",
+      ...phase.suites,
+      "--maxWorkers=1", "--reporter=default", "--reporter=json", `--outputFile.json=${resultsPath}`
+    ], { cwd: root, env: { ...process.env, CLOUDX_CODEX_CONFIGURATION_BIN: binary }, stdio: "inherit", timeout: 300_000 });
+    if (result.error) throw new Error(`Native Codex ${phase.name} validation failed: ${result.error.message}`);
+    if (result.status !== 0) throw new Error(`Native Codex ${phase.name} validation exited ${result.status ?? result.signal}.`);
+    const report = JSON.parse(fs.readFileSync(resultsPath, "utf8"));
+    if (!report.numTotalTests || report.numPendingTests || report.numFailedTests || report.numPassedTests !== report.numTotalTests)
+      throw new Error(`Native Codex ${phase.name} validation must run every selected case successfully; skipped tests are not accepted.`);
+    for (const suite of phase.suites) {
+      const result = report.testResults.find(value => value.name === path.join(root, suite));
+      if (!result?.assertionResults?.length || result.assertionResults.some(value => value.status !== "passed"))
+        throw new Error(`Required native suite did not pass every case: ${suite}`);
+    }
   }
   const runtime = spawnSync(process.execPath, [fileURLToPath(new URL("codex-runtime-verification.mjs", import.meta.url)), binary], {
     cwd: root, env: process.env, stdio: "inherit", timeout: 60_000
