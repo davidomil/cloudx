@@ -7,6 +7,7 @@ import type { ForgeGitHistoryManifest, ForgeGitHistoryReceipt, ForgeGitHistoryRe
 import type { DirectoryIdentity } from "../directoryIdentity.js";
 import { JsonStateFile, openOwnedDirectoryNoFollow, requireSafeDirectory } from "../jsonStateFile.js";
 import { ForgeEvidenceFiles, maxEvidenceBytes, syncEvidenceReceipt } from "./ForgeEvidenceFiles.js";
+import { retainForgeArchive, retainForgeArchiveStream } from "./ForgeArchiveAccess.js";
 
 const namespace = "forge-git-history";
 const bundleName = "history.bundle";
@@ -139,8 +140,11 @@ export class ForgeGitHistory {
   }
 
   async fileStream(archiveId: string) {
-    await this.read(archiveId);
-    return this.storage.fileStream(namespace, archiveId, bundleName);
+    const release = retainForgeArchive(path.resolve(this.dataDir, namespace, archiveId));
+    try {
+      await this.read(archiveId);
+      return retainForgeArchiveStream(await this.storage.fileStream(namespace, archiveId, bundleName), release);
+    } catch (error) { release(); throw error; }
   }
 
   private ownership(workerId: string): JsonStateFile {

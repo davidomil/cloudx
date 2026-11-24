@@ -95,7 +95,7 @@ def test_a_circuit_outside_the_visible_pdf_crop_does_not_classify_the_page(tmp_p
         page.close()
         document.save(output)
     spans = PdfExtractionPipeline(tmp_path).extract(output.getvalue(), 'board.pdf')
-    assert spans and list(tmp_path.glob('figures/*.png'))
+    assert spans and list(tmp_path.glob('figures/*'))
     assert not list(tmp_path.glob('schematics/*/graph.json'))
 
 

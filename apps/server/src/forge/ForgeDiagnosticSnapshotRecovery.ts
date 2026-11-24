@@ -7,9 +7,11 @@ import { readDirectoryIdentity, type DirectoryIdentity } from "../directoryIdent
 import { openOwnedDirectoryNoFollow, requireSafeDirectory, type OwnedDirectory } from "../jsonStateFile.js";
 import { captureForgeRemovalContents } from "./ForgeCheckoutRemoval.js";
 import type { OwnedDiagnosticSnapshot } from "./ForgeDiagnosticSnapshots.js";
+import { retainForgeArchive, retainForgeArchiveStream } from "./ForgeArchiveAccess.js";
 
 export interface SnapshotRecoveryReceipt {
   version: 1;
+  lifecycle?: "terminal-work";
   state: "archiving" | "verified";
   directory: DirectoryIdentity;
   archivePath: string;
@@ -50,7 +52,7 @@ export class ForgeDiagnosticSnapshotRecovery {
       const directory = await readDirectoryIdentity(directoryPath, label);
       if ((await fs.readdir(directoryPath)).length)
         throw new Error(`${label} destination already contains unowned files; its contents and source were preserved.`);
-      receipt = { version: 1, state: "archiving", directory, archivePath: path.join(directoryPath, "snapshot.tar"),
+      receipt = { version: 1, lifecycle: "terminal-work", state: "archiving", directory, archivePath: path.join(directoryPath, "snapshot.tar"),
         ownershipPath: path.join(directoryPath, "ownership.json"), sourceFingerprint: before.fingerprint,
         contentSha256: before.contentSha256, entryCount: before.entryCount };
       snapshot.recovery = receipt;
@@ -136,7 +138,9 @@ export class ForgeDiagnosticSnapshotRecovery {
   async fileStream(snapshot: OwnedDiagnosticSnapshot, signal?: AbortSignal): Promise<ReadStream> {
     const receipt = this.assertReceipt(snapshot);
     if (receipt.state !== "verified") throw new Error(`${label} is incomplete; no verified archive is available.`);
-    const destination = await openOwnedDirectoryNoFollow(path.dirname(receipt.directory.path), receipt.directory.path, label, receipt.directory);
+    const release = retainForgeArchive(receipt.directory.path);
+    let streaming = false;
+    const destination = await openOwnedDirectoryNoFollow(path.dirname(receipt.directory.path), receipt.directory.path, label, receipt.directory).catch(error => { release(); throw error; });
     let archive: FileHandle | undefined;
     try {
       await this.assertDestination(destination);
@@ -150,8 +154,9 @@ export class ForgeDiagnosticSnapshotRecovery {
       await destination.assertCurrent();
       const stream = archive.createReadStream({ start: 0, autoClose: true });
       archive = undefined;
-      return stream;
-    } finally { await archive?.close(); await destination.close(); }
+      streaming = true;
+      return retainForgeArchiveStream(stream, release);
+    } finally { if (!streaming) release(); await archive?.close(); await destination.close(); }
   }
 
   private directoryPath(snapshot: OwnedDiagnosticSnapshot): string {
@@ -191,6 +196,7 @@ export class ForgeDiagnosticSnapshotRecovery {
 export function isSnapshotRecoveryReceipt(value: unknown): value is SnapshotRecoveryReceipt {
   const item = value as SnapshotRecoveryReceipt | undefined;
   return Boolean(item && item.version === 1 && ["archiving", "verified"].includes(item.state) &&
+    (item.lifecycle === undefined || item.lifecycle === "terminal-work") &&
     typeof item.directory?.path === "string" && path.isAbsolute(item.directory.path) && /^\d+$/u.test(item.directory.dev) && /^\d+$/u.test(item.directory.ino) &&
     typeof item.archivePath === "string" && typeof item.ownershipPath === "string" &&
     /^[a-f0-9]{64}$/u.test(item.sourceFingerprint) && /^[a-f0-9]{64}$/u.test(item.contentSha256) &&

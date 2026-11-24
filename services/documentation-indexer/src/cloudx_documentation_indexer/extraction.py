@@ -108,8 +108,11 @@ class SchematicArtifact:
     analysis: SchematicPageAnalysis
 
 
-def extract_file(path: Path, content: bytes, source_type: str, artifact_dir: Path | None = None) -> list[ExtractedSpan]:
-    return extract_bytes(content, path.name, source_type, mimetypes.guess_type(path.name)[0], artifact_dir)
+def extract_file(path: Path, content: bytes, source_type: str, artifact_dir: Path | None = None,
+                 *, pdf_figure_paths: dict[int, str] | None = None) -> list[ExtractedSpan]:
+    options = {"pdf_figure_paths": pdf_figure_paths} if pdf_figure_paths else {}
+    return extract_bytes(content, path.name, source_type, mimetypes.guess_type(path.name)[0], artifact_dir,
+                         **options)
 
 
 def extract_bytes(
@@ -118,12 +121,14 @@ def extract_bytes(
     source_type: str,
     content_type: str | None,
     artifact_dir: Path | None = None,
+    *,
+    pdf_figure_paths: dict[int, str] | None = None,
 ) -> list[ExtractedSpan]:
     suffix = source_suffix(name)
     normalized_type = detected_content_type(content) or normalized_content_type(content_type)
     validate_source_container(content, spreadsheet=source_type == "spreadsheet" or suffix in SPREADSHEET_SUFFIXES or normalized_type in SPREADSHEET_CONTENT_TYPES)
     if suffix in PDF_SUFFIXES or normalized_type == "application/pdf" or looks_like_pdf(content):
-        return PdfExtractionPipeline(artifact_dir).extract(content, name)
+        return PdfExtractionPipeline(artifact_dir, figure_paths=pdf_figure_paths).extract(content, name)
     if source_type == "spreadsheet" or suffix in SPREADSHEET_SUFFIXES or normalized_type in SPREADSHEET_CONTENT_TYPES:
         return SpreadsheetExtractionPipeline(artifact_dir).extract(content, name, normalized_type)
     if source_type == "image" or suffix in IMAGE_SUFFIXES or normalized_type.startswith("image/"):
@@ -139,8 +144,9 @@ def extract_bytes(
 
 
 class PdfExtractionPipeline:
-    def __init__(self, artifact_dir: Path | None = None):
+    def __init__(self, artifact_dir: Path | None = None, *, figure_paths: dict[int, str] | None = None):
         self.artifact_dir = artifact_dir
+        self.figure_paths = figure_paths or {}
         self.schematic_settings = SchematicAnalysisSettings.from_environment()
 
     def extract(self, content: bytes, name: str = "source.pdf") -> list[ExtractedSpan]:
@@ -162,6 +168,8 @@ class PdfExtractionPipeline:
         schematic_pages: list[SchematicPageAnalysis] = []
         artifact_root = prepare_artifact_dir(self.artifact_dir)
         source_sha256 = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+        retained_ids = {Path(path).stem for path in self.figure_paths.values()}
+        figure_number = 1
 
         with pdfplumber.open(pdf_path) as pdf, SinaDetector(self.schematic_settings).document() as detector:
             declarations = extract_pdf_metadata(pdf, source_sha256)
@@ -187,8 +195,14 @@ class PdfExtractionPipeline:
 
                     visual_summary = page_visual_summary(page)
                     if visual_summary and artifact_root and pdfium_doc:
-                        figure_id = f"figure-{len(figure_records) + 1:03d}"
-                        figure_path = render_page_artifact(pdfium_doc, page_number, artifact_root / "figures" / f"{figure_id}.png")
+                        while f"figure-{figure_number:03d}" in retained_ids:
+                            figure_number += 1
+                        figure_id = Path(self.figure_paths[page_number]).stem if page_number in self.figure_paths else f"figure-{figure_number:03d}"
+                        if page_number not in self.figure_paths:
+                            figure_number += 1
+                        retained_path = self.figure_paths.get(page_number, f"figures/{figure_id}.webp")
+                        figure_path = render_page_artifact(pdfium_doc, page_number, artifact_root / retained_path,
+                                                          preserve_format=page_number in self.figure_paths)
                         relative_figure_path = figure_path.relative_to(artifact_root).as_posix()
                         figure_records.append({
                             "id": figure_id,
@@ -982,11 +996,30 @@ def schematic_span_text(schematic: SchematicArtifact, record: dict[str, Any]) ->
     ]).strip()
 
 
-def render_page_artifact(pdf: pdfium.PdfDocument, page_number: int, output_path: Path) -> Path:
+def render_page_artifact(pdf: pdfium.PdfDocument, page_number: int, output_path: Path, *, preserve_format: bool = False) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     page = pdf[page_number - 1]
     try:
-        page.render(scale=2).to_pil().save(output_path)
+        bitmap = page.render(scale=2)
+        try:
+            with bitmap.to_pil() as image:
+                if max(image.size) > 16383:
+                    output_path = output_path.with_suffix(".png")
+                if output_path.suffix == ".png":
+                    image.save(output_path, optimize=True)
+                else:
+                    webp = io.BytesIO()
+                    image.save(webp, format="WEBP", lossless=True, exact=True, method=4)
+                    encoded = webp.getvalue()
+                    if not preserve_format:
+                        png = io.BytesIO()
+                        image.save(png, format="PNG", optimize=True)
+                        if len(png.getvalue()) < len(encoded):
+                            output_path = output_path.with_suffix(".png")
+                            encoded = png.getvalue()
+                    output_path.write_bytes(encoded)
+        finally:
+            bitmap.close()
     finally:
         page.close()
     return output_path

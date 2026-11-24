@@ -13,6 +13,7 @@ import { PluginSessionMissingError, PluginSessionNotStartedError } from "@cloudx
 import { AGENT_TERMINAL_PLUGIN_ID, MODEL_ID_PATTERN, CODEX_REASONING_EFFORTS, RULES_SKILLS_PLUGIN_ID, isForgeTurnCompletion, isRecord, readAgentSelection, type AgentSelection, type AgentSwitchRequest, type DirectoryOwnershipAvailability, type DirectoryOwnershipPreview, type DirectoryOwnershipReconciliation, type WorkspaceRuntimeContext, type WorkspaceTab } from "@cloudx/shared";
 
 import { materializeCodexHomeOverlay, parseCodexSkillOverrides, readCodexSkillOverrides, resolveCodexHome, type CodexHomeOverlay, type CodexSkillOverride } from "../rulesSkills/CodexHomeOverlay.js";
+import type { CodexLaunchCacheLifecycle } from "./CodexLaunchCacheLifecycle.js";
 import { legacyCodexConfigKeys } from "./CodexConfigRepairService.js";
 import { readCodexVersion } from "../../../../scripts/codex-updater.mjs";
 import { CodexStateSources } from "./CodexStateSources.js";
@@ -111,7 +112,8 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
     private readonly dataDir?: string,
     private readonly sources = dataDir ? new CodexStateSources(dataDir) : undefined,
     private readonly env: NodeJS.ProcessEnv = process.env,
-    private readonly providers?: AgentTerminalProviders
+    private readonly providers?: AgentTerminalProviders,
+    private readonly cacheLifecycle?: CodexLaunchCacheLifecycle
   ) {
     this.claude = providers && dataDir ? new ClaudeTerminal({
       factory, dataDir, accounts: providers.accounts, settings: providers.claudeSettings, usage: providers.usage, replayBytes, env
@@ -153,6 +155,12 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   }
 
   private async startSession(input: CreatePluginSessionInput, recovering: boolean): Promise<PluginSession> {
+    return this.cacheLifecycle
+      ? this.cacheLifecycle.withProfile(input.tab.id, () => this.startSessionNow(input, recovering))
+      : this.startSessionNow(input, recovering);
+  }
+
+  private async startSessionNow(input: CreatePluginSessionInput, recovering: boolean): Promise<PluginSession> {
     const preparationStarted = performance.now();
     const agent = readAgentSelection(input.initialInput?.agent);
     if (agent?.providerId === "claude") return this.requireClaude().start(input, recovering, agent);
@@ -366,6 +374,12 @@ export class CodexTerminalPlugin implements WorkspacePlugin {
   }
 
   async restoreSession(input: CreatePluginSessionInput): Promise<PluginSession> {
+    return this.cacheLifecycle
+      ? this.cacheLifecycle.withProfile(input.tab.id, () => this.restoreSessionNow(input))
+      : this.restoreSessionNow(input);
+  }
+
+  private async restoreSessionNow(input: CreatePluginSessionInput): Promise<PluginSession> {
     if (!this.factory.attach) throw new Error("Codex terminal reconnection is unavailable.");
     const agent = readAgentSelection(input.initialInput?.agent);
     if (agent?.providerId === "claude") return this.requireClaude().restore(input);

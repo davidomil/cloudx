@@ -125,6 +125,27 @@ async function newSsh(
     await label(page, "Enable automatic SSH login checks").uncheck();
 }
 
+async function waitForSshLoginCheck(hardwareId: string, revision: number) {
+  await expect
+    .poll(async () => {
+      const summary = (await lab.service.snapshot(operator)).items.find(
+        (value) => value.item.id === hardwareId,
+      );
+      return {
+        revision: summary?.item.revision,
+        checkedRevision: summary?.connectionCheck?.itemRevision,
+        online: summary?.connectionCheck?.online,
+        held: Boolean(summary?.checkHold || summary?.reservation),
+      };
+    })
+    .toEqual({
+      revision,
+      checkedRevision: revision,
+      online: true,
+      held: false,
+    });
+}
+
 test("SSH legacy password metadata: annotate and disable an offline machine without key setup", async ({
   page,
 }, info) => {
@@ -1173,6 +1194,7 @@ test("SSH editor creates, retains, saves and deletes a revision-guarded item", a
   await button(page, "Back to inventory").click();
   await button(page, "Add hardware").click();
   await expect(label(page, "Hardware name")).toHaveValue("New SSH");
+  await expect(label(page, "Enable automatic SSH login checks")).toBeChecked();
   await button(page, "Save hardware").click();
   await expect(button(page, "Select New SSH")).toBeVisible();
   const created = (await lab.service.snapshot(operator)).items.find(
@@ -1183,12 +1205,24 @@ test("SSH editor creates, retains, saves and deletes a revision-guarded item", a
     port: 2222,
     auth: { kind: "identity_file" },
   });
+  await waitForSshLoginCheck(created.id, created.revision);
+  await refresh(page);
   await button(page, "Select New SSH").click();
   await button(page, "Edit hardware").click();
   await label(page, "SSH authentication").selectOption("agent");
   await label(page, "Hardware name").fill("Renamed SSH");
   await button(page, "Save hardware").click();
   await expect(button(page, "Select Renamed SSH")).toBeVisible();
+  const renamed = (await lab.service.snapshot(operator)).items.find(
+    (value) => value.item.id === created.id,
+  )!.item;
+  expect(renamed).toMatchObject({
+    name: "Renamed SSH",
+    revision: created.revision + 1,
+  });
+  expect(renamed.config.auth).toEqual({ kind: "agent" });
+  await waitForSshLoginCheck(renamed.id, renamed.revision);
+  await refresh(page);
   await button(page, "Select Renamed SSH").click();
   await button(page, "Edit hardware").click();
   await button(page, "Delete hardware").click();

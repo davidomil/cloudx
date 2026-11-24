@@ -5,6 +5,7 @@ import type { ForgeWorker, WorkspaceCleanupCandidate, DisposableContainerInput, 
 import { JsonStateFile } from "../jsonStateFile.js";
 import { ForgeContainerEvidence, readContainerEvidenceTar, validEvidencePaths, validRecordedEvidencePaths, type EvidenceSink } from "./ForgeContainerEvidence.js";
 import { maxEvidenceCollectionBytes, maxEvidenceCollectionFiles, writeEvidenceReceipt } from "./ForgeEvidenceFiles.js";
+import { retiredForgeArchivePaths } from "./ForgeArchiveAccess.js";
 
 export type { DisposableContainerInput, DisposableResource, EvidenceDecision } from "@cloudx/shared";
 
@@ -102,7 +103,32 @@ export class ForgeDisposableResources {
     });
   }
 
-  async records(): Promise<DisposableResource[]> { return structuredClone((await this.read()).resources); }
+  async records(): Promise<DisposableResource[]> {
+    const retired = await retiredForgeArchivePaths(this.journal.rootPath);
+    return structuredClone((await this.read()).resources).map(resource => {
+      const archive = resource.evidence?.archivePath;
+      if (resource.evidence && archive && retired.has(archive.endsWith("/manifest.json") ? archive.slice(0, -14) : archive))
+        resource.evidence = { ...resource.evidence, state: "retired", files: undefined };
+      return resource;
+    });
+  }
+
+  compactRetiredArchives(): Promise<void> {
+    return this.serial(async () => {
+      const retired = await retiredForgeArchivePaths(this.journal.rootPath);
+      const state = await this.read();
+      let changed = false;
+      for (const resource of state.resources) {
+        const archive = resource.evidence?.archivePath;
+        if (resource.state !== "deleted" || !resource.evidence || resource.evidence.state === "retired" || !archive ||
+            !retired.has(archive.endsWith("/manifest.json") ? archive.slice(0, -14) : archive)) continue;
+        resource.evidence = { ...resource.evidence, state: "retired", files: undefined };
+        resource.updatedAt = now();
+        changed = true;
+      }
+      if (changed) await this.write(state);
+    });
+  }
 
   updateEvidenceSelection(worker: ForgeWorker, resourceId: string, selection: Pick<DisposableContainerInput, "evidencePaths" | "commitSha">): Promise<DisposableResource> {
     return this.serial(async () => {
@@ -560,7 +586,7 @@ function validResource(item: DisposableResource): boolean {
     (item.removalStartedAt === undefined || Number.isFinite(Date.parse(item.removalStartedAt))) && Number.isFinite(Date.parse(item.updatedAt)));
 }
 function validEvidence(value: DisposableResource["evidence"]): boolean {
-  return Boolean(value && ["pending", "exporting", "verified", "kept", "discarded", "missing", "incomplete"].includes(value.state) && validRecordedEvidencePaths(value.paths, true) &&
+  return Boolean(value && ["pending", "exporting", "verified", "kept", "discarded", "missing", "incomplete", "retired"].includes(value.state) && validRecordedEvidencePaths(value.paths, true) &&
     (value.missingPaths === undefined || validRecordedEvidencePaths(value.missingPaths) && value.missingPaths.every(source => value.paths.includes(source))) &&
     (value.state !== "incomplete" || value.missingPaths?.length) &&
     (value.commitSha === undefined || validCommit(value.commitSha)) &&

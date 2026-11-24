@@ -228,11 +228,14 @@ export interface ForgeWorkflowDependencies {
       attemptId: string,
       context: unknown,
     ): Promise<{ reportPath: string; contextPath: string }>;
+    recordOwner?(attemptId: string, workerId: string): Promise<void>;
     read(attemptId: string): Promise<unknown | undefined>;
     remove(attemptId: string): Promise<void>;
   };
   notify(title: string, body: string): void;
   cleanupDisposableResources?(worker: ForgeWorker): Promise<void>;
+  retireArchives?(worker: ForgeWorker, workers: ForgeWorker[]): Promise<void>;
+  reconcileArchives?(workers: ForgeWorker[]): Promise<void>;
   validateEvidenceHandoff?(worker: ForgeWorker): Promise<void>;
 }
 
@@ -1513,7 +1516,9 @@ export class ForgeWorkflowService {
     // Record native outcomes before observing the automatic issue loops they feed.
     const workers = [...this.workers].sort((a, b) => Number(b.status === "running") - Number(a.status === "running"));
     const recovering = new Set(this.workers.filter(worker => this.providerRecoveries.has(worker.id) || worker.providerRetryAt).map(worker => worker.id));
-    return workers.map(worker => this.pollJob(worker.id, () => this.pollWorker(worker, completionChecks, recovering)));
+    const jobs = workers.map(worker => this.pollJob(worker.id, () => this.pollWorker(worker, completionChecks, recovering)));
+    if (completionChecks && this.deps.reconcileArchives) jobs.push(this.pollJob("archive-retirement", () => this.deps.reconcileArchives!(structuredClone(this.workers))));
+    return jobs;
   }
   private pollJob(key: string, operation: () => Promise<void>): Promise<void> {
     const pending = this.pollJobs.get(key);
@@ -3349,6 +3354,7 @@ export class ForgeWorkflowService {
       reviewScope ? { ...context, reviewScope, previousReviews: this.previousReviews(worker) } :
         worker.rebaseRecovery?.phase === "resolving" ? { ...context, rebaseRecovery: worker.rebaseRecovery } : context,
     );
+    await this.deps.reports.recordOwner?.(worker.attemptId, worker.id);
     signal?.throwIfAborted();
     let instructions =
       worker.kind === "issue"
@@ -3676,6 +3682,7 @@ export class ForgeWorkflowService {
           this.deps.notify("Forge files retained", `${worker.title}: recover working files from ${worker.retainedWorkspace.worktreePath}. ${worker.retainedWorkspace.reason ?? "The checkout and Git index were kept intact."}`);
         return;
       }
+      await this.deps.retireArchives?.(structuredClone(worker), structuredClone(this.workers));
       const index = this.workers.indexOf(worker);
       const parent = this.autoReviewParent(worker);
       if (parent?.autoReview) parent.autoReview.reviewWorkerId = undefined;

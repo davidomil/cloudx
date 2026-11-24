@@ -4,6 +4,7 @@ import type { ForgeDiagnosticSnapshotStatus } from "@cloudx/shared";
 import type { DirectoryIdentity } from "../directoryIdentity.js";
 import { JsonStateFile, requireSafeDirectory } from "../jsonStateFile.js";
 import { isOwnedDiagnosticSnapshot, type OwnedDiagnosticSnapshot } from "./ForgeDiagnosticSnapshots.js";
+import { retiredForgeArchivePaths } from "./ForgeArchiveAccess.js";
 
 export function diagnosticSnapshotStatus(snapshot: OwnedDiagnosticSnapshot): ForgeDiagnosticSnapshotStatus {
   return { path: snapshot.path, kind: snapshot.kind, retentionPolicy: snapshot.retentionPolicy,
@@ -18,6 +19,7 @@ export class ForgeDiagnosticSnapshotInventory {
 
   async list(): Promise<{ snapshots: ForgeDiagnosticSnapshotStatus[]; errors: string[] }> {
     const snapshots: ForgeDiagnosticSnapshotStatus[] = [], errors: string[] = [];
+    const retired = await retiredForgeArchivePaths(this.dataDir);
     const directory = path.join(this.dataDir, "forge-workers/workspaces");
     if (!await requireSafeDirectory(this.dataDir, directory, { create: false, label: "Snapshot ownership inventory" })) return { snapshots, errors };
     for (const name of (await fs.readdir(directory)).sort()) {
@@ -34,7 +36,8 @@ export class ForgeDiagnosticSnapshotInventory {
             errors.push(`${owned.id}: invalid snapshot ownership; the copy remains protected.`);
             continue;
           }
-          snapshots.push(diagnosticSnapshotStatus(snapshot));
+          const recoveryPath = snapshot.recovery && path.relative(this.dataDir, snapshot.recovery.directory.path).split(path.sep).join("/");
+          if (!recoveryPath || !retired.has(recoveryPath)) snapshots.push(diagnosticSnapshotStatus(snapshot));
         }
       } catch (error) { errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`); }
     }

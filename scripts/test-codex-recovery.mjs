@@ -34,6 +34,7 @@ const requiredSuites = [
   "apps/server/src/rulesSkills/CodexSkillOverrides.native.test.ts",
   "apps/server/src/plugins/CodexVersionSelection.native.test.ts",
   "apps/server/src/plugins/CodexFirstSelection.native.test.ts",
+  "apps/server/src/plugins/CodexHistoryMaintenance.native.test.ts",
   "scripts/codex-updater.native.test.mjs"
 ];
 const result = spawnSync(process.execPath, [

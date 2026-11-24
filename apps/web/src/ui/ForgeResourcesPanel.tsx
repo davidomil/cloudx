@@ -14,7 +14,7 @@ export function ForgeResourcesPanel({ revision }: { revision: number }) {
     void Promise.allSettled([getForgeResources(controller.signal), getForgeCheckoutEvidence(controller.signal), getForgeGitHistory(controller.signal)]).then(([resources, archives, history]) => {
       if (controller.signal.aborted) return;
       setEvidence({
-        resources: resources.status === "fulfilled" ? resources.value.filter(resource => resource.evidence?.state !== "discarded" && (resource.evidence || resource.retentionReason && resource.state !== "deleted")) : [],
+        resources: resources.status === "fulfilled" ? resources.value.filter(resource => !["discarded", "retired"].includes(resource.evidence?.state ?? "") && (resource.evidence || resource.retentionReason && resource.state !== "deleted")) : [],
         archives: archives.status === "fulfilled" ? archives.value : [],
         history: history.status === "fulfilled" ? history.value : [],
         errors: [resources, archives, history].flatMap(result => result.status === "rejected" ? [result.reason instanceof Error ? result.reason.message : String(result.reason)] : []),

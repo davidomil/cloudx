@@ -22,7 +22,7 @@ export interface ForgeEvidenceFile {
 export interface ForgeEvidenceBatch { files: ForgeEvidenceFile[]; bytes: number }
 
 export interface ForgeResourceEvidence {
-  state: "pending" | "exporting" | "verified" | "kept" | "discarded" | "missing" | "incomplete";
+  state: "pending" | "exporting" | "verified" | "kept" | "discarded" | "missing" | "incomplete" | "retired";
   paths: string[];
   /** Required sources unavailable at validation; an explicit correction must resume export. */
   missingPaths?: string[];

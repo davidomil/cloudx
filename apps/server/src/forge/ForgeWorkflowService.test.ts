@@ -181,6 +181,59 @@ function fixture(issueNumber = 1) {
 }
 const placement = { windowId: "window", paneId: "pane" };
 
+describe("Forge archive lifecycle integration", () => {
+  it("records report ownership and retires archives only after issue closure and successful checkout cleanup", async () => {
+    const f = fixture();
+    const recordOwner = vi.fn(async (_attemptId: string, _workerId: string) => {});
+    const retireArchives = vi.fn(async (_worker: ForgeWorker, _workers: ForgeWorker[]) => {});
+    f.deps.reports.recordOwner = recordOwner;
+    f.deps.retireArchives = retireArchives;
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    expect(recordOwner).toHaveBeenCalledWith(worker.attemptId, worker.id);
+    await f.service.poll();
+    expect(retireArchives).not.toHaveBeenCalled();
+    f.issue.state = "closed";
+    await f.service.reconcileResourceCleanup();
+    expect(retireArchives).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: worker.id, status: "completed", worktreePath: undefined, tabId: undefined }), expect.any(Array));
+    expect(f.stored()).toEqual([]);
+  });
+
+  it("keeps archive retirement behind workspace recovery holds", async () => {
+    const f = fixture();
+    const retireArchives = vi.fn(async (_worker: ForgeWorker, _workers: ForgeWorker[]) => {});
+    f.deps.retireArchives = retireArchives;
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.runtime.cleanup.mockResolvedValueOnce({ worktreePath: worker.worktreePath!,
+      reason: "Unpublished working files", retainedPaths: ["unpublished.txt"] });
+    f.issue.state = "closed";
+    await f.service.poll();
+    expect(retireArchives).not.toHaveBeenCalled();
+    expect(f.stored()[0]).toMatchObject({ id: worker.id, retainedWorkspace: { reason: "Unpublished working files" } });
+  });
+
+  it("retains lifecycle authority for retry when archive persistence fails", async () => {
+    const f = fixture();
+    f.deps.retireArchives = async () => { throw new Error("Archive receipt could not be synced"); };
+    const worker = await f.service.startIssue(f.deps.settings().repository, 1, placement);
+    f.issue.state = "closed";
+    await f.service.poll();
+    expect(f.stored()[0]).toMatchObject({ id: worker.id, status: "cleanup_failed", error: "Archive receipt could not be synced" });
+  });
+
+  it("reconciles archive journals after restart even when there are no worker cards", async () => {
+    const f = fixture();
+    const reconcileArchives = vi.fn(async (_workers: ForgeWorker[]) => {});
+    f.deps.reconcileArchives = reconcileArchives;
+    await f.service.poll();
+    expect(reconcileArchives).toHaveBeenCalledExactlyOnceWith([]);
+    await f.service.dispose();
+    const restart = new ForgeWorkflowService(f.deps);
+    await restart.poll();
+    expect(reconcileArchives).toHaveBeenCalledTimes(2);
+    await restart.dispose();
+  });
+});
+
 describe("Container evidence completion handoff", () => {
   it.each(["issue", "review"] as const)("keeps a %s report recoverable when required evidence is missing before tab finish", async kind => {
     const f = fixture();

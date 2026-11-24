@@ -95,6 +95,7 @@ def test_recovered_legacy_media_aliases_stay_blocked_after_migration_retry(legac
     archive, document = legacy_media_archive
     snapshot = archive.root / archive.get_document(document.document_id)['snapshot_path']
     alias = archive.ingest_text(text=snapshot.read_text(), uri='manual://media-alias', source_type='media')
+    orphan_snapshot = archive.root / archive.get_document(alias.document_id)['snapshot_path']
     with archive._connect() as db:
         db.execute('UPDATE documents SET snapshot_path=? WHERE document_id=?',
                    (snapshot.relative_to(archive.root).as_posix(), alias.document_id))
@@ -104,7 +105,6 @@ def test_recovered_legacy_media_aliases_stay_blocked_after_migration_retry(legac
     metadata_path.write_bytes(b'')
     retained_files = {path: path.read_bytes() for path in snapshot.parent.rglob('*') if path.is_file()
                       and path.name != 'metadata.json'}
-    snapshot_directories = set(archive.snapshots_dir.iterdir())
     mark_legacy(archive)
 
     with monkeypatch.context() as patch:
@@ -127,7 +127,8 @@ def test_recovered_legacy_media_aliases_stay_blocked_after_migration_retry(legac
             assert upgraded.get_document(item.document_id) == detail
             assert detail['chunks'] == chunks[item.document_id]
         assert {path: path.read_bytes() for path in retained_files} == retained_files
-        assert set(archive.snapshots_dir.iterdir()) == snapshot_directories
+        assert set(archive.snapshots_dir.iterdir()) == {snapshot.parent}
+        assert not orphan_snapshot.parent.exists()
         assert not snapshot.with_name('source-spans.json').exists()
 
 

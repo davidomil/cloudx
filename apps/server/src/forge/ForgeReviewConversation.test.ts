@@ -19,6 +19,7 @@ let binding: ReviewConversationBinding | undefined;
 
 class ConversationTransport {
   requests: Record<string, unknown>[] = [];
+  configuration: Record<string, unknown> = {};
   respond: (method: string) => unknown = method => method === "initialize" || method === "thread/inject_items" ? {} : method === "thread/unsubscribe" ? { status: "unsubscribed" } : { thread };
   private listener: ((message: Record<string, unknown>) => void) | undefined;
   close = vi.fn();
@@ -26,7 +27,7 @@ class ConversationTransport {
   terminate = vi.fn(async () => undefined);
   send(message: Record<string, unknown>): void {
     this.requests.push(message);
-    if (message.id !== undefined) this.listener?.({ id: message.id, result: this.respond(message.method as string) });
+    if (message.id !== undefined) this.listener?.({ id: message.id, result: message.method === "config/read" ? { config: this.configuration } : this.respond(message.method as string) });
   }
   onMessage(listener: (message: Record<string, unknown>) => void): void { this.listener = listener; }
 }
@@ -70,15 +71,15 @@ it.each(["review", "batch"] as const)("persists the exact %s thread before relea
   expect(await service.prepare(launch, { ...options(), purpose })).toBe(threadId);
 
   expect(createTransport).toHaveBeenCalledExactlyOnceWith(launch, undefined);
-  expect(transport.requests.map(request => request.method)).toEqual(["initialize", "initialized", "thread/start", "thread/inject_items", "thread/unsubscribe", "thread/resume", "thread/unsubscribe"]);
-  expect(transport.requests[2]).toMatchObject({ params: { cwd: root, model: "gpt-6-astra", ephemeral: false, config: { model_reasoning_effort: "max" } } });
-  expect(transport.requests[3]).toMatchObject({ params: { threadId, items: [{ type: "message", role: "user", content: [{ type: "input_text", text: expect.stringContaining(purpose === "batch" ? "Forge issue batch" : "Forge review") }] }] } });
+  expect(transport.requests.map(request => request.method)).toEqual(["initialize", "initialized", "config/read", "thread/start", "thread/inject_items", "thread/unsubscribe", "thread/resume", "thread/unsubscribe"]);
+  expect(transport.requests[3]).toMatchObject({ params: { cwd: root, model: "gpt-6-astra", ephemeral: false, config: { model_reasoning_effort: "max" } } });
+  expect(transport.requests[4]).toMatchObject({ params: { threadId, items: [{ type: "message", role: "user", content: [{ type: "input_text", text: expect.stringContaining(purpose === "batch" ? "Forge issue batch" : "Forge review") }] }] } });
   expect(transport.terminate).toHaveBeenCalledOnce();
   const second = new ConversationTransport();
   expect(await new ForgeReviewConversation(dataDir, async () => second).prepare(launch, { ...options(), purpose })).toBe(threadId);
-  expect(second.requests.map(request => request.method)).toEqual(["initialize", "initialized", "thread/resume", "thread/unsubscribe"]);
-  expect(second.requests[2]).toMatchObject({ params: { threadId, excludeTurns: true } });
-  expect(second.requests[2]!.params).not.toHaveProperty("cwd");
+  expect(second.requests.map(request => request.method)).toEqual(["initialize", "initialized", "config/read", "thread/resume", "thread/unsubscribe"]);
+  expect(second.requests[3]).toMatchObject({ params: { threadId, excludeTurns: true } });
+  expect(second.requests[3]!.params).not.toHaveProperty("cwd");
 });
 
 it("preserves a batch binding when its native session is lost without starting another thread", async () => {
@@ -92,7 +93,7 @@ it("preserves a batch binding when its native session is lost without starting a
   };
   await expect(new ForgeReviewConversation(dataDir, async () => transport).prepare(launch, { ...options(), purpose: "batch" })).rejects.toThrow("Native batch session is unavailable");
   expect(binding).toEqual(original);
-  expect(transport.requests.map(request => request.method)).toEqual(["initialize", "initialized", "thread/resume"]);
+  expect(transport.requests.map(request => request.method)).toEqual(["initialize", "initialized", "config/read", "thread/resume"]);
   expect(transport.terminate).toHaveBeenCalledOnce();
 });
 
@@ -252,6 +253,18 @@ it("resumes the existing reviewer thread when every durable source and view devi
   await fs.writeFile(bindingPath, JSON.stringify({ ...source, dev: "1" }));
   const second = new ConversationTransport();
   expect(await new ForgeReviewConversation(dataDir, async () => second).prepare(launch, options())).toBe(threadId);
-  expect(second.requests.map(request => request.method)).toEqual(["initialize", "initialized", "thread/resume", "thread/unsubscribe"]);
+  expect(second.requests.map(request => request.method)).toEqual(["initialize", "initialized", "config/read", "thread/resume", "thread/unsubscribe"]);
   expect(binding!.threadId).toBe(threadId);
+});
+
+it("binds the native effective SQLite home when configuration overrides the launch environment", async () => {
+  const transport = new ConversationTransport();
+  const configured = path.join(root, "configured-sqlite");
+  await fs.mkdir(configured);
+  transport.configuration = { sqlite_home: configured };
+  expect(await new ForgeReviewConversation(dataDir, async () => transport).prepare(launch, options())).toBe(threadId);
+  expect(binding).toMatchObject({ sqliteHome: { path: configured }, sqliteHomeVerified: true });
+  const changed = new ConversationTransport();
+  await expect(new ForgeReviewConversation(dataDir, async () => changed).prepare(launch, options())).rejects.toThrow("SQLite home changed");
+  expect(changed.requests.some(request => request.method === "thread/start" || request.method === "thread/resume")).toBe(false);
 });
