@@ -47,7 +47,7 @@ The installer is split into two visible phases:
    `git worktree list --porcelain -z`; on older Git packages it can add
    `ppa:git-core/ppa` and install the current stable Git package after approval.
 2. `scripts/install-cloudx.mjs` is the Cloudx wizard. It prints each phase as it
-   runs: Codex CLI verification/login (default 0.157.1 or the retained exact
+   runs: Codex CLI verification/login (default 0.172.0 or the retained exact
    selection), install choices, `npm ci`, a private
    `uv 0.11.28` bootstrap, managed Python 3.12, locked ASR and
    documentation-indexer environments,
@@ -371,7 +371,7 @@ does the operational refresh:
 - Verifies Ubuntu prerequisites, Node.js, npm, and Git 2.36+ before any Codex or
   Cloudx npm commands run. Updates require an existing Node.js executable for the
   initial ownership checks.
-- Installs exactly `@openai/codex@0.157.1` in CloudX’s user-owned npm
+- Installs exactly `@openai/codex@0.172.0` in CloudX’s user-owned npm
   prefix (`~/.local/share/cloudx/npm-global`) when no exact selection has
   been retained. Otherwise, it preserves the selected installation and
   verifies that executable and its login status.

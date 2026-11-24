@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { Bell, Blocks, RefreshCw, ScrollText, Search, Settings2, X } from "lucide-react";
 
-import { AGENT_ACCOUNT_HOOKS, AGENT_ACCOUNTS_OPTION_SOURCE, AGENT_ACCOUNTS_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, CLAUDE_SETTINGS_PLUGIN_ID, CLOUDX_LOG_SOURCES, agentProviderLabel, type AgentAccount, type AgentAccountsState } from "@cloudx/shared";
+import { AGENT_ACCOUNT_HOOKS, AGENT_ACCOUNTS_OPTION_SOURCE, AGENT_ACCOUNTS_PLUGIN_ID, AGENT_USAGE_PLUGIN_ID, CLAUDE_SETTINGS_PLUGIN_ID, CLOUDX_LOG_SOURCES, agentProviderLabel, type AgentAccount, type AgentAccountsState, type AgentProviderStatus } from "@cloudx/shared";
 import type { CloudxConfigResponse, CloudxConfigValues, ConfigFieldDescriptor, ConfigValue, ForgeRepository, RulesSkillsStore } from "@cloudx/shared";
 
 import { ControlButton } from "./Control.js";
@@ -16,6 +16,7 @@ import { ClaudeSettingsPanel } from "./ClaudeSettingsPanel.js";
 import { AgentPricingPanel } from "./AgentPricingPanel.js";
 import { LogsPanel } from "./LogsPanel.js";
 import { useOutsidePointerDismiss } from "./outsidePointer.js";
+import { modelNativeWarning } from "./modelNativeWarning.js";
 import { TemplateSelect } from "./RulesSkillsPanel.js";
 import type { BrowserNotificationPermissionState } from "./notifications.js";
 import type { UiContributionRenderContext } from "./uiContributions.js";
@@ -79,15 +80,21 @@ export function SettingsDialog({
   const [horizontalTabs, setHorizontalTabs] = useState(false);
   const [codexSettingsEditor] = useState(() => new CodexSettingsEditor());
   const [agentAccounts, setAgentAccounts] = useState<AgentAccount[]>();
-  const usesAgentAccounts = config.plugins.some(plugin => plugin.fields.some(field => field.optionSource === AGENT_ACCOUNTS_OPTION_SOURCE));
+  const [providerSnapshot, setProviderSnapshot] = useState<{ categoryId: string; providers: AgentProviderStatus[] }>();
+  const agentProviders = providerSnapshot?.categoryId === activeCategoryId ? providerSnapshot.providers : undefined;
+  const activeFields = activeCategoryId === "general" ? config.globalFields
+    : config.plugins.find(plugin => `plugin:${plugin.pluginId}` === activeCategoryId)?.fields ?? [];
+  const usesNativeModels = activeFields.some(field => field.options?.some(option => option.nativeRequirement));
+  const usesAgentAccounts = activeFields.some(field => field.optionSource === AGENT_ACCOUNTS_OPTION_SOURCE);
   useEffect(() => {
-    if (!callHook || !usesAgentAccounts) return;
+    setProviderSnapshot(undefined);
+    if (!callHook || (!usesAgentAccounts && !usesNativeModels)) return;
     let disposed = false;
     callHook<{ state: AgentAccountsState }>(AGENT_ACCOUNT_HOOKS.read, {})
-      .then(result => { if (!disposed) setAgentAccounts(result.state.accounts); })
+      .then(result => { if (!disposed) { setAgentAccounts(result.state.accounts); setProviderSnapshot({ categoryId: activeCategoryId, providers: result.state.providers }); } })
       .catch(() => { if (!disposed) setAgentAccounts([]); });
     return () => { disposed = true; };
-  }, [callHook, usesAgentAccounts]);
+  }, [callHook, activeCategoryId, usesAgentAccounts, usesNativeModels]);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -159,6 +166,7 @@ export function SettingsDialog({
         field={field}
         templates={rulesSkillsStore?.templates}
         agentAccounts={agentAccounts}
+        agentProviders={agentProviders}
         value={(pluginId ? values.plugins[pluginId]?.[field.key] : values.global[field.key]) ?? field.defaultValue}
         onChange={value => pluginId ? setPluginValue(pluginId, field.key, value) : setGlobalValue(field.key, value)}
         onClearSecret={pluginId && field.type === "secret" && field.secretConfigured && onClearPluginSecret ? () => onClearPluginSecret(pluginId, field.key) : undefined}
@@ -438,7 +446,7 @@ function browserNotificationMessage(state: BrowserNotificationPermissionState): 
   return "Allow Cloudx to mirror in-app notifications through the browser notification system.";
 }
 
-function ConfigField({ field, value, onChange, onClearSecret, templates, agentAccounts }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void; onClearSecret?: () => Promise<void>; templates?: RulesSkillsStore["templates"]; agentAccounts?: AgentAccount[] }) {
+function ConfigField({ field, value, onChange, onClearSecret, templates, agentAccounts, agentProviders }: { field: ConfigFieldDescriptor; value: ConfigValue; onChange: (value: ConfigValue) => void; onClearSecret?: () => Promise<void>; templates?: RulesSkillsStore["templates"]; agentAccounts?: AgentAccount[]; agentProviders?: AgentProviderStatus[] }) {
   const [clearing, setClearing] = useState(false);
 
   async function clearSecret() {
@@ -500,12 +508,16 @@ function ConfigField({ field, value, onChange, onClearSecret, templates, agentAc
       <label>
         {field.label}
         <select aria-label={field.label} value={String(value)} onChange={(event) => onChange(parseSelectValue(event.target.value, field))}>
-          {(field.options ?? []).map((option) => (
-            <option key={`${field.key}:${String(option.value)}`} value={String(option.value)}>
-              {selectOptionLabel(option)}
-            </option>
-          ))}
+          {(field.options ?? []).map(option => {
+            const warning = modelNativeWarning(option, agentProviders);
+            return <option key={`${field.key}:${String(option.value)}`} value={String(option.value)} disabled={Boolean(warning)}>
+              {selectOptionLabel(option)}{warning ? ` — ${warning}` : ""}
+            </option>;
+          })}
         </select>
+        {field.options?.some(option => option.nativeRequirement) ? <small>
+          {modelNativeWarning(field.options.find(option => option.value === value) ?? { label: "", value }, agentProviders) ?? "The selected account and provider determine model access and capabilities."}
+        </small> : null}
         {field.description ? <small>{field.description}</small> : null}
       </label>
     );

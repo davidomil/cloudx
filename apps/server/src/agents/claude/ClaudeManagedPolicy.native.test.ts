@@ -13,6 +13,7 @@ import { buildEnforcedLoginShellLaunch } from "../../terminal/ShellLaunch.js";
 import { RulesSkillsCatalogService } from "../../rulesSkills/RulesSkillsCatalogService.js";
 
 const claude = process.env.CLOUDX_NATIVE_CLAUDE;
+const expectedNativeVersion = process.env.CLOUDX_NATIVE_CLAUDE_VERSION ?? "2.1.331";
 const native = it.skipIf(!claude);
 const run = promisify(execFile);
 type Skill = { name: string; source: string; state: string; advertised: boolean; description: string };
@@ -50,7 +51,7 @@ function client(overlay: ClaudeHomeOverlay, cwd: string, env: NodeJS.ProcessEnv,
   };
 }
 
-native("native 2.1.316 contains late synced, project, nested, add-dir and plugin arrivals while selected snapshots and CloudX skills remain usable", async () => {
+native("native reviewed version contains late synced, project, nested, add-dir and plugin arrivals while selected snapshots and CloudX skills remain usable", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-managed-native-"));
   const providerHome = path.join(root, "home", ".claude"), cwd = path.join(root, "project"), accountHome = path.join(root, "account"), added = path.join(root, "added"), nested = path.join(cwd, "nested");
   let requests = 0;
@@ -65,7 +66,7 @@ native("native 2.1.316 contains late synced, project, nested, add-dir and plugin
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     const port = (server.address() as { port: number }).port;
     const env = { PATH: process.env.PATH, HOME: path.dirname(providerHome), ANTHROPIC_API_KEY: "fake-local-only", ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1", DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1" };
-    const options = { dataDir: path.join(root, "data"), tabId: "first", executionId: "11111111-1111-4111-8111-111111111111", accountHome, providerHome, cwd, launchEnv: env, nativeVersion: "2.1.316", launchMode: "cloudx-managed" as const, allowedSkills: ["notes", "docx"] };
+    const options = { dataDir: path.join(root, "data"), tabId: "first", executionId: "11111111-1111-4111-8111-111111111111", accountHome, providerHome, cwd, launchEnv: env, nativeVersion: expectedNativeVersion, launchMode: "cloudx-managed" as const, allowedSkills: ["notes", "docx"] };
     const catalog = new RulesSkillsCatalogService(options.dataDir);
     await catalog.list();
     const writer = path.join(catalog.catalogRoot(), "system-skills", "source-grounded-writing");
@@ -79,7 +80,7 @@ export CLAUDE_CODE_HOST_SKILL_CATALOG='{"skills":["late-personal"]}'
 export CLAUDE_CODE_PLUGIN_CACHE_DIR=${JSON.stringify(path.join(providerHome, "plugins"))}
 `);
     active = client(overlay, cwd, { ...env, SHELL: "/bin/bash", BASH_ENV: profile }, ["--add-dir", added]);
-    const initialize = await active.request("initialize"); expect(initialize.claude_code_version).toBe("2.1.316");
+    const initialize = await active.request("initialize"); expect(initialize.claude_code_version).toBe(expectedNativeVersion);
     expect((initialize.commands as { name: string }[]).some(command => command.name === "doctor")).toBe(false);
     const skills = async () => (await active!.request("get_skills_dialog")).skills as Skill[];
     const before = await skills();
@@ -165,7 +166,7 @@ native("native managed launches expand allowed personal, synced and CloudX skill
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     const port = (server.address() as { port: number }).port;
     const env = { PATH: process.env.PATH, HOME: path.dirname(providerHome), ANTHROPIC_API_KEY: "fake-local-only", ANTHROPIC_BASE_URL: `http://127.0.0.1:${port}`, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1", DISABLE_TELEMETRY: "1", DISABLE_ERROR_REPORTING: "1" };
-    const options = { dataDir: path.join(root, "data"), tabId: "managed", executionId: "11111111-1111-4111-8111-111111111111", accountHome, providerHome, cwd, launchEnv: env, nativeVersion: "2.1.316", allowedSkills: ["notes", "docx", "doctor", "checkup", "design"], trustProject: true };
+    const options = { dataDir: path.join(root, "data"), tabId: "managed", executionId: "11111111-1111-4111-8111-111111111111", accountHome, providerHome, cwd, launchEnv: env, nativeVersion: expectedNativeVersion, allowedSkills: ["notes", "docx", "doctor", "checkup", "design"], trustProject: true };
     const managed = await materializeClaudeHomeOverlay({ ...options, launchMode: "cloudx-managed" });
     // A local instruction arriving after this launch's preflight is still outside the native source set.
     await write(path.join(cwd, "CLAUDE.local.md"), "LOCAL_INSTRUCTIONS_MARKER\n");
@@ -205,7 +206,7 @@ native("native managed launches expand allowed personal, synced and CloudX skill
     expect(nativeProject.launchPolicy).toMatchObject({ mode: "native-project", exclusiveSkills: false, settingSources: ["user", "project", "local"] });
     if (process.env.CLOUDX_NATIVE_EVIDENCE_DIR) {
       await fs.mkdir(process.env.CLOUDX_NATIVE_EVIDENCE_DIR, { recursive: true });
-      await fs.writeFile(path.join(process.env.CLOUDX_NATIVE_EVIDENCE_DIR, "managed-invocations.json"), JSON.stringify({ nativeVersion: "2.1.316", nativeSha256: createHash("sha256").update(await fs.readFile(claude!)).digest("hex"), requests, policy: managed.launchPolicy, nativeProjectPolicy: nativeProject.launchPolicy }, null, 2));
+      await fs.writeFile(path.join(process.env.CLOUDX_NATIVE_EVIDENCE_DIR, "managed-invocations.json"), JSON.stringify({ nativeVersion: expectedNativeVersion, nativeSha256: createHash("sha256").update(await fs.readFile(claude!)).digest("hex"), requests, policy: managed.launchPolicy, nativeProjectPolicy: nativeProject.launchPolicy }, null, 2));
     }
   } finally { await new Promise<void>(resolve => server.close(() => resolve())); await fs.rm(root, { recursive: true, force: true }); }
 }, 50_000);
@@ -222,14 +223,14 @@ native("managed source scope excludes project MCP configuration while Native pro
     await write(path.join(cwd, ".mcp.json"), JSON.stringify({ mcpServers: { fixture: { command: process.execPath, args: [server] } } }));
     await write(path.join(providerHome, "settings.json"), JSON.stringify({ enableAllProjectMcpServers: true }));
     const env = { PATH: process.env.PATH, HOME: path.join(root, "home"), ANTHROPIC_API_KEY: "fake-local-only", ANTHROPIC_BASE_URL: "http://127.0.0.1:1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1" };
-    const overlay = await materializeClaudeHomeOverlay({ dataDir: path.join(root, "data"), tabId: "mcp", cwd, providerHome, accountHome, executionId: "11111111-1111-4111-8111-111111111111", nativeVersion: "2.1.316", launchMode: "cloudx-managed", launchEnv: env, trustProject: true });
+    const overlay = await materializeClaudeHomeOverlay({ dataDir: path.join(root, "data"), tabId: "mcp", cwd, providerHome, accountHome, executionId: "11111111-1111-4111-8111-111111111111", nativeVersion: expectedNativeVersion, launchMode: "cloudx-managed", launchEnv: env, trustProject: true });
     active = client(overlay, cwd, env); await active.request("initialize");
     await active.request("reload_plugins");
     const skills = (await active.request("get_skills_dialog")).skills as Skill[];
     expect(skills.some(entry => entry.source === "mcp")).toBe(false);
     await expect(fs.stat(observations)).rejects.toMatchObject({ code: "ENOENT" });
     await active.close(); active = undefined;
-    const nativeProject = await materializeClaudeHomeOverlay({ dataDir: path.join(root, "data"), tabId: "native-mcp", cwd, providerHome, accountHome, executionId: "11111111-1111-4111-8111-111111111111", nativeVersion: "2.1.316", launchMode: "native-project", launchEnv: env, trustProject: true });
+    const nativeProject = await materializeClaudeHomeOverlay({ dataDir: path.join(root, "data"), tabId: "native-mcp", cwd, providerHome, accountHome, executionId: "11111111-1111-4111-8111-111111111111", nativeVersion: expectedNativeVersion, launchMode: "native-project", launchEnv: env, trustProject: true });
     active = client(nativeProject, cwd, env); const nativeInit = await active.request("initialize"); const nativeReload = await active.request("reload_plugins");
     expect((nativeInit.commands as { name: string }[]).some(command => command.name === "doctor")).toBe(true);
     const nativeSkills = (await active.request("get_skills_dialog")).skills as Skill[];
@@ -256,7 +257,7 @@ native("managed preflight rejects disabled personal hooks despite an enabling ex
     await write(path.join(cwd, ".claude", "settings.json"), '{"disableAllHooks":false}');
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     const env = { PATH: process.env.PATH, HOME: root, ANTHROPIC_API_KEY: "fake-local-only", ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as {port:number}).port}`, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1" };
-    const options = { dataDir: path.join(root, "data"), tabId: "rejected", providerHome, accountHome, cwd, executionId: "11111111-1111-4111-8111-111111111111", nativeVersion: "2.1.316", launchEnv: env };
+    const options = { dataDir: path.join(root, "data"), tabId: "rejected", providerHome, accountHome, cwd, executionId: "11111111-1111-4111-8111-111111111111", nativeVersion: expectedNativeVersion, launchEnv: env };
     await expect(materializeClaudeHomeOverlay({ ...options, launchMode: "cloudx-managed" })).rejects.toThrow("disableAllHooks");
     await expect(fs.stat(path.join(options.dataDir, "claude-launches"))).rejects.toMatchObject({ code: "ENOENT" });
     expect(requests).toBe(0);
@@ -265,7 +266,7 @@ native("managed preflight rejects disabled personal hooks despite an enabling ex
     const probe = { command: claude!, settingsPath, cwd, env: { ...env, CLAUDE_CONFIG_DIR: providerHome } };
     const managed = await inspectClaudeNativeSettings({ ...probe, configurationArgs: ["--setting-sources", "user"] });
     const nativeProject = await inspectClaudeNativeSettings(probe);
-    expect(managed.version).toBe("2.1.316");
+    expect(managed.version).toBe(expectedNativeVersion);
     expect(managed.hooks.policy).toMatchObject({ allDisabled: true });
     expect(nativeProject.hooks.policy).toMatchObject({ allDisabled: false });
     expect(requests).toBe(0);
@@ -284,7 +285,7 @@ native.each(["settings.json", "settings.local.json"])("Native project rejects re
     await write(path.join(dataDir, "rules-skills", "skills", "template-owned", "SKILL.md"), "---\ndescription: Selected template fixture.\n---\nTemplate body.");
     const resolved = { source: "tab" as const, template: { id: "template", name: "Template", color: "green" as const, ruleIds: [], skillIds: ["template-owned"] }, rules: [], skills: [{ id: "template-owned", name: "Template owned", description: "Selected fixture" }] };
     const env = { PATH: process.env.PATH, HOME: root, ANTHROPIC_API_KEY: "fake-local-only", ANTHROPIC_BASE_URL: "http://127.0.0.1:1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1" };
-    const options = { dataDir, tabId: "control", providerHome, accountHome, cwd, executionId: "11111111-1111-4111-8111-111111111111", nativeVersion: "2.1.316", launchMode: "native-project" as const, launchEnv: env, resolved };
+    const options = { dataDir, tabId: "control", providerHome, accountHome, cwd, executionId: "11111111-1111-4111-8111-111111111111", nativeVersion: expectedNativeVersion, launchMode: "native-project" as const, launchEnv: env, resolved };
     const overlay = await materializeClaudeHomeOverlay(options);
     active = client(overlay, cwd, env); await active.request("initialize");
     const before = (await active.request("get_skills_dialog")).skills as Skill[];

@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 
 import { PluginSessionNotStartedError, type CreatePluginSessionInput, type PluginSession, type PluginSessionLaunchOptions, type PluginTabControls } from "@cloudx/plugin-api";
 import { isForgeTurnCompletion, readAgentSelection, type ClaudeLaunchMode, type AgentSelection, type TabIndicatorUpdate } from "@cloudx/shared";
@@ -207,13 +208,13 @@ export class ClaudeTerminal {
     });
     if (input.agentTurn) {
       try {
-        const sessionId = await waitForClaudeReceipt(conversation, input.tab.id, executionId, input.cwd, () => session.hasExited(), newSessionId ?? codexResumeInput(launchInput)?.sessionId);
+        const sessionId = await waitForClaudeReceipt(conversation, input.tab.id, executionId, input.cwd, () => session.hasExited(), () => session.snapshot().recentOutput ?? "", newSessionId ?? codexResumeInput(launchInput)?.sessionId);
         await this.conversationPolicies.bind(sessionId, { accountId: account.id, cwd: input.cwd, policy: overlay.launchPolicy, historical: mode.historical });
         await session.handleAction("wait_until_ready", { timeoutMs: 30_000 });
         const prompt = launchInput?.prompt;
         if (prompt !== undefined) {
           if (typeof prompt !== "string" || !prompt.trim() || prompt.includes("\0")) throw new Error("Claude initial prompt must be a non-empty string without null bytes.");
-          await session.handleAction("enter_text", { text: prompt, submit: true });
+          await submitClaudeForgePrompt(session, prompt);
           await waitForClaudePromptReceipt(input.agentTurn, sessionId, () => session.hasExited());
         }
       } catch (error) {
@@ -343,7 +344,7 @@ class ClaudeTrackingStatus {
   }
 }
 
-async function waitForClaudeReceipt(conversation: CodexConversationRecovery, tabId: string, executionId: string, cwd: string, exited: () => boolean, expectedSessionId?: string): Promise<string> {
+async function waitForClaudeReceipt(conversation: CodexConversationRecovery, tabId: string, executionId: string, cwd: string, exited: () => boolean, output: () => string, expectedSessionId?: string): Promise<string> {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     const receipt = conversation.readForExecution(tabId, executionId);
@@ -354,7 +355,27 @@ async function waitForClaudeReceipt(conversation: CodexConversationRecovery, tab
     if (exited()) break;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
+  const visible = stripVTControlCharacters(output()).replace(/\s+/gu, "");
+  if (visible.includes("ANTHROPIC_API_KEY") && visible.includes("DoyouwanttousethisAPIkey?"))
+    throw new Error("This native Claude execution requires API-key confirmation before unattended Forge work. CloudX has not accepted that native prompt or transferred approval from another tab. No worker prompt was submitted or replayed.");
   throw new Error("Claude did not deliver its required SessionStart receipt. Native hook policy or a hook failure prevents CloudX tracking. Ask the policy owner to permit CloudX SessionStart, UserPromptSubmit, Stop and StopFailure hooks before starting Forge work. No worker prompt was submitted.");
+}
+
+async function submitClaudeForgePrompt(session: CodexTerminalSession, prompt: string): Promise<void> {
+  let rendered = false;
+  const stop = session.onData(() => { rendered = true; });
+  const deadline = Date.now() + 30_000;
+  try {
+    const text = prompt.replace(/[\r\n]+$/u, "").replace(/\r\n?/gu, "\n");
+    session.write(`\u001b[200~${text}\u001b[201~`);
+    while (!rendered) {
+      if (session.hasExited()) throw new Error("Claude exited before rendering the Forge prompt. No Enter was sent and the prompt was not replayed.");
+      if (Date.now() >= deadline) throw new Error("Claude did not render the Forge prompt before the submission deadline. No Enter was sent and the prompt was not replayed.");
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    await session.handleAction("wait_until_ready", { timeoutMs: Math.max(1, deadline - Date.now()) });
+    await session.handleAction("send_key", { key: "enter" });
+  } finally { stop(); }
 }
 
 async function waitForClaudePromptReceipt(binding: NonNullable<PluginSessionLaunchOptions["agentTurn"]>, sessionId: string, exited: () => boolean): Promise<void> {

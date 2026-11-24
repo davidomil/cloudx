@@ -156,6 +156,28 @@ describe("ClaudeSettingsService", () => {
       .toEqual({ maxEffortLevel: "xhigh", autoCompactWindow: 200000 });
   });
 
+  it("saves and round-trips Fable 5.2 effort without changing other model or legacy preferences", async () => {
+    const { service, providerHome } = await setup({ model: "claude-fable-5-2", effortLevel: "low", modelSettings: {
+      "claude-fable-5-2": { maxEffortLevel: "xhigh", autoCompactWindow: 500000 },
+      "claude-fable-5-1": { effortLevel: "xhigh" }
+    } });
+    vi.spyOn(service, "cliStatus").mockResolvedValue({ installed: true, command: "selected-claude", version: "2.1.331 (Claude Code)" });
+    for (const effortLevel of ["low", "medium", "high", "xhigh"] as const) {
+      const saved = await service.update({ expectedRevision: (await service.read()).revision, effortLevel });
+      expect(saved).toMatchObject({ model: "claude-fable-5-2", effortLevel, legacyEffortLevel: "low" });
+      expect(saved.modelEffortLevels).toEqual({ "claude-fable-5-2": effortLevel, "claude-fable-5-1": "xhigh" });
+    }
+    expect(JSON.parse(await fs.readFile(path.join(providerHome, "settings.json"), "utf8")).modelSettings["claude-fable-5-2"])
+      .toEqual({ effortLevel: "xhigh", maxEffortLevel: "xhigh", autoCompactWindow: 500000 });
+  });
+
+  it("passes best through to native alias resolution without guessing a saved-effort model", async () => {
+    const { service } = await setup({ model: "claude-sonnet-5-5" });
+    expect((await service.update({ expectedRevision: (await service.read()).revision, model: "best" })).model).toBe("best");
+    await expect(service.update({ expectedRevision: (await service.read()).revision, effortLevel: "high" })).rejects.toThrow("full Claude model ID");
+    expect((await service.read()).model).toBe("best");
+  });
+
   it("rejects ambiguous models, old native effort and malformed model entries before writing either owner", async () => {
     const { service, providerHome, dataDir } = await setup({ model: "opus", effortLevel: "high" });
     const expectedRevision = (await service.read()).revision;

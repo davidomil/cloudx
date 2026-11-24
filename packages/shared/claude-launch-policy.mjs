@@ -1,3 +1,5 @@
+import nativeReview from "./src/claudeNativeVersions.json" with { type: "json" };
+
 export const CLAUDE_LAUNCH_MODES = ["native-project", "cloudx-managed"];
 export function resolveClaudeLaunchMode(requested, saved) {
     if (requested !== undefined) {
@@ -21,7 +23,7 @@ export function parseClaudeResolvedLaunchPolicy(value) {
         !strings(value.includedSources, 64) || !strings(value.excludedSources, 64) ||
         !Array.isArray(value.skills) || value.skills.length > 2_000)
         return fail();
-    if (value.mode === "cloudx-managed" && (value.settingSources.length !== 1 || value.settingSources[0] !== "user" || value.nativeVersion.replace(" (Claude Code)", "") !== "2.1.316"))
+    if (value.mode === "cloudx-managed" && (value.settingSources.length !== 1 || value.settingSources[0] !== "user" || !nativeReview.reviewedVersions.includes(value.nativeVersion.replace(" (Claude Code)", ""))))
         return fail();
     const settingSources = value.settingSources;
     if (value.mode === "native-project" && (settingSources.length !== 3 || !["user", "project", "local"].every(source => settingSources.includes(source))))

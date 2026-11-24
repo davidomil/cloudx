@@ -2057,5 +2057,127 @@
     "scope": "launch",
     "description": "Native summary",
     "reason": "Native diagnostic operation; not a persistent preference. CloudX does not run connectivity or authentication probes merely to display defaults."
+  },
+  {
+    "path": "codex exec --remote",
+    "command": "codex exec",
+    "flag": "--remote",
+    "scope": "launch",
+    "description": "Connect to an existing app server.",
+    "reason": "A remote app server has separate transport and session ownership; CloudX supplies its managed local app-server connection."
+  },
+  {
+    "path": "codex exec --remote-auth-token-env",
+    "command": "codex exec",
+    "flag": "--remote-auth-token-env",
+    "scope": "launch",
+    "description": "Environment variable containing the remote WebSocket bearer token.",
+    "reason": "Remote authentication routing is supplied by the connection owner and is not a saved native option."
+  },
+  {
+    "path": "codex exec --trust",
+    "command": "codex exec",
+    "flag": "--trust",
+    "scope": "launch",
+    "description": "Save project trust for future chats, including MCP commands outside the sandbox.",
+    "reason": "Trust persists project-wide, including MCP execution; CloudX manages the explicit workspace trust boundary."
+  },
+  {
+    "path": "codex exec resume --remote",
+    "command": "codex exec resume",
+    "flag": "--remote",
+    "scope": "launch",
+    "description": "Connect to an existing app server.",
+    "reason": "A remote app server has separate transport and session ownership; CloudX supplies its managed local app-server connection."
+  },
+  {
+    "path": "codex exec resume --remote-auth-token-env",
+    "command": "codex exec resume",
+    "flag": "--remote-auth-token-env",
+    "scope": "launch",
+    "description": "Environment variable containing the remote WebSocket bearer token.",
+    "reason": "Remote authentication routing is supplied by the connection owner and is not a saved native option."
+  },
+  {
+    "path": "codex exec resume --trust",
+    "command": "codex exec resume",
+    "flag": "--trust",
+    "scope": "launch",
+    "description": "Save project trust for future chats, including MCP commands outside the sandbox.",
+    "reason": "Trust persists project-wide, including MCP execution; CloudX manages the explicit workspace trust boundary."
+  },
+  {
+    "path": "codex exec fork --remote",
+    "command": "codex exec fork",
+    "flag": "--remote",
+    "scope": "launch",
+    "description": "Connect to an existing app server.",
+    "reason": "A remote app server has separate transport and session ownership; CloudX supplies its managed local app-server connection."
+  },
+  {
+    "path": "codex exec fork --remote-auth-token-env",
+    "command": "codex exec fork",
+    "flag": "--remote-auth-token-env",
+    "scope": "launch",
+    "description": "Environment variable containing the remote WebSocket bearer token.",
+    "reason": "Remote authentication routing is supplied by the connection owner and is not a saved native option."
+  },
+  {
+    "path": "codex exec fork --trust",
+    "command": "codex exec fork",
+    "flag": "--trust",
+    "scope": "launch",
+    "description": "Save project trust for future chats, including MCP commands outside the sandbox.",
+    "reason": "Trust persists project-wide, including MCP execution; CloudX manages the explicit workspace trust boundary."
+  },
+  {
+    "path": "codex review --trust",
+    "command": "codex review",
+    "flag": "--trust",
+    "scope": "launch",
+    "description": "Save project trust for future chats, including MCP commands outside the sandbox.",
+    "reason": "Trust persists project-wide, including MCP execution; CloudX manages the explicit workspace trust boundary."
+  },
+  {
+    "path": "codex exec review --remote",
+    "command": "codex exec review",
+    "flag": "--remote",
+    "scope": "launch",
+    "description": "Connect to an existing app server.",
+    "reason": "A remote app server has separate transport and session ownership; CloudX supplies its managed local app-server connection."
+  },
+  {
+    "path": "codex exec review --remote-auth-token-env",
+    "command": "codex exec review",
+    "flag": "--remote-auth-token-env",
+    "scope": "launch",
+    "description": "Environment variable containing the remote WebSocket bearer token.",
+    "reason": "Remote authentication routing is supplied by the connection owner and is not a saved native option."
+  },
+  {
+    "path": "codex exec review --trust",
+    "command": "codex exec review",
+    "flag": "--trust",
+    "scope": "launch",
+    "description": "Save project trust for future chats, including MCP commands outside the sandbox.",
+    "reason": "Trust persists project-wide, including MCP execution; CloudX manages the explicit workspace trust boundary."
+  },
+  {
+    "path": "codex app-server --mcp-launch-cwd",
+    "command": "codex app-server",
+    "flag": "--mcp-launch-cwd",
+    "scope": "launch",
+    "description": "Process-local absolute launch directory override for a managed stdio MCP server.",
+    "reason": "The app-server host owns MCP launch directories; these overrides are not persisted configuration.",
+    "internal": true
+  },
+  {
+    "path": "codex app-server --plugin-mcp-launch-cwd",
+    "command": "codex app-server",
+    "flag": "--plugin-mcp-launch-cwd",
+    "scope": "launch",
+    "description": "Process-local absolute launch directory override for a managed stdio MCP server.",
+    "reason": "The app-server host owns MCP launch directories; these overrides are not persisted configuration.",
+    "internal": true
   }
 ]

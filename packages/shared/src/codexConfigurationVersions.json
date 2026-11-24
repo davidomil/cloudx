@@ -90,5 +90,47 @@
       "cli/src/queue_cmd.rs": "773fdb564580445ad2905aafacd424fb3befe035444f364a8f1f5ec3b6b41843",
       "cli/src/doctor.rs": "034b53a33555c5c11d77b404b19ca4302735e1bbf4a9cbff160b294764ff24b0"
     }
+  },
+  "0.172.0": {
+    "schemaUrl": "https://raw.githubusercontent.com/openai/codex/rust-v0.172.0/codex-rs/core/config.schema.json",
+    "schemaSha256": "52fb96b1ff79a51bf9ce31695a4a22d4e80f57591d91bad5747b657f4e612bac",
+    "releaseUrl": "https://github.com/openai/codex/releases/tag/rust-v0.172.0",
+    "featureRegistryUrl": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/features/src/lib.rs",
+    "permissionsSourceUrl": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/config/src/permissions_toml.rs",
+    "cliSourceUrls": [
+      "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/cli/src/main.rs",
+      "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/cli.rs",
+      "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/utils/cli/src/shared_options.rs",
+      "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/exec/src/cli.rs",
+      "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/app-server/src/startup_config.rs",
+      "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/cli/src/queue_cmd.rs",
+      "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/cli/src/doctor.rs",
+      "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/app-server/src/plugin_mcp_launch.rs"
+    ],
+    "nativeCliVersion": "0.172.0",
+    "reviewedAt": "2026-11-24",
+    "latestStableCheckedAt": "2026-11-24",
+    "releasePublishedAt": "2026-11-24T00:03:55Z",
+    "defaultsSourceUrl": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs",
+    "keymapSourceUrl": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs",
+    "sourceSha256": {
+      "cli/src/main.rs": "56dd5cc4f17117db09a1fa76064a6d406a598f29ad4292238702911f65f735f4",
+      "config/src/permissions_toml.rs": "7ace764fcfc526802e8bf56f0d49fb31c5f0a24c05567edc2114b61719982c6a",
+      "core/src/config/mod.rs": "759160ab883729341b152e270bd7a0efd0bc58e936b2c35ddc5d6b2c64432e4e",
+      "utils/cli/src/shared_options.rs": "6eefb5fcf0545fca54ffa1f80a6d3630c8d9b61ec449466d5834ac9c489f76d8",
+      "exec/src/cli.rs": "dc36955d295470e542e9677dddf8b757f8d3bbcd6530a601dbb908aeec2d1668",
+      "tui/src/cli.rs": "a2fa6eca759af254c9118eabbd042906d9957ffa6dc7f6d4de5a59377ca060b0",
+      "tui/src/keymap.rs": "63da15458a675ae32717ff2ee1d1ef92c58467b0de4175d0abcd2d9f78a5344e",
+      "tui/src/keymap/leader.rs": "3ff4d6275d5354390a507f21482b8535990ba59909de08c5230536ec45809f6c",
+      "tui/src/keymap/vim_search.rs": "53ab93f56589dd212439d0f4134133b841f9313bed091d388952ff2965f1897a",
+      "tui/src/keymap/chords/leader_defaults.rs": "2de600b6d1a057b586ca56fb647073994cffcc0d1caaff5cd0cc442cf74053b5",
+      "features/src/lib.rs": "96124895b43ffb2eb2136c851d54f4696891de3a82cb69869beb17c23f7954f9",
+      "app-server/src/startup_config.rs": "3f53cfac68aee2e33d5d3e790c085aa0c5112a4e905951d64a30e357645ad052",
+      "cli/src/queue_cmd.rs": "773fdb564580445ad2905aafacd424fb3befe035444f364a8f1f5ec3b6b41843",
+      "cli/src/doctor.rs": "a0979a7c7ff299b971622a9b301f9c7d08838fbfb8963b96112709eaa85b4c9b",
+      "features/src/feature_configs.rs": "00c6a0bc50b84d8564ce7fa3c92a4b2bbe9906700602050144df60cefd0c8646",
+      "app-server/src/plugin_mcp_launch.rs": "a905a55ae6bbaa613e88d249d21ee3ad0d290c2a827bed2507a51ccfebbc39bb"
+    },
+    "featureConfigurationSourceUrl": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/features/src/feature_configs.rs"
   }
 }

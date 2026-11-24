@@ -1,9 +1,9 @@
 The Claude configuration inventory records the official settings, environment,
-and CLI references retained in the documentation archive on 30 October 2026.
+and CLI references retained in the documentation archive on 24 November 2026.
 Each source has its original SHA-256 in
 `packages/shared/src/claudeConfigurationInventory.json`. The inventory contains
-247 settings rows, 384 environment rows, and 121 CLI reference rows. Five CLI
-rows repeat flag summaries; the catalog has 116 distinct CLI entries.
+250 settings rows, 422 environment rows, and 123 CLI reference rows. Five CLI
+rows repeat flag summaries; the catalog has 118 distinct CLI entries.
 
 `update.py` reads the three original HTML files. With no `--write`, it checks
 the current inventory and fails if the source bytes or extracted metadata
@@ -20,8 +20,7 @@ checked inventory is a documentation snapshot, not proof that a particular
 native binary accepts or applies each option. No native versions are certified
 by this inventory.
 
-The separate `CLAUDE_SETTINGS_NATIVE_REVIEW` records a narrower native 2.1.316
-check. An isolated no-model control session observes all eleven typed Boolean
+The separate `CLAUDE_SETTINGS_NATIVE_REVIEW` records narrower checks for native 2.1.316, 2.1.325 and 2.1.331. An isolated no-model control session observes all eleven typed Boolean
 settings with both values, per-model effort, language and update-channel merging, user/project/
 launch precedence, unset, and preservation of unrelated model fields. It runs
 through the production settings service. This checks the native merge contract;
@@ -32,7 +31,7 @@ this exact-version observation.
 Run the fixture with the explicitly selected executable:
 
 ```bash
-CLOUDX_NATIVE_CLAUDE=/path/to/claude node node_modules/vitest/vitest.mjs run apps/server/src/agents/claude/ClaudeConfiguration.native.test.ts --maxWorkers=1
+CLOUDX_NATIVE_CLAUDE=/path/to/claude CLOUDX_NATIVE_CLAUDE_VERSION=2.1.331 node node_modules/vitest/vitest.mjs run apps/server/src/agents/claude/ClaudeConfiguration.native.test.ts --maxWorkers=1
 ```
 
 `claudeConfiguration.ts` classifies every entry. Managed policy, account and

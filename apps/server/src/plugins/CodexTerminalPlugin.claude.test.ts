@@ -23,16 +23,30 @@ vi.mock("../agents/claude/ClaudeNativeSettings.js", () => ({ verifyClaudeNativeA
 const SESSION = "a5570c58-978a-4694-84f9-c67756be3acd";
 
 class FakeTerminalProcess implements TerminalProcess {
+  startupOutput = "Claude native composer ready\r\n";
   written = "";
   terminated = false;
   exitAtStartup = false;
   acknowledgePrompt = true;
+  renderPaste = true;
+  exitAfterPaste = false;
   forgeBinding?: { workerId: string; attemptId: string; receiptPath: string };
+  private readonly dataListeners = new Set<(data: string) => void>();
+  private outputStarted = false;
   private exitListener: ((event: TerminalExit) => void) | undefined;
-  onData(listener: (data: string) => void) { queueMicrotask(() => listener("Claude native composer ready\r\n")); return () => undefined; }
+  onData(listener: (data: string) => void) {
+    this.dataListeners.add(listener);
+    if (!this.outputStarted) { this.outputStarted = true; queueMicrotask(() => this.emitData(this.startupOutput)); }
+    return () => { this.dataListeners.delete(listener); };
+  }
+  emitData(data: string) { for (const listener of this.dataListeners) listener(data); }
   onExit(listener: (event: TerminalExit) => void) { this.exitListener = listener; if (this.exitAtStartup) queueMicrotask(() => listener({ exitCode: 1 })); return () => { this.exitListener = undefined; }; }
   write(data: string) {
     this.written += data;
+    if (data.startsWith("\u001b[200~")) {
+      if (this.renderPaste) queueMicrotask(() => this.emitData("Native draft rendered.\r\n"));
+      if (this.exitAfterPaste) queueMicrotask(() => this.exitListener?.({ exitCode: 1 }));
+    }
     if (data === "\r" && this.written.includes("/exit")) queueMicrotask(() => this.exitListener?.({ exitCode: 0 }));
     else if (data === "\r" && this.forgeBinding) {
       if (this.acknowledgePrompt) writeFileSync(this.forgeBinding.receiptPath, JSON.stringify({ workerId: this.forgeBinding.workerId, attemptId: this.forgeBinding.attemptId, threadId: SESSION, turnId: "initial", status: "running" }));
@@ -46,14 +60,20 @@ class FakeTerminalProcess implements TerminalProcess {
 }
 
 class CapturingFactory implements TerminalProcessFactory {
+  startupOutput = "Claude native composer ready\r\n";
   deliverReceipt = true;
   acknowledgePrompt = true;
+  renderPaste = true;
+  exitAfterPaste = false;
   exitWithoutReceipt = true;
   launches: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv; process: FakeTerminalProcess }> = [];
   async spawn(command: string, args: string[], options: { env: NodeJS.ProcessEnv }) {
     const process = new FakeTerminalProcess();
+    process.startupOutput = this.startupOutput;
     process.exitAtStartup = !this.deliverReceipt && this.exitWithoutReceipt;
     process.acknowledgePrompt = this.acknowledgePrompt;
+    process.renderPaste = this.renderPaste;
+    process.exitAfterPaste = this.exitAfterPaste;
     this.launches.push({ command, args, env: options.env, process });
     const configDir = options.env.CLOUDX_ENFORCED_CLAUDE_CONFIG_DIR!;
     try { process.forgeBinding = JSON.parse(await fs.readFile(path.join(configDir, ".cloudx-forge-turn.json"), "utf8")); }
@@ -123,6 +143,57 @@ describe("CodexTerminalPlugin on Claude", () => {
     expect(factory.last.process.terminated).toBe(true);
   });
 
+  it("waits for native draft output and terminal quiet before sending one Forge Enter", async () => {
+    const { plugin, factory, tab, cwd, controls, dataDir, claudeSettings } = await setup();
+    await claudeSettings.acceptBypass();
+    factory.renderPaste = false;
+    const launching = plugin.createSession({ tab: { ...tab, ownerPluginId: "forge" }, cwd, controls,
+      agentTurn: { workerId: "issue-1", attemptId: "attempt-1", receiptPath: path.join(dataDir, "rendered-prompt.json") },
+      initialInput: { agent: { providerId: "claude" }, prompt: "First line\r\nSecond line\r\n" }
+    });
+    await expect.poll(() => factory.launches.at(-1)?.process.written).toBe("\u001b[200~First line\nSecond line\u001b[201~");
+    await new Promise(resolve => setTimeout(resolve, 75));
+    expect(factory.last.process.written).not.toContain("\r");
+    factory.last.process.emitData("Native draft rendered.\r\n");
+    await new Promise(resolve => setTimeout(resolve, 75));
+    expect(factory.last.process.written).not.toContain("\r");
+    const session = await launching;
+    try { expect(factory.last.process.written).toBe("\u001b[200~First line\nSecond line\u001b[201~\r"); }
+    finally { await session.terminate?.(); }
+  });
+
+  it("does not send Forge Enter or replay the paste when native output never arrives", async () => {
+    const { plugin, factory, tab, cwd, controls, dataDir, claudeSettings } = await setup();
+    await claudeSettings.acceptBypass();
+    factory.renderPaste = false;
+    factory.exitAfterPaste = true;
+    await expect(plugin.createSession({ tab: { ...tab, ownerPluginId: "forge" }, cwd, controls,
+      agentTurn: { workerId: "issue-1", attemptId: "attempt-1", receiptPath: path.join(dataDir, "unrendered-prompt.json") },
+      initialInput: { agent: { providerId: "claude" }, prompt: "Submit after native output" }
+    })).rejects.toThrow("No Enter was sent and the prompt was not replayed");
+    expect(factory.last.process.written).toBe("\u001b[200~Submit after native output\u001b[201~");
+    expect(factory.last.process.terminated).toBe(true);
+  });
+
+  it("bounds the wait for native draft output without sending Forge Enter", async () => {
+    const { plugin, factory, tab, cwd, controls, dataDir, claudeSettings } = await setup();
+    await claudeSettings.acceptBypass();
+    factory.renderPaste = false;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const launching = plugin.createSession({ tab: { ...tab, ownerPluginId: "forge" }, cwd, controls,
+        agentTurn: { workerId: "issue-1", attemptId: "attempt-1", receiptPath: path.join(dataDir, "timed-out-prompt.json") },
+        initialInput: { agent: { providerId: "claude" }, prompt: "Wait for native output" }
+      });
+      const rejected = expect(launching).rejects.toThrow("submission deadline");
+      await expect.poll(() => factory.launches.at(-1)?.process.written).toContain("Wait for native output");
+      vi.setSystemTime(Date.now() + 30_001);
+      await rejected;
+      expect(factory.last.process.written).toBe("\u001b[200~Wait for native output\u001b[201~");
+      expect(factory.last.process.terminated).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("surfaces unavailable interactive tracking and restores the activity indicator after a late valid receipt", async () => {
     const { plugin, factory, tab, cwd, controls, restored } = await setup();
     factory.deliverReceipt = false;
@@ -152,6 +223,21 @@ describe("CodexTerminalPlugin on Claude", () => {
       initialInput: { agent: { providerId: "claude" }, prompt: "Never submit this work" }
     })).rejects.toThrow("No worker prompt was submitted");
     expect(factory.lastCommandLine).not.toContain("Never submit this work");
+    expect(factory.last.process.written).toBe("");
+    expect(factory.last.process.terminated).toBe(true);
+  });
+
+  it("reports native API-key confirmation separately from missing hook tracking without exposing the key or submitting Forge work", async () => {
+    const { plugin, factory, tab, cwd, controls, dataDir, claudeSettings } = await setup();
+    await claudeSettings.acceptBypass();
+    factory.deliverReceipt = false;
+    factory.startupOutput = "ANTHROPIC_API_KEY: sk-ant-never-print-key\r\nDo\u001b[5Gyou\u001b[9Gwant to use this API key?\r\n";
+    const launch = plugin.createSession({ tab: { ...tab, ownerPluginId: "forge" }, cwd, controls,
+      agentTurn: { workerId: "issue-1", attemptId: "attempt-1", receiptPath: path.join(dataDir, "attempt-1.json") },
+      initialInput: { agent: { providerId: "claude" }, prompt: "Never submit this work" }
+    });
+    await expect(launch).rejects.toThrow("requires API-key confirmation before unattended Forge work");
+    await expect(launch).rejects.not.toThrow("never-print");
     expect(factory.last.process.written).toBe("");
     expect(factory.last.process.terminated).toBe(true);
   });

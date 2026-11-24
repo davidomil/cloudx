@@ -195,6 +195,7 @@ jobs:
           - installer
           - 0.156.1
           - 0.166.0
+          - 0.172.0
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -217,8 +218,12 @@ jobs:
           fi
           npm install --global --prefix "$RUNNER_TEMP/codex" --ignore-scripts --no-audit --no-fund "@openai/codex@$codex_version"
           printf 'version=%s\n' "$codex_version" >> "$GITHUB_OUTPUT"
+      - name: Install previous native for shared-state compatibility
+        if: matrix.codex == '0.172.0'
+        run: npm install --global --prefix "$RUNNER_TEMP/codex-previous" --ignore-scripts --no-audit --no-fund @openai/codex@0.166.0
       - name: Require production launch, permissions and conversation recovery
         env:
+          CLOUDX_PREVIOUS_NATIVE_CODEX: ${{ matrix.codex == '0.172.0' && format('{0}/codex-previous/bin/codex', runner.temp) || '' }}
           CLOUDX_NATIVE_CODEX_VERSION: ${{ steps.codex.outputs.version }}
           CLOUDX_CODEX_VERIFICATION_DIAGNOSTICS_DIR: ${{ github.workspace }}/test-results/codex-verification
         run: CLOUDX_NATIVE_CODEX="$RUNNER_TEMP/codex/bin/codex" npm run test:codex-recovery
@@ -236,9 +241,13 @@ jobs:
           npm install --global --prefix "$RUNNER_TEMP/codex-config-repair" --ignore-scripts --no-audit --no-fund @openai/codex@0.160.0
           CLOUDX_NATIVE_CODEX_CONFIG_REPAIR="$RUNNER_TEMP/codex-config-repair/bin/codex" npx vitest run apps/server/src/plugins/CodexConfigRepair.native.test.ts
   claude-native:
-    name: Claude Code native contract
+    name: Claude Code native contract (${{ matrix.claude }})
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        claude: ["2.1.325", "2.1.331"]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
@@ -249,12 +258,15 @@ jobs:
           node-version: 22.23.1
           cache: npm
       - run: npm ci
-      - name: Install the pinned Claude Code CLI
+      - name: Install the exact reviewed Claude Code channel release
+        env:
+          CLAUDE_RELEASE: ${{ matrix.claude }}
         run: |
-          claude_version="$(node --input-type=module -e 'import { CLAUDE_CODE_VERSION } from "./scripts/install-cloudx.mjs"; console.log(CLAUDE_CODE_VERSION)')"
+          claude_version="$CLAUDE_RELEASE"
           npm install --global --prefix "$RUNNER_TEMP/claude" --no-audit --no-fund "@anthropic-ai/claude-code@$claude_version"
       - name: Require the CLI flags, login status and hook receipts CloudX relies on
         env:
+          CLOUDX_NATIVE_CLAUDE_VERSION: ${{ matrix.claude }}
           CLOUDX_COOPERATION_NATIVE_DIAGNOSTICS_DIR: ${{ runner.temp }}/claude-native-diagnostics
         run: |
           CLOUDX_NATIVE_CLAUDE="$RUNNER_TEMP/claude/bin/claude" npx vitest run apps/server/src/agents apps/server/src/cooperationAgent/CooperationNative.native.test.ts
@@ -262,7 +274,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: claude-native-diagnostics-${{ github.sha }}
+          name: claude-native-diagnostics-${{ matrix.claude }}-${{ github.sha }}
           path: ${{ runner.temp }}/claude-native-diagnostics/
           if-no-files-found: ignore
           retention-days: 14

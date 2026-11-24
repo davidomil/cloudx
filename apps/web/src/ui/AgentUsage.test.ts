@@ -353,6 +353,20 @@ describe("UsageHoverCard", () => {
 });
 
 describe("AgentPricingPanel", () => {
+  it("shows model review dates and estimate limits without changing saved overrides", async () => {
+    const state: AgentPricingState = { asOf: "2026-10-05", modelAsOf: { "claude-haiku-5-5": "2026-11-24" },
+      builtIn: { "claude-haiku-5-5": { input: 0.1, cachedInput: 0.01, cacheWrite: 0.125, cacheWrite1h: 0.2, output: 0.5 } },
+      overrides: { "claude-haiku-5-5": { input: 3, cachedInput: 2, cacheWrite: 1, output: 4 } } };
+    const callHook = vi.fn(async () => ({ pricing: state }));
+    const container = await render(createElement(AgentPricingPanel, { callHook: callHook as never }));
+    expect(container.textContent).toContain("2026-10-05 baseline");
+    expect(container.textContent).toContain("Reviewed 2026-11-24");
+    expect(container.textContent).toContain("API-equivalent prices");
+    expect(container.textContent).toContain("do not identify regional routing or separate 12-hour cache writes");
+    expect(container.querySelector<HTMLInputElement>('[aria-label="claude-haiku-5-5 Input"]')!.value).toBe("3");
+    expect(callHook).toHaveBeenCalledTimes(1);
+  });
+
   it("shows built-in prices as placeholders and saves complete overrides only", async () => {
     const state: AgentPricingState = { asOf: "2026-10-05", builtIn: { "gpt-6.1-sol": { input: 2, cachedInput: 0.1, cacheWrite: 2.5, output: 10 } }, overrides: {} };
     const callHook = vi.fn(async (hookId: string, input?: Record<string, unknown>) =>

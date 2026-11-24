@@ -7,10 +7,10 @@ const artifactAction = "actions/download-artifact@634f93cb2916e3fdff6788551b99b0
 const artifactStep = { name: "Download artifacts", number: 5, status: "completed", conclusion: "failure" };
 
 describe("Pinned workflow dependencies", () => {
-  it.each(["Installed previous-version upgrade", "Codex native recovery (0.166.0)"])("resolves the real CI aggregate's failed %s producer, including every literal matrix sibling", async failedName => {
+  it.each(["Installed previous-version upgrade", "Codex native recovery (0.166.0)", "Codex native recovery (0.172.0)"])("resolves the real CI aggregate's failed %s producer, including every literal matrix sibling", async failedName => {
     const workflow = new GitHubWorkflowDependencies(await fs.readFile(".github/workflows/ci.yml", "utf8"));
     const names = ["Repository policy", "TypeScript (build, type-check, test)", "Codex native recovery (installer)",
-      "Codex native recovery (0.156.1)", "Codex native recovery (0.166.0)", "Terminal stress (Node 22, 2 CPUs, 7 GiB)", "Pinned lifecycle revisions",
+      "Codex native recovery (0.156.1)", "Codex native recovery (0.166.0)", "Codex native recovery (0.172.0)", "Terminal stress (Node 22, 2 CPUs, 7 GiB)", "Pinned lifecycle revisions",
       "Clean installation", "Installed previous-version upgrade", "Python services (pytest)",
       "Browser smoke (desktop and mobile)", "Isolated full verifier", "Trusted merge identity"];
     const jobs = names.map(name => terminal(name, name === failedName ? "failure" : "success"));

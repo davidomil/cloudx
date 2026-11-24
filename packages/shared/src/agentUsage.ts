@@ -67,6 +67,8 @@ export interface AgentModelPrice {
 export interface AgentPricingState {
   asOf: string;
   builtIn: Record<string, AgentModelPrice>;
+  // Per-model review dates when they differ from the original baseline.
+  modelAsOf?: Record<string, string>;
   overrides: Record<string, AgentModelPrice>;
 }
 

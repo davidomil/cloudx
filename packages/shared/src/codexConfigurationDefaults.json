@@ -3648,5 +3648,1427 @@
       "source": "https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/config/mod.rs#L4255",
       "kind": "fixed"
     }
+  },
+  "0.172.0": {
+    "tui.keymap.global.open_agents": {
+      "value": [],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1922",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.open_transcript": {
+      "value": [
+        "Ctrl+T"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1923",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.find_transcript": {
+      "value": [
+        "F3"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1924",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.select_transcript": {
+      "value": [
+        "leader ["
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L35",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.focus_activity": {
+      "value": [
+        "F4"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1926",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.open_warnings": {
+      "value": [
+        "F2"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1927",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.open_external_editor": {
+      "value": [
+        "Ctrl+G"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1928",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.copy": {
+      "value": [
+        "Ctrl+O"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1929",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.clear_terminal": {
+      "value": [
+        "Ctrl+L"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1930",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.toggle_vim_mode": {
+      "value": [],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1931",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.toggle_fast_mode": {
+      "value": [],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1932",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.toggle_raw_output": {
+      "value": [
+        "Alt+R"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1933",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.toggle_side_conversation": {
+      "value": [
+        "Ctrl+/"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1934",
+      "kind": "keymap"
+    },
+    "tui.keymap.chat.open_presets": {
+      "value": [
+        "leader p"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L36",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.chat.toggle_voice": {
+      "value": [
+        "F8"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1939",
+      "kind": "keymap"
+    },
+    "tui.keymap.chat.toggle_voice_mute": {
+      "value": [
+        "F9"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1940",
+      "kind": "keymap"
+    },
+    "tui.keymap.chat.interrupt_turn": {
+      "value": [
+        "Escape"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1942",
+      "kind": "keymap"
+    },
+    "tui.keymap.chat.decrease_reasoning_effort": {
+      "value": [
+        "Alt+,",
+        "Shift+Down"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1943",
+      "kind": "keymap"
+    },
+    "tui.keymap.chat.increase_reasoning_effort": {
+      "value": [
+        "Alt+.",
+        "Shift+Up"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1947",
+      "kind": "keymap"
+    },
+    "tui.keymap.chat.previous_permission_mode": {
+      "value": [],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1951",
+      "kind": "keymap"
+    },
+    "tui.keymap.chat.next_permission_mode": {
+      "value": [],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1952",
+      "kind": "keymap"
+    },
+    "tui.keymap.chat.edit_queued_message": {
+      "value": [
+        "Shift+Left",
+        "Alt+Up"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1953",
+      "kind": "keymap"
+    },
+    "tui.keymap.chat.prompt_stack_back": {
+      "value": [
+        "Shift+Right",
+        "Alt+Down"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1954",
+      "kind": "keymap"
+    },
+    "tui.keymap.chat.skip_question": {
+      "value": [
+        "Ctrl+]"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1955",
+      "kind": "keymap"
+    },
+    "tui.keymap.composer.submit": {
+      "value": [
+        "Enter"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1958",
+      "kind": "keymap"
+    },
+    "tui.keymap.composer.queue": {
+      "value": [
+        "Tab"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1959",
+      "kind": "keymap"
+    },
+    "tui.keymap.composer.toggle_shortcuts": {
+      "value": [
+        "?",
+        "Shift+?"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1960",
+      "kind": "keymap"
+    },
+    "tui.keymap.composer.history_search_previous": {
+      "value": [
+        "Ctrl+R"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1964",
+      "kind": "keymap"
+    },
+    "tui.keymap.composer.history_search_next": {
+      "value": [
+        "Ctrl+S"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1965",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.insert_newline": {
+      "value": [
+        "Ctrl+J",
+        "Ctrl+M",
+        "Enter",
+        "Shift+Enter",
+        "Alt+Enter"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1970",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.move_left": {
+      "value": [
+        "Left",
+        "Ctrl+B"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1977",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.move_right": {
+      "value": [
+        "Right",
+        "Ctrl+F"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1978",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.move_up": {
+      "value": [
+        "Up",
+        "Ctrl+P"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1979",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.move_down": {
+      "value": [
+        "Down",
+        "Ctrl+N"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1980",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.move_word_left": {
+      "value": [
+        "Alt+B",
+        "Alt+Left",
+        "Ctrl+Left"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1981",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.move_word_right": {
+      "value": [
+        "Alt+F",
+        "Alt+Right",
+        "Ctrl+Right"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1986",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.move_line_start": {
+      "value": [
+        "Home",
+        "Ctrl+A",
+        "Super+Left"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1991",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.move_line_end": {
+      "value": [
+        "End",
+        "Ctrl+E",
+        "Super+Right"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1996",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.delete_backward": {
+      "value": [
+        "Backspace",
+        "Shift+Backspace",
+        "Ctrl+H"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2001",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.delete_forward": {
+      "value": [
+        "Delete",
+        "Shift+Delete",
+        "Ctrl+D"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2006",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.delete_backward_word": {
+      "value": [
+        "Alt+Backspace",
+        "Ctrl+Backspace",
+        "Ctrl+Shift+Backspace",
+        "Ctrl+W",
+        "Ctrl+Alt+h"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2011",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.delete_forward_word": {
+      "value": [
+        "Alt+Delete",
+        "Ctrl+Delete",
+        "Ctrl+Shift+Delete",
+        "Alt+D"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2024",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.kill_line_start": {
+      "value": [
+        "Ctrl+U",
+        "Super+Backspace"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2033",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.kill_whole_line": {
+      "value": [],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2037",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.kill_line_end": {
+      "value": [
+        "Ctrl+K"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2038",
+      "kind": "keymap"
+    },
+    "tui.keymap.editor.yank": {
+      "value": [
+        "Ctrl+Y"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2039",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.enter_insert": {
+      "value": [
+        "i",
+        "Insert"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2042",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.append_after_cursor": {
+      "value": [
+        "a"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2043",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.append_line_end": {
+      "value": [
+        "Shift+A",
+        "A"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2044",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.insert_line_start": {
+      "value": [
+        "Shift+I",
+        "I"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2048",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.open_line_below": {
+      "value": [
+        "o"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2052",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.open_line_above": {
+      "value": [
+        "Shift+O",
+        "O"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2053",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.enter_replace_mode": {
+      "value": [
+        "Shift+R",
+        "R"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2057",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.move_left": {
+      "value": [
+        "h",
+        "Left"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2061",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.move_right": {
+      "value": [
+        "l",
+        "Right"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2062",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.move_up": {
+      "value": [
+        "k",
+        "Up"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2063",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.move_down": {
+      "value": [
+        "j",
+        "Down"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2064",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.move_word_forward": {
+      "value": [
+        "w"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2065",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.move_word_backward": {
+      "value": [
+        "b"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2066",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.move_word_end": {
+      "value": [
+        "e"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2067",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.move_line_start": {
+      "value": [
+        "0"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2068",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.move_line_end": {
+      "value": [
+        "$",
+        "Shift+$"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1996",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.find_forward": {
+      "value": [
+        "f"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2073",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.find_backward": {
+      "value": [
+        "Shift+F"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2074",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.till_forward": {
+      "value": [
+        "t"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2075",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.till_backward": {
+      "value": [
+        "Shift+T"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2076",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.jump_top": {
+      "value": [],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2077",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.jump_bottom": {
+      "value": [
+        "Shift+G",
+        "G"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2078",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.delete_char": {
+      "value": [
+        "x"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2082",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.replace_char": {
+      "value": [
+        "r"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2083",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.repeat_last_change": {
+      "value": [
+        "."
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2084",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.substitute_char": {
+      "value": [
+        "s"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2085",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.delete_to_line_end": {
+      "value": [
+        "Shift+D",
+        "D"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2086",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.change_to_line_end": {
+      "value": [
+        "Shift+C",
+        "C"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2090",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.yank_line": {
+      "value": [
+        "Shift+Y",
+        "Y"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2094",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.paste_after": {
+      "value": [
+        "p"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2095",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.start_delete_operator": {
+      "value": [
+        "d"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2096",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.start_yank_operator": {
+      "value": [
+        "y"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2097",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.start_change_operator": {
+      "value": [
+        "c"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2098",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.undo": {
+      "value": [
+        "u"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2099",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.redo": {
+      "value": [
+        "Ctrl+R"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2100",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_normal.cancel_operator": {
+      "value": [
+        "Escape"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2101",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.delete_line": {
+      "value": [
+        "d"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2105",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.yank_line": {
+      "value": [
+        "y"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2106",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_left": {
+      "value": [
+        "h"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2107",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_right": {
+      "value": [
+        "l"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2108",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_up": {
+      "value": [
+        "k"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2109",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_down": {
+      "value": [
+        "j"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2110",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_word_forward": {
+      "value": [
+        "w"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2111",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_word_backward": {
+      "value": [
+        "b"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2112",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_word_end": {
+      "value": [
+        "e"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2113",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_line_start": {
+      "value": [
+        "0"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2114",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_line_end": {
+      "value": [
+        "$",
+        "Shift+$"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2115",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_find_forward": {
+      "value": [
+        "f"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2119",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_find_backward": {
+      "value": [
+        "Shift+F"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2120",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_till_forward": {
+      "value": [
+        "t"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2121",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_till_backward": {
+      "value": [
+        "Shift+T"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2122",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_jump_top": {
+      "value": [],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2123",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.motion_jump_bottom": {
+      "value": [
+        "Shift+G",
+        "G"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2124",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.select_inner_text_object": {
+      "value": [
+        "i"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2128",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.select_around_text_object": {
+      "value": [
+        "a"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2129",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_operator.cancel": {
+      "value": [
+        "Escape"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2130",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_text_object.word": {
+      "value": [
+        "w"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2133",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_text_object.big_word": {
+      "value": [
+        "Shift+W",
+        "W"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2134",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_text_object.parentheses": {
+      "value": [
+        "(",
+        "Shift+(",
+        ")",
+        "Shift+)",
+        "b"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2135",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_text_object.brackets": {
+      "value": [
+        "[",
+        "]"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2142",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_text_object.braces": {
+      "value": [
+        "{",
+        "Shift+{",
+        "}",
+        "Shift+}",
+        "Shift+B",
+        "B"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2143",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_text_object.double_quote": {
+      "value": [
+        "\"",
+        "Shift+\""
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2151",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_text_object.single_quote": {
+      "value": [
+        "'"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2155",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_text_object.backtick": {
+      "value": [
+        "`"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2156",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_text_object.cancel": {
+      "value": [
+        "Escape"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2130",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.scroll_up": {
+      "value": [
+        "Up",
+        "k"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2160",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.scroll_down": {
+      "value": [
+        "Down",
+        "j"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2161",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.page_up": {
+      "value": [
+        "PageUp",
+        "Shift+ ",
+        "Ctrl+B"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2162",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.page_down": {
+      "value": [
+        "PageDown",
+        " ",
+        "Ctrl+F"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2167",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.half_page_up": {
+      "value": [
+        "Ctrl+U"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2172",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.half_page_down": {
+      "value": [
+        "Ctrl+D"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2173",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.jump_top": {
+      "value": [
+        "Home"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2174",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.jump_bottom": {
+      "value": [
+        "End"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2175",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.close": {
+      "value": [
+        "q",
+        "Ctrl+C"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2176",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.close_transcript": {
+      "value": [
+        "Ctrl+T"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2177",
+      "kind": "keymap"
+    },
+    "tui.keymap.pager.find": {
+      "value": [
+        "F3",
+        "/"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2178",
+      "kind": "keymap"
+    },
+    "tui.keymap.list.move_up": {
+      "value": [
+        "Up",
+        "Ctrl+P",
+        "Ctrl+K",
+        "k"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2183",
+      "kind": "keymap"
+    },
+    "tui.keymap.list.move_down": {
+      "value": [
+        "Down",
+        "Ctrl+N",
+        "Ctrl+J",
+        "j"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2189",
+      "kind": "keymap"
+    },
+    "tui.keymap.list.move_left": {
+      "value": [
+        "Left",
+        "Ctrl+H"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2195",
+      "kind": "keymap"
+    },
+    "tui.keymap.list.move_right": {
+      "value": [
+        "Right",
+        "Ctrl+L"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2196",
+      "kind": "keymap"
+    },
+    "tui.keymap.list.page_up": {
+      "value": [
+        "PageUp",
+        "Ctrl+B"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2197",
+      "kind": "keymap"
+    },
+    "tui.keymap.list.page_down": {
+      "value": [
+        "PageDown",
+        "Ctrl+F"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2198",
+      "kind": "keymap"
+    },
+    "tui.keymap.list.jump_top": {
+      "value": [
+        "Home"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2174",
+      "kind": "keymap"
+    },
+    "tui.keymap.list.jump_bottom": {
+      "value": [
+        "End"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2175",
+      "kind": "keymap"
+    },
+    "tui.keymap.list.accept": {
+      "value": [
+        "Enter"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2201",
+      "kind": "keymap"
+    },
+    "tui.keymap.list.cancel": {
+      "value": [
+        "Escape"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2130",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.resume": {
+      "value": [
+        "o"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2208",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.search": {
+      "value": [
+        "F3",
+        "/"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2209",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.new_task": {
+      "value": [
+        "n"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2210",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.new_worktree": {
+      "value": [
+        "w"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2211",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.fork": {
+      "value": [
+        "f"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2212",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.rename": {
+      "value": [
+        "r"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2213",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.stop": {
+      "value": [
+        "x"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2214",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.archive": {
+      "value": [
+        "a"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2215",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.delete": {
+      "value": [
+        "Backspace"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2216",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.hide": {
+      "value": [
+        "h"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2217",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.toggle_pin": {
+      "value": [
+        "p"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2218",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.toggle_grouping": {
+      "value": [
+        "g"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2219",
+      "kind": "keymap"
+    },
+    "tui.keymap.approval.open_fullscreen": {
+      "value": [
+        "Ctrl+A",
+        "Ctrl+Shift+a"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2223",
+      "kind": "keymap"
+    },
+    "tui.keymap.approval.open_thread": {
+      "value": [
+        "o"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2230",
+      "kind": "keymap"
+    },
+    "tui.keymap.approval.approve": {
+      "value": [
+        "y"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2231",
+      "kind": "keymap"
+    },
+    "tui.keymap.approval.approve_for_session": {
+      "value": [
+        "a"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2232",
+      "kind": "keymap"
+    },
+    "tui.keymap.approval.approve_for_prefix": {
+      "value": [
+        "p"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2233",
+      "kind": "keymap"
+    },
+    "tui.keymap.approval.deny": {
+      "value": [
+        "d"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2234",
+      "kind": "keymap"
+    },
+    "tui.keymap.approval.decline": {
+      "value": [
+        "Escape",
+        "n"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2235",
+      "kind": "keymap"
+    },
+    "tui.keymap.approval.cancel": {
+      "value": [
+        "c"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2236",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.submit": {
+      "value": [
+        "Enter"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1958",
+      "kind": "keymap",
+      "description": "Reusable action; the built-in bindings shown apply to the composer context. A configured context overrides this global setting."
+    },
+    "tui.keymap.global.queue": {
+      "value": [
+        "Tab"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1959",
+      "kind": "keymap",
+      "description": "Reusable action; the built-in bindings shown apply to the composer context. A configured context overrides this global setting."
+    },
+    "tui.keymap.global.toggle_shortcuts": {
+      "value": [
+        "?",
+        "Shift+?"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L1960",
+      "kind": "keymap",
+      "description": "Reusable action; the built-in bindings shown apply to the composer context. A configured context overrides this global setting."
+    },
+    "tui.keymap.vim_search.forward": {
+      "value": [
+        "/"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/vim_search.rs#L20",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_search.backward": {
+      "value": [
+        "?",
+        "Shift+?"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/vim_search.rs#L21",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_search.next": {
+      "value": [
+        "n"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/vim_search.rs#L22",
+      "kind": "keymap"
+    },
+    "tui.keymap.vim_search.previous": {
+      "value": [
+        "N",
+        "Shift+N"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/vim_search.rs#L23",
+      "kind": "keymap"
+    },
+    "tui.keymap.global.leader": {
+      "value": [
+        "Ctrl+X"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/leader.rs#L16",
+      "kind": "keymap",
+      "description": "Default yields to explicitly configured shortcuts or chord prefixes."
+    },
+    "file_opener": {
+      "value": "vscode",
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs#L4863",
+      "kind": "fixed"
+    },
+    "web_search": {
+      "value": "cached",
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs#L4170",
+      "kind": "fixed",
+      "description": "Base native default before explicit search settings, legacy feature flags, provider capabilities and enforced requirements are applied."
+    },
+    "hide_agent_reasoning": {
+      "value": false,
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs#L4870",
+      "kind": "fixed"
+    },
+    "check_for_update_on_startup": {
+      "value": true,
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs#L4521",
+      "kind": "fixed"
+    },
+    "include_permissions_instructions": {
+      "value": true,
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs#L4422",
+      "kind": "fixed"
+    },
+    "include_apps_instructions": {
+      "value": true,
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs#L4423",
+      "kind": "fixed"
+    },
+    "include_collaboration_mode_instructions": {
+      "value": true,
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs#L4425",
+      "kind": "fixed"
+    },
+    "include_environment_context": {
+      "value": true,
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs#L4435",
+      "kind": "fixed"
+    },
+    "include_environment_context_time": {
+      "value": true,
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs#L4436",
+      "kind": "fixed"
+    },
+    "tui.keymap.global.change_host": {
+      "value": [
+        "leader b"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L34",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.focus_main_composer": {
+      "value": [
+        "leader c"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L37",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.focus_sidebar_content": {
+      "value": [
+        "leader s"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L38",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.hide_pane": {
+      "value": [
+        "leader -"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L39",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.focus_pane_left": {
+      "value": [
+        "leader left",
+        "leader h"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L41",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.focus_pane_right": {
+      "value": [
+        "leader right",
+        "leader l"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L43",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.toggle_pane_zoom": {
+      "value": [
+        "leader z"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L44",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.move_divider_left": {
+      "value": [
+        "leader shift-h"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L45",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.move_divider_right": {
+      "value": [
+        "leader shift-l"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L46",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.equalize_pane_widths": {
+      "value": [
+        "leader ="
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L47",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.resize_panes": {
+      "value": [
+        "leader r"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L48",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.minimize_pane_width": {
+      "value": [
+        "leader ,"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L49",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.maximize_pane_width": {
+      "value": [
+        "leader ."
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L50",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.close_sidebar_tab": {
+      "value": [
+        "leader w"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L51",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.focus_sidebar_tabs": {
+      "value": [
+        "leader t"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L52",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.sidebar_up": {
+      "value": [
+        "leader shift-tab",
+        "leader up",
+        "leader k"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L56",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.sidebar_down": {
+      "value": [
+        "leader tab",
+        "leader down",
+        "leader j"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L58",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.pager.mark_markdown": {
+      "value": [
+        "leader v"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L59",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.global.choose_cloud_environment": {
+      "value": [
+        "leader e"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap/chords/leader_defaults.rs#L60",
+      "kind": "keymap",
+      "description": "Implicit leader chords require a free action and prefix. Side-pane actions also require native workspace mode. An explicit empty list disables them."
+    },
+    "tui.keymap.agents.next_group": {
+      "value": [
+        "Shift+Down",
+        "Shift+J"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2206",
+      "kind": "keymap"
+    },
+    "tui.keymap.agents.previous_group": {
+      "value": [
+        "Shift+Up",
+        "Shift+K"
+      ],
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/keymap.rs#L2207",
+      "kind": "keymap"
+    },
+    "code_mode.heartbeat_interval_s": {
+      "value": 0,
+      "source": "https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/core/src/config/mod.rs#L1291",
+      "kind": "fixed"
+    }
   }
 }

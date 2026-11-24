@@ -49,13 +49,14 @@ export function AgentPricingPanel({ callHook }: { callHook: CallHook }) {
 
   return <section className="agent-accounts-panel" aria-label="Model pricing">
     <h3>Model pricing</h3>
-    <p>USD per million tokens, used for the usage shown on tabs, windows and Forge workers. Built-in prices are standard API prices as of {pricing.asOf}. Fill a row to override a model; clear it to return to the built-in price.</p>
+    <p>USD per million tokens, used for the usage shown on tabs, windows and Forge workers. Built-in prices use the {pricing.asOf} baseline with later model review dates shown below. Fill a row to override a model; clear it to return to the built-in price.</p>
+    <p>These are estimates. Subscription usage uses API-equivalent prices, not subscription bills. Haiku 5.5 prompts over 100K tokens and GPT-6.2 prompts over 272K tokens use higher rates. Recorded fast mode, US inference and GPT-6.2 requested service tiers adjust estimates. GPT-6.2 usage during an ambiguous in-flight tier change remains unpriced. Native Codex rollouts do not identify regional routing or separate 12-hour cache writes; those charges are not included.</p>
     <div className="agent-pricing-table">
       <table>
         <thead><tr><th>Model</th>{AGENT_PRICE_FIELDS.map(field => <th key={field}>{FIELD_LABELS[field]}</th>)}</tr></thead>
         <tbody>
           {models.map(model => <tr key={model}>
-            <th scope="row">{model}</th>
+            <th scope="row">{model}{pricing.modelAsOf?.[model] ? <small>Reviewed {pricing.modelAsOf[model]}</small> : null}</th>
             {AGENT_PRICE_FIELDS.map(field => <td key={field}>
               <input aria-label={`${model} ${FIELD_LABELS[field]}`} inputMode="decimal" value={draft[model]?.[field] ?? ""}
                 placeholder={pricing.builtIn[model]?.[field]?.toString() ?? ""} onChange={event => set(model, field, event.target.value)} />

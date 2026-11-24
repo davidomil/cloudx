@@ -10,11 +10,28 @@ const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(root => fs.rm(root, { recursive: true, force: true }))); });
 
 it("uses the reviewed native registry only and never echoes an unsupported executable's output", () => {
-  expect(() => assertClaudeAccountPolicyVersion("2.1.316 (Claude Code)\n")).not.toThrow();
-  for (const version of ["2.1.315", "2.1.317", "9.9.9 (Claude Code)", "never-print-private-version"]) {
+  for (const version of ["2.1.316", "2.1.325", "2.1.331"]) {
+    expect(() => assertClaudeAccountPolicyVersion(`${version} (Claude Code)\n`)).not.toThrow();
+    expect(() => assertClaudeAccountPolicyVersion(version)).not.toThrow();
+  }
+  for (const version of ["2.1.315", "2.1.317", "2.1.326", "2.1.332", "9.9.9 (Claude Code)", "never-print-private-version"]) {
     expect(() => assertClaudeAccountPolicyVersion(version)).toThrow("reviewed for native 2.1.316");
     expect(() => assertClaudeAccountPolicyVersion(version)).not.toThrow("never-print");
   }
+});
+
+it("prevents native background updates from moving a reviewed executable to an unreviewed version", () => {
+  const launch = claudeAccountLaunch({ DISABLE_AUTOUPDATER: "" }, "/selected", {});
+  expect(launch.env.DISABLE_AUTOUPDATER).toBe("1");
+  expect(launch.enforced.set.DISABLE_AUTOUPDATER).toBe("1");
+  expect(launch.policy.settings.env.DISABLE_AUTOUPDATER).toBe("1");
+});
+
+it("refuses unreviewed Anthropic-managed Google Cloud service routing and suppresses its ambient selectors", () => {
+  expect(() => resolveClaudeAccountPolicy({ CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: "1" }, "/selected", {})).toThrow("not reviewed");
+  const launch = claudeAccountLaunch({}, "/selected", { ANTHROPIC_API_KEY: "selected" });
+  for (const key of ["CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH", "ANTHROPIC_GOOGLE_CLOUD_AUTH", "ANTHROPIC_GOOGLE_CLOUD_BASE_URL", "ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID"])
+    expect(launch.policy.settings.env[key]).toBe("");
 });
 
 it("pins selected credentials, refresh/profile/federation selectors and the SDK config directory through every launch boundary", () => {
@@ -62,9 +79,19 @@ it("keeps matching managed routing authoritative and rejects managed helper/iden
   for (const value of [
     { env: { AWS_PROFILE: "unrelated-secret-profile" } }, { awsCredentialExport: "never-print-helper" },
     { forceLoginMethod: "gateway" }, { forceLoginOrgUUID: "never-print-org" }, { policyHelper: { path: "/unverified" } },
+    { enforceAnthropicSignIn: true },
   ]) {
     await fs.writeFile(base, JSON.stringify(value));
     try { await assertClaudeAccountCompatibility(policy, [base]); throw new Error("Expected refusal"); }
     catch (error) { expect((error as Error).message).toContain("Claude managed"); expect((error as Error).message).not.toContain("never-print"); expect((error as Error).message).not.toContain("unrelated-secret-profile"); }
   }
+});
+
+it("keeps managed Anthropic sign-in requirements separate from selected API-key authentication", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-sign-in-policy-")); roots.push(root);
+  const file = path.join(root, "managed-settings.json");
+  await fs.writeFile(file, JSON.stringify({ enforceAnthropicSignIn: true }));
+  await expect(assertClaudeAccountCompatibility(resolveClaudeAccountPolicy({}, "/selected", { ANTHROPIC_API_KEY: "fake-selected" }), [file])).rejects.toThrow("enforceAnthropicSignIn");
+  await expect(assertClaudeAccountCompatibility(resolveClaudeAccountPolicy({}, "/selected", {}), [file])).resolves.toBeUndefined();
+  expect(await fs.readFile(file, "utf8")).toBe(JSON.stringify({ enforceAnthropicSignIn: true }));
 });

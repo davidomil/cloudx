@@ -61,7 +61,7 @@ describe("claudeLaunchEnv", () => {
       PATH: "/bin", ANTHROPIC_API_KEY: "inherited", CLAUDECODE: "1", CODEX_HOME: "/codex",
       CLAUDE_CODE_CHILD_SESSION: "1", CLAUDE_CODE_SESSION_ID: "parent", CLAUDE_CODE_MESSAGING_SOCKET: "/run/sock"
     }, "/overlay", {});
-    expect(env).toEqual({ PATH: "/bin", CLAUDE_CONFIG_DIR: "/overlay", ANTHROPIC_CONFIG_DIR: "/overlay/anthropic-auth" });
+    expect(env).toEqual({ PATH: "/bin", CLAUDE_CONFIG_DIR: "/overlay", ANTHROPIC_CONFIG_DIR: "/overlay/anthropic-auth", DISABLE_AUTOUPDATER: "1" });
     expect(claudeLaunchEnv({}, "/overlay", { ANTHROPIC_API_KEY: "account" })).toMatchObject({ ANTHROPIC_API_KEY: "account" });
   });
 
@@ -90,7 +90,7 @@ describe("Claude overlay and hook receipts", () => {
     const env = async (launchEnv: NodeJS.ProcessEnv) => JSON.parse(await fs.readFile((await materializeClaudeHomeOverlay({ ...options, launchEnv })).settingsPath, "utf8")).env;
 
     const configDir = path.join(root, "data", "claude-launches", "tab-1");
-    const cleared = { ...Object.fromEntries(CLAUDE_ACCOUNT_ENV_KEYS.map(key => [key, ""])), CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_CONFIG_DIR: path.join(configDir, "anthropic-auth") };
+    const cleared = { ...Object.fromEntries(CLAUDE_ACCOUNT_ENV_KEYS.map(key => [key, ""])), CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_CONFIG_DIR: path.join(configDir, "anthropic-auth"), DISABLE_AUTOUPDATER: "1" };
     expect(await env({ PATH: "/bin" })).toEqual(cleared);
     // Fake native settings cannot retain the newer provider selectors or key.
     await fs.writeFile(path.join(providerHome, "settings.json"), JSON.stringify({ env: { CLAUDE_CODE_USE_ANTHROPIC_AWS: "1", CLAUDE_CODE_USE_MANTLE: "1", ANTHROPIC_AWS_API_KEY: "fake-other-account" } }));

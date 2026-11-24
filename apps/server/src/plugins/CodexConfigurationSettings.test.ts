@@ -27,6 +27,23 @@ describe("native Codex settings", () => {
     expect(snapshot("", "0.167.0").blockedReason).toContain("no reviewed schema");
     expect(() => validateCodexNativeOptions(values, snapshot("", "0.162.1"), "")).toThrow(/reviewed/);
   });
+  it("round-trips 0.172 options while retaining private credential export commands", () => {
+    const text = '[model_providers.gateway]\nname="Before"\n[model_providers.gateway.gateway_oauth.credential_export]\ncommand="private-export-command"\nargs=["private-token"] # preserve\n';
+    const original = snapshot(text, "0.172.0");
+    expect(original.blockedReason).toBeNull();
+    expect(JSON.stringify(original)).not.toContain("private-");
+    const options = { code_mode: { heartbeat_interval_s: 15 }, tui: { notification_method: "osc777" } };
+    expect(() => validateCodexNativeOptions(options, original, text)).not.toThrow();
+    let saved = text;
+    for (const [family, value] of Object.entries(options)) saved = editCodexConfiguration(saved, family, original.values[family], value);
+    expect(snapshot(saved, "0.172.0").values).toMatchObject(options);
+    expect(saved).toContain('args=["private-token"] # preserve');
+    expect(() => validateCodexNativeOptions({ model_providers: { gateway: { gateway_oauth: { credential_export: { command: "replacement" } } } } }, snapshot(saved, "0.172.0"), saved)).toThrow(/authentication/);
+    const unset = editCodexConfiguration(saved, "code_mode", options.code_mode, null);
+    expect(snapshot(unset, "0.172.0").values).not.toHaveProperty("code_mode");
+    expect(unset).toContain("private-export-command");
+  });
+
   it("redacts authentication values, including nested profile credentials, while publishing environment references", () => {
     const text = '[mcp_servers.private]\ncommand="mcp"\nenv={ SECRET="hidden-value" }\nbearer_token="hidden-token"\nbearer_token_env_var="MCP_TOKEN"\n[model_providers.private]\nname="Provider"\nexperimental_bearer_token="hidden-provider-token"\nenv_key="PROVIDER_KEY"\n';
     const settings = snapshot(text);

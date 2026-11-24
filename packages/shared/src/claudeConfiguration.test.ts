@@ -8,10 +8,10 @@ const setting = (name: string) => claudeConfigurationCatalog("", "settings").fin
 describe("Claude native configuration inventory", () => {
   it("accounts for the complete retained reference surface without counting repeated flag summaries as independent controls", () => {
     const entries = claudeConfigurationCatalog();
-    expect(entries.filter(entry => entry.family === "settings")).toHaveLength(247);
-    expect(entries.filter(entry => entry.family === "environment")).toHaveLength(384);
-    expect(entries.filter(entry => entry.family === "cli")).toHaveLength(116);
-    expect(entries.filter(entry => entry.family === "cli").reduce((sum, entry) => sum + entry.referenceRows, 0)).toBe(121);
+    expect(entries.filter(entry => entry.family === "settings")).toHaveLength(250);
+    expect(entries.filter(entry => entry.family === "environment")).toHaveLength(422);
+    expect(entries.filter(entry => entry.family === "cli")).toHaveLength(118);
+    expect(entries.filter(entry => entry.family === "cli").reduce((sum, entry) => sum + entry.referenceRows, 0)).toBe(123);
     expect(new Set(entries.map(entry => `${entry.family}:${entry.name}`)).size).toBe(entries.length);
     for (const entry of entries) {
       expect(entry.scope).not.toBe("");
@@ -35,6 +35,8 @@ describe("Claude native configuration inventory", () => {
 
   it("preserves literal defaults, unset state, source provenance and version uncertainty", () => {
     expect(claudeConfigurationAvailability(setting("autoCompactEnabled"), "2.1.316 (Claude Code)")).toContain("source merging and unset verified");
+    for (const version of ["2.1.325", "2.1.331"])
+      expect(claudeConfigurationAvailability(setting("autoCompactEnabled"), version)).toContain("source merging and unset verified");
     expect(claudeConfigurationAvailability(setting("autoCompactEnabled"), "2.1.317")).not.toContain("unset verified");
     expect(claudeConfigurationAvailability(setting("allowManagedHooksOnly"), "2.1.316")).toContain("runtime unverified");
     expect(setting("copyOnSelect")).toMatchObject({ nativeDefault: true, defaultKind: "literal", scope: "Global config" });

@@ -13,13 +13,14 @@ export const CLAUDE_SETTINGS_HOOKS = {
 
 export const CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"] as const;
 export type ClaudeEffortLevel = typeof CLAUDE_EFFORT_LEVELS[number];
-// Current official model-config reference, reviewed 2026-11-01. Alias
+// Current official model-config reference, reviewed 2026-11-24.
+// These are persistable levels; max cannot be saved in modelSettings. Alias
 // resolution, provider deployment IDs and future models remain unestablished.
 export function claudeModelEffort(model: string): { model: string; levels: readonly ClaudeEffortLevel[]; referenceDefault: ClaudeEffortLevel } | undefined {
   const canonical = model.replace(/\[1m\]$/u, "").replace(/-\d{8}$/u, "");
   if (/^claude-(?:opus|sonnet)-4-6$/u.test(canonical)) return { model: canonical, levels: ["low", "medium", "high"], referenceDefault: "high" };
-  if (/^claude-(?:(?:opus|sonnet|haiku)-5-5|(?:opus|sonnet)-5|opus-4-[78]|fable-5(?:-1)?)$/u.test(canonical))
-    return { model: canonical, levels: CLAUDE_EFFORT_LEVELS, referenceDefault: canonical.endsWith("-5-5") ? "medium" : canonical === "claude-opus-4-7" ? "xhigh" : "high" };
+  if (/^claude-(?:(?:opus|sonnet|haiku)-5-5|(?:opus|sonnet)-5|opus-4-[78]|fable-5(?:-[12])?)$/u.test(canonical))
+    return { model: canonical, levels: CLAUDE_EFFORT_LEVELS, referenceDefault: (canonical.endsWith("-5-5") || canonical === "claude-fable-5-2") ? "medium" : canonical === "claude-opus-4-7" ? "xhigh" : "high" };
   return undefined;
 }
 export const CLAUDE_UPDATE_CHANNELS = ["latest", "stable"] as const;
@@ -101,5 +102,5 @@ export interface ClaudeCliStatus {
   output?: string;
 }
 
-export const CLAUDE_MODEL_ID_PATTERN = /^(?:claude-[a-z0-9.-]{1,96}|opus|sonnet|haiku|fable|default|opusplan)(?:\[1m\])?$/u;
+export const CLAUDE_MODEL_ID_PATTERN = /^(?:claude-[a-z0-9.-]{1,96}|opus|sonnet|haiku|fable|default|best|opusplan)(?:\[1m\])?$/u;
 export const CLAUDE_TEXT_SETTING_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N} ._:-]{0,63}$/u;

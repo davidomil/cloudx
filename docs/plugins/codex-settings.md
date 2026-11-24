@@ -120,8 +120,15 @@ must be corrected before this editor can save.
 Use **Search Codex options** to find native configuration families and
 nested paths. Groups show descriptions, types, enum choices, declared
 defaults, experimental status and platform scope. The inventory is
-pinned to Codex 0.160.0 and 0.162.1; an unreviewed executable blocks
+pinned to Codex 0.160.0, 0.162.1, 0.166.0 and 0.172.0; an unreviewed executable blocks
 native edits. Launch-only CLI options are listed separately.
+
+The 0.172.0 inventory includes `code_mode.heartbeat_interval_s`, the
+`osc777` notification method and the native feature defaults from the
+[exact release source](https://github.com/openai/codex/tree/rust-v0.172.0).
+Credential-export commands stay private. Native host selection state is
+read-only. Catalog coverage describes the editor; a managed update also
+requires isolated native launch and shared-state verification before selection.
 
 Each family has a structured JSON editor. Strings need quotes, tables
 use objects and lists use arrays. **Unset** removes the selected family

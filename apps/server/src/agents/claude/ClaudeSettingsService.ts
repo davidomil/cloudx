@@ -27,6 +27,8 @@ import { JsonStateFile, writeTextFileAtomic } from "../../jsonStateFile.js";
 import { agentCommand, claudeLaunchEnv, readAgentProviderStatus, runAgentCli } from "../agentCli.js";
 import { discoverClaudeUserSkills, type ClaudeUserSkill } from "./claudeSkillPolicy.js";
 import { AgentLaunchRecords } from "../AgentLaunchRecords.js";
+import { assertClaudeAccountPolicyVersion } from "./claudeAccountPolicy.js";
+import { verifyClaudeAccountPolicyVersion } from "./ClaudeNativeSettings.js";
 
 const MAX_SETTINGS_BYTES = 1024 * 1024;
 const UPDATE_TIMEOUT_MS = 5 * 60_000;
@@ -114,16 +116,25 @@ export class ClaudeSettingsService {
     return { installed: status.installed, command: status.command ?? agentCommand("claude", this.env), ...(status.version ? { version: status.version } : {}) };
   }
 
-  // Runs Claude Code's own updater, which follows autoUpdatesChannel.
+  // Refuse a moving channel that points beyond the exact native policy review.
   async updateCli(signal?: AbortSignal): Promise<ClaudeCliStatus> {
     const channel = (await this.read()).autoUpdatesChannel;
     if (channel !== null && !CLAUDE_UPDATE_CHANNELS.some(value => value === channel))
       throw new Error(`Saved Claude update channel ${JSON.stringify(channel)} is unsupported. Select latest, stable, or unset it in Settings → Claude before updating.`);
-    const env = claudeLaunchEnv(this.env, this.providerHome(), {});
-    const result = await runAgentCli(agentCommand("claude", this.env), ["update"], { env, timeoutMs: UPDATE_TIMEOUT_MS, signal, maxOutputBytes: 256 * 1024 });
+    const selectedChannel = channel ?? "latest";
+    const command = agentCommand("claude", this.env);
+    const options = { env: claudeLaunchEnv(this.env, this.providerHome(), {}), cwd: process.cwd(), signal };
+    const settingsArgs = ["--settings", JSON.stringify({ autoUpdatesChannel: selectedChannel })];
+    await verifyClaudeUpdateChannel(command, settingsArgs, selectedChannel, options);
+    const target = await reviewedClaudeUpdateVersion(selectedChannel, signal);
+    const result = await runAgentCli(command, [...settingsArgs, "update"], { ...options, timeoutMs: UPDATE_TIMEOUT_MS, maxOutputBytes: 256 * 1024 });
     const output = `${result.stdout}\n${result.stderr}`.replace(/\u001b\[[0-9;?]*[A-Za-z]/gu, "").trim().slice(-4_000);
     if (result.code !== 0) throw new Error(`Claude Code update failed${output ? `: ${output}` : "."}`);
-    return { ...await this.cliStatus(), output };
+    const status = await this.cliStatus();
+    assertClaudeAccountPolicyVersion(status.version ?? "");
+    if (status.version?.trim().replace(/ \(Claude Code\)$/u, "") !== target)
+      throw new Error(`Claude update did not select the verified ${selectedChannel} target ${target}. Check the selected installation and its update policy before starting a new launch; saved model and channel choices are unchanged.`);
+    return { ...status, output: `Reviewed ${selectedChannel} target: ${target}.\n${output}`.trim() };
   }
 
   private serialize<T>(operation: () => Promise<T>): Promise<T> {
@@ -211,6 +222,60 @@ export class ClaudeSettingsService {
     else delete native.modelSettings;
     return true;
   }
+}
+
+async function verifyClaudeUpdateChannel(command: string, settingsArgs: string[], channel: string, options: { env: NodeJS.ProcessEnv; cwd: string; signal?: AbortSignal }): Promise<void> {
+  const unverified = "Cannot verify the effective Claude update policy. Ask the policy owner to verify the selected installation and its managed update channel; no updater has started and saved choices are unchanged.";
+  let diagnostic: string;
+  try {
+    await verifyClaudeAccountPolicyVersion(command, options.env, runAgentCli, options.signal);
+    const result = await runAgentCli(command, [...settingsArgs, "doctor"], { ...options, timeoutMs: 30_000, maxOutputBytes: 256 * 1024 });
+    if (result.code !== 0) throw new Error();
+    diagnostic = result.stdout.replace(/\u001b\[[0-9;?]*[A-Za-z]/gu, "").replace(/\r\n/gu, "\n");
+  } catch { throw new Error(unverified); }
+  const channels = [...diagnostic.matchAll(/^Auto-update channel: (.*)$/gmu)];
+  if (channels.length !== 1 || !CLAUDE_UPDATE_CHANNELS.some(value => value === channels[0]![1])) throw new Error(unverified);
+  if (channels[0]![1] !== channel)
+    throw new Error(`Claude managed update channel conflicts with the saved ${channel} choice. Ask the policy owner to align the channels before updating; no updater has started and saved choices are unchanged.`);
+  // Doctor captures the channel before awaiting remote settings. A fetched or
+  // pending remote policy cannot establish the snapshot used by the next command.
+  const remote = [...diagnostic.matchAll(/^Managed settings \(remote\): (.*)$/gmu)];
+  const inactive = [
+    "no usable credentials for the settings fetch", "requires an Enterprise or Team subscription",
+    "not available with a custom ANTHROPIC_BASE_URL", "not available on Bedrock/Vertex/third-party providers"
+  ];
+  if (remote.length !== 1 || !inactive.some(reason => remote[0]![1] === `not fetched — ${reason}`)
+    || /^Managed settings \((?:fetched|cached)\):/mu.test(diagnostic)) throw new Error(unverified);
+}
+
+async function reviewedClaudeUpdateVersion(channel: string, signal?: AbortSignal): Promise<string> {
+  let version: string;
+  try {
+    const response = await fetch(`https://downloads.claude.ai/claude-code-releases/${channel}`, {
+      redirect: "error", signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000)
+    });
+    if (!response.ok) throw new Error();
+    if (!response.body) throw new Error();
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    try {
+      for (;;) {
+        const next = await reader.read();
+        if (next.done) break;
+        bytes += next.value.byteLength;
+        if (bytes > 64) { await reader.cancel(); throw new Error(); }
+        chunks.push(next.value);
+      }
+    } finally { reader.releaseLock(); }
+    version = Buffer.concat(chunks).toString("utf8").trim();
+    if (version.length > 64 || !/^\d+\.\d+\.\d+$/u.test(version)) throw new Error();
+  } catch {
+    throw new Error(`Cannot verify the Claude ${channel} channel target. No updater has started; the selected executable and settings are unchanged.`);
+  }
+  try { assertClaudeAccountPolicyVersion(version); }
+  catch { throw new Error(`The Claude ${channel} channel points to unreviewed native ${version}. Update the CloudX native policy review before updating Claude; no updater has started and saved choices are unchanged.`); }
+  return version;
 }
 
 function settingsFrom(settingsPath: string, text: string | undefined, preferences: ClaudeLaunchPreferences, installed: ClaudeUserSkill[]): ClaudeGlobalSettings {

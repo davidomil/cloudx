@@ -5,7 +5,7 @@ import path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { expect, it } from "vitest";
 import { parse, stringify } from "smol-toml";
-import type { WorkspaceTab } from "@cloudx/shared";
+import type { CodexConfigurationValue, WorkspaceTab } from "@cloudx/shared";
 import type { PluginSession } from "@cloudx/plugin-api";
 import { NodePtyTerminalProcessFactory } from "../terminal/NodePtyTerminalProcess.js";
 import { CodexTerminalPlugin } from "./CodexTerminalPlugin.js";
@@ -23,19 +23,22 @@ it.skipIf(!codex)("new-release presets and structured features survive native sa
   const fixture = await NativeConfigurationSession.create();
   try {
     const original = await fixture.settings.read();
-    if (original.configuration?.selectedVersion !== "0.166.0") { context.skip(); return; }
-    const nativeTui = { ...tui, copy_on_select_clear_selection: true, presets: { "3": { input: "Review the change", label: "Review" } } };
+    if (original.configuration?.selectedVersion !== "0.166.0" && original.configuration?.selectedVersion !== "0.172.0") { context.skip(); return; }
+    const nativeTui: Record<string, CodexConfigurationValue> = { ...tui, ...(original.configuration?.selectedVersion === "0.172.0" ? { notification_method: "osc777" } : {}), copy_on_select_clear_selection: true, presets: { "3": { input: "Review the change", label: "Review" } } };
     const features = { async_compaction: { enabled: false, model_async_compact_threshold_percent: 65 } };
-    await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { tui: nativeTui, features } });
+    const latest: Record<string, CodexConfigurationValue | null> = original.configuration?.selectedVersion === "0.172.0"
+      ? { code_mode: { heartbeat_interval_s: 15 } } : {};
+    await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: { tui: nativeTui, features, ...latest } });
     const reloaded = await fixture.settings.read();
-    expect(reloaded.configuration?.values).toMatchObject({ tui: nativeTui, features });
+    expect(reloaded.configuration?.values).toMatchObject({ tui: nativeTui, features, ...latest });
     await fixture.launch();
     await fixture.completeTurn();
-    expect(parse(await fs.readFile(fixture.overlayConfigPath, "utf8"))).toMatchObject({ tui: nativeTui, features });
-    await fixture.settings.update({ expectedRevision: reloaded.revision, nativeOptions: { tui: null, features: null } });
+    expect(parse(await fs.readFile(fixture.overlayConfigPath, "utf8"))).toMatchObject({ tui: nativeTui, features, ...latest });
+    await fixture.settings.update({ expectedRevision: reloaded.revision, nativeOptions: { tui: null, features: null, ...(latest.code_mode ? { code_mode: null } : {}) } });
     const unset = await fixture.settings.read();
     expect(unset.configuration?.values).not.toHaveProperty("tui");
     expect(unset.configuration?.values).not.toHaveProperty("features");
+    expect(unset.configuration?.values).not.toHaveProperty("code_mode");
     expect(unset.model).toBe(original.model);
     expect(unset.defaultSkills).toEqual(original.defaultSkills);
     expect(parse(await fs.readFile(fixture.overlayConfigPath, "utf8"))).toMatchObject({ tui: nativeTui });
@@ -49,7 +52,7 @@ it.skipIf(!codex).each(["tab", "Forge worker"])("saved configuration reaches a n
     const selected = await fixture.settings.update({ expectedRevision: original.revision, nativeOptions: {
       model_verbosity: "low", model_reasoning_summary: "concise", tui
     } });
-    expect(selected.configuration?.selectedVersion).toMatch(/^0\.(160\.0|162\.1|166\.0)$/u);
+    expect(selected.configuration?.selectedVersion).toMatch(/^0\.(160\.0|162\.1|166\.0|172\.0)$/u);
     await fixture.launch();
     await fixture.completeTurn();
     expect(fixture.requests[0]).toMatchObject({ text: { verbosity: "low" }, reasoning: { summary: "concise" } });

@@ -71,12 +71,16 @@ trap 'exit 143' TERM
 if [[ $scenario == upgrade ]]; then [[ $source_sha != "$target_sha" ]]; fi
 source /etc/os-release
 [[ $ID == ubuntu && $VERSION_ID == 24.04 ]]
+[[ $(dpkg --print-architecture) == amd64 ]]
 controller_node=$(command -v node)
 controller_bin=$(dirname "$controller_node")
 application_path="$controller_bin:/usr/local/bin:/usr/bin:/bin"
 : "${PLAYWRIGHT_BROWSERS_PATH:?Install the controller Chromium browser first}"
 test -r "$controller/node_modules/@playwright/test/package.json"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
+# Avoid runner mirror lists that can spend the installer deadline on failed downloads.
+# This also applies to the immutable previous version's unmodified install.sh.
+"$controller_node" "$controller/scripts/ci/lifecycle-apt.mjs" /etc/apt "$evidence"
 apt-get update > "$evidence/host-setup.log" 2>&1
 apt-get install --yes dbus-user-session sudo git openssl >> "$evidence/host-setup.log" 2>&1
 fixture=$(mktemp -d /tmp/cloudx-lifecycle.XXXXXX)

@@ -14,7 +14,9 @@ describe.skipIf(!selected)("selected Codex launch-option coverage", () => {
       expect(codexConfigurationCliCoverage(help, command, catalog), command).toEqual([]);
     }
     for (const option of catalog.filter(entry => entry.aliasOf || entry.internal)) {
-      expect(() => execFileSync(selected!, [...option.command.split(" ").slice(1), option.flag, "--help"], { encoding: "utf8", timeout: 10_000 }), option.path).not.toThrow();
+      const values = option.flag === "--plugin-mcp-launch-cwd" ? ["synthetic@native", "synthetic", "/tmp"]
+        : option.flag === "--mcp-launch-cwd" ? ["synthetic", "/bin/false", "/tmp"] : [];
+      expect(() => execFileSync(selected!, [...option.command.split(" ").slice(1), option.flag, ...values, "--help"], { encoding: "utf8", timeout: 10_000 }), option.path).not.toThrow();
     }
   });
 });

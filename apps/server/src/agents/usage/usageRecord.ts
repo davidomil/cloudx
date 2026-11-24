@@ -23,6 +23,10 @@ export interface UsageRecord {
   webSearches: number;
   fast: boolean;
   usInference: boolean;
+  // Requested native service tier, when the transcript records it.
+  serviceTier?: string;
+  // A thread edit overlapped a native turn without response-level tier data.
+  serviceTierUncertain?: boolean;
 }
 
 export function count(value: unknown): number {
@@ -34,5 +38,7 @@ export function isUsageRecord(value: unknown): value is UsageRecord {
     typeof value.at === "number" && Number.isFinite(value.at) &&
     ["input", "cachedInput", "cacheWrite", "cacheWrite1h", "output", "reasoning", "webSearches"].every(key =>
       typeof value[key] === "number" && Number.isFinite(value[key]) && value[key] >= 0) &&
-    typeof value.fast === "boolean" && typeof value.usInference === "boolean";
+    typeof value.fast === "boolean" && typeof value.usInference === "boolean" &&
+    (value.serviceTier === undefined || typeof value.serviceTier === "string") &&
+    (value.serviceTierUncertain === undefined || typeof value.serviceTierUncertain === "boolean");
 }

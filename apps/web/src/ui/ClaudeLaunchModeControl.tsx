@@ -1,5 +1,5 @@
 import { useId } from "react";
-import type { ClaudeLaunchMode } from "@cloudx/shared";
+import { CLAUDE_NATIVE_REVIEW, type ClaudeLaunchMode } from "@cloudx/shared";
 
 export function claudeLaunchModeLabel(mode: ClaudeLaunchMode): string {
   return mode === "cloudx-managed" ? "CloudX-managed" : "Native project";
@@ -13,7 +13,7 @@ export function ClaudeLaunchModeControl({ value, inheritedLabel, onChange }: {
   const disclosureId = useId();
   return <div className="claude-launch-mode">
     <div id={disclosureId}>
-      <p><strong>CloudX-managed is opt-in.</strong> Shared project settings, project CLAUDE.md and project rules are omitted. The supported configuration also omits local settings and CLAUDE.local.md; existing local inputs block launch with an actionable diagnostic. Use Native project to retain them. Permitted personal inputs remain. CloudX system/template skills and selected external skills form the controlled available set in the verified Claude Code 2.1.316 configuration on Linux.</p>
+      <p><strong>CloudX-managed is opt-in.</strong> Shared project settings, project CLAUDE.md and project rules are omitted. The supported configuration also omits local settings and CLAUDE.local.md; existing local inputs block launch with an actionable diagnostic. Use Native project to retain them. Permitted personal inputs remain. CloudX system/template skills and selected external skills form the controlled available set in the reviewed Claude Code {CLAUDE_NATIVE_REVIEW.reviewedVersions.join(", ")} configurations on Linux.</p>
       <p><strong>Native project</strong> preserves native project discovery. CloudX-supplied skill choices are additions, not an exclusive native allowlist. Account isolation, required hooks/receipts and selected CloudX system/template ownership apply in both modes.</p>
     </div>
     <label>
