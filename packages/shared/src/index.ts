@@ -17,7 +17,7 @@ export * from "./cloudxUpdate.js";
 export * from "./cloudxUpdateBackups.js";
 export * from "./directoryOwnership.js";
 export * from "./agents.js";
-import type { AGENT_ACCOUNTS_OPTION_SOURCE } from "./agents.js";
+import type { AGENT_ACCOUNTS_OPTION_SOURCE, AgentProviderId } from "./agents.js";
 export * from "./claudeSettings.js";
 export * from "./claudeLaunchPolicy.js";
 export * from "./claudeConfiguration.js";
@@ -628,6 +628,7 @@ export interface ConfigFieldOption {
   label: string;
   value: ConfigValue;
   description?: string;
+  nativeRequirement?: { providerId: AgentProviderId; minimumVersion: string };
 }
 
 export interface ConfigFieldDescriptor {

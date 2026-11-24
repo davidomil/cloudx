@@ -9,6 +9,8 @@ import { AgentUsageLedger } from "./AgentUsageLedger.js";
 import { AgentUsageService } from "./AgentUsageService.js";
 import { ClaudeUsageReader } from "./ClaudeUsageReader.js";
 import { CodexUsageReader } from "./CodexUsageReader.js";
+import { JsonlCache } from "./JsonlCache.js";
+import type { UsageRecord } from "./usageRecord.js";
 import { AgentPricing } from "./pricing.js";
 import { AgentUsagePlugin } from "../../plugins/AgentUsagePlugin.js";
 import { HookRegistry } from "../../hooks/HookRegistry.js";
@@ -127,6 +129,128 @@ describe("transcript readers", () => {
     expect(price(record!)).toBeCloseTo(0.25, 10);
   });
 
+  it("retains the native requested service tier per response and clears it on a native reset", async () => {
+    const home = await codexHome();
+    const file = path.join(home, "sessions", "2026", "10", "05", `rollout-2026-10-05T10-00-00-${ROOT}.jsonl`);
+    const settings = (service_tier: string | null) => ({ type: "event_msg", payload: { type: "thread_settings_applied", thread_id: ROOT, thread_settings: { service_tier } } });
+    await fs.appendFile(file, lines([
+      { type: "turn_context", payload: { model: "gpt-6.2-sol" } },
+      settings("priority"), codexUsage(ROOT, ROOT, "resp-fast", 21, { input_tokens: 10_000, output_tokens: 1_000 }),
+      settings(null), codexUsage(ROOT, ROOT, "resp-standard", 22, { input_tokens: 10_000, output_tokens: 1_000 }),
+      settings("unreviewed"), codexUsage(ROOT, ROOT, "resp-unreviewed", 23, { input_tokens: 10_000, output_tokens: 1_000 })
+    ]));
+    const records = await completeCodex(codexReader(() => home), ROOT, T0);
+    const price = await new AgentPricing(home).pricer();
+    const fast = records.find(record => record.id === "codex:resp-fast")!;
+    const standard = records.find(record => record.id === "codex:resp-standard")!;
+    expect(fast.serviceTier).toBe("priority");
+    expect(standard.serviceTier).toBeUndefined();
+    expect(price(fast)).toBeCloseTo(price(standard)! * 2, 10);
+    expect(price(records.find(record => record.id === "codex:resp-unreviewed")!)).toBeUndefined();
+  });
+
+  it.each([["task_started", "task_complete"], ["turn_started", "turn_complete"]])(
+    "keeps overlapping tier changes unpriced until a new native turn (%s/%s)", async (started, completed) => {
+      const home = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-codex-tier-overlap-"));
+      const day = path.join(home, "sessions", "2026", "10", "05");
+      await fs.mkdir(day, { recursive: true });
+      const file = path.join(day, `rollout-2026-10-05T10-00-00-${ROOT}.jsonl`);
+      const directory = path.join(home, "index");
+      const settings = (service_tier: string | null) => ({ type: "event_msg", payload: {
+        type: "thread_settings_applied", thread_id: ROOT, thread_settings: { service_tier }
+      } });
+      const lifecycle = (type: string, turn_id: string) => ({ type: "event_msg", payload: { type, turn_id } });
+      const context = (turn_id: string) => ({ type: "turn_context", payload: { model: "gpt-6.2-sol", turn_id } });
+      const response = (id: string, turn_id: string, minutes: number) => {
+        const value = codexUsage(ROOT, ROOT, id, minutes, { input_tokens: 10_000, output_tokens: 1_000 });
+        return { ...value, payload: { ...value.payload, turn_id } };
+      };
+      await fs.writeFile(file, lines([
+        { type: "session_meta", payload: { id: ROOT } },
+        lifecycle(started, "first-turn"), context("first-turn"), settings("priority"), response("before-change", "first-turn", 1),
+        settings(null)
+      ]));
+      const makeReader = () => new CodexUsageReader(() => home, { directory, scheduler: new UsageScanScheduler({ intervalMs: 0 }) });
+      const beforeRestart = makeReader();
+      await completeCodex(beforeRestart, ROOT, T0);
+      await beforeRestart.dispose();
+      await fs.appendFile(file, lines([
+        response("in-flight", "first-turn", 2),
+        context("first-turn"), settings(null), response("same-turn", "first-turn", 3),
+        lifecycle(completed, "first-turn"), lifecycle(started, "next-turn"), context("next-turn"), settings(null), response("next-turn", "next-turn", 4)
+      ]));
+      const reader = makeReader();
+      const records = await completeCodex(reader, ROOT, T0);
+      expect(records.map(record => record.serviceTierUncertain)).toEqual([undefined, true, true, undefined]);
+      const pricing = new AgentPricing(home);
+      const price = await pricing.pricer();
+      expect(price(records[0]!)).toBeCloseTo(0.06, 10);
+      expect(price(records[1]!)).toBeUndefined();
+      expect(price(records[2]!)).toBeUndefined();
+      expect(price(records[3]!)).toBeCloseTo(0.03, 10);
+      const ledger = new AgentUsageLedger(home, () => T0);
+      await ledger.open({ tabId: "tab", windowId: "window", forgeWorkerId: "worker" },
+        { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
+      const usage = new AgentUsageService(ledger, pricing, { codex: reader,
+        claude: { snapshot: async () => ({ records: [] }), idle: async () => {}, dispose: async () => {} } });
+      try {
+        const result = await completeUsage(usage, { tabIds: ["tab"], windowIds: ["window"], forgeWorkerIds: ["worker"] });
+        expect(result.total.totals).toMatchObject({ requests: 4, input: 40_000, output: 4_000 });
+        expect(result.total.costUsd).toBeCloseTo(0.09, 10);
+        expect(result.total.unpricedModels).toEqual(["gpt-6.2-sol"]);
+        expect(result.total.byModel[0]).not.toHaveProperty("costUsd");
+        expect(result.tabs.tab).toEqual(result.total);
+        expect(result.windows.window).toEqual(result.total);
+        expect(result.forgeWorkers.worker).toEqual(result.total);
+      } finally { await usage.dispose(); }
+    });
+
+  it("reindexes pre-tier checkpoints once and preserves requested tiers across a production reader restart", async () => {
+    const home = await codexHome();
+    const file = path.join(home, "sessions", "2026", "10", "05", `rollout-2026-10-05T10-00-00-${ROOT}.jsonl`);
+    const directory = path.join(home, "usage-index");
+    await fs.writeFile(file, lines([
+      { type: "session_meta", payload: { id: ROOT } },
+      { type: "turn_context", payload: { model: "gpt-6.2-sol" } },
+      { type: "event_msg", payload: { type: "thread_settings_applied", thread_id: ROOT, thread_settings: { service_tier: "priority" } } },
+      codexUsage(ROOT, ROOT, "historical-priority", 1, { input_tokens: 10_000, output_tokens: 1_000 })
+    ]));
+    const oldRecord: UsageRecord = { id: "codex:historical-priority", at: T0 + 60_000, model: "gpt-6.2-sol", input: 10_000,
+      cachedInput: 0, cacheWrite: 0, cacheWrite1h: 0, output: 1_000, reasoning: 0, webSearches: 0, fast: false, usInference: false };
+    const oldDirectory = path.join(directory, "service-tiers-v2");
+    const oldIndex = new JsonlCache(() => ({ model: "gpt-6.2-sol", ownThread: ROOT }), () => undefined, {
+      directory: oldDirectory, scheduler: new UsageScanScheduler({ intervalMs: 0 })
+    });
+    await oldIndex.read(file);
+    await oldIndex.idle();
+    await oldIndex.dispose();
+    const journal = path.join(oldDirectory, (await fs.readdir(oldDirectory))[0]!);
+    const checkpoint = JSON.parse((await fs.readFile(journal, "utf8")).trim());
+    checkpoint.results = [{ rootSession: ROOT, record: oldRecord }];
+    checkpoint.totalResults = 1;
+    await fs.writeFile(journal, `${JSON.stringify(checkpoint)}\n`);
+    const oldCheckpoint = await fs.readFile(journal, "utf8");
+
+    const reads: number[] = [];
+    const reader = new CodexUsageReader(() => home, { directory, scheduler: new UsageScanScheduler({ intervalMs: 0 }), onRead: (_file, offset) => reads.push(offset) });
+    const initial = await completeCodex(reader, ROOT, T0);
+    const record = initial.find(item => item.id === oldRecord.id)!;
+    expect(record).toMatchObject({ id: oldRecord.id, serviceTier: "priority" });
+    expect(reads).toContain(0);
+    expect(await fs.readFile(journal, "utf8")).toBe(oldCheckpoint);
+    const price = await new AgentPricing(home).pricer();
+    expect(price(record!)).toBeCloseTo(0.06, 10);
+    await reader.dispose();
+
+    reads.length = 0;
+    const restarted = new CodexUsageReader(() => home, { directory, scheduler: new UsageScanScheduler({ intervalMs: 0 }), onRead: (_file, offset) => reads.push(offset) });
+    expect(await completeCodex(restarted, ROOT, T0)).toEqual(initial);
+    expect(reads).toEqual([]);
+    await fs.appendFile(file, lines([codexUsage(ROOT, ROOT, "continued-priority", 2, { input_tokens: 10_000, output_tokens: 1_000 })]));
+    expect((await completeCodex(restarted, ROOT, T0)).filter(item => item.model === "gpt-6.2-sol").map(item => item.serviceTier)).toEqual(["priority", "priority"]);
+    await restarted.dispose();
+  });
+
   it("reads appended Codex records without rereading the file", async () => {
     const home = await codexHome();
     const reader = codexReader(() => home);
@@ -193,6 +317,30 @@ describe("AgentUsageService", () => {
     const priced = (await completeUsage(usage, { tabIds: ["tab-1"] })).tabs["tab-1"]!;
     expect(priced.costUsd).toBeCloseTo(2.46, 6);
     await expect(new AgentPricing(dataDir).updateOverrides({ "gpt-x": { input: -1 } })).rejects.toThrow("non-negative");
+  });
+
+  it("keeps unknown-price token totals and model identity while pricing the four current models", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-current-model-aggregate-"));
+    const ledger = new AgentUsageLedger(dataDir, () => T0);
+    const records = ["gpt-6.2-sol", "gpt-6.2-astra", "claude-fable-5-2", "claude-haiku-5-5", "unpriced-model"].map((model, index) => ({
+      id: `response-${index}`, at: T0 + 1, model, input: 10_000, cachedInput: 0, cacheWrite: 0, cacheWrite1h: 0,
+      output: 1_000, reasoning: 0, webSearches: 0, fast: false, usInference: false
+    }));
+    const reader = { snapshot: async () => ({ records }), idle: async () => {}, dispose: async () => {} };
+    const usage = new AgentUsageService(ledger, new AgentPricing(dataDir), { codex: reader, claude: reader });
+    await ledger.open({ tabId: "tab", windowId: "window", forgeWorkerId: "worker" }, { providerId: "codex", accountKind: "subscription", sessionId: ROOT });
+    const result = await usage.read({ tabIds: ["tab"], windowIds: ["window"], forgeWorkerIds: ["worker"] });
+    expect(result.total.totals).toMatchObject({ requests: 5, input: 50_000, output: 5_000 });
+    expect(result.total.costUsd).toBeCloseTo(0.03 + 0.12 + 0.12 + 0.0015, 10);
+    expect(result.total.costBasis).toBe("api-equivalent");
+    expect(result.total.unpricedModels).toEqual(["unpriced-model"]);
+    expect(result.total.byModel.find(entry => entry.model === "unpriced-model")).toEqual({
+      model: "unpriced-model", totals: { requests: 1, input: 10_000, cachedInput: 0, cacheWrite: 0, output: 1_000, reasoning: 0, webSearches: 0 }
+    });
+    expect(result.tabs.tab).toEqual(result.total);
+    expect(result.windows.window).toEqual(result.total);
+    expect(result.forgeWorkers.worker).toEqual(result.total);
+    await usage.dispose();
   });
 
   it("retains mixed-provider window totals after the last tab closes and the service restarts", async () => {

@@ -10,6 +10,7 @@ import { expect, it } from "vitest";
 import { materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
 
 const claude = process.env.CLOUDX_NATIVE_CLAUDE;
+const expectedNativeVersion = process.env.CLOUDX_NATIVE_CLAUDE_VERSION ?? "2.1.331";
 const native = it.skipIf(!claude);
 
 type Skill = { name: string; source: string; state: string; advertised: boolean; description: string };
@@ -96,7 +97,7 @@ native("keeps selected skill snapshots stable while late unselected personal nam
     child.stderr.on("data", chunk => { stderr += String(chunk); });
     const controls = nativeControls(child);
     const initialize = await controls.request("initialize");
-    expect(initialize.claude_code_version).toBe("2.1.316");
+    expect(initialize.claude_code_version).toBe(expectedNativeVersion);
     const skills = async () => (await controls.request("get_skills_dialog")).skills as Skill[];
     const before = await skills();
     expect(before).toEqual(expect.arrayContaining([expect.objectContaining({ name: "notes", source: "user", state: "on", advertised: true })]));

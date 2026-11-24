@@ -15,7 +15,17 @@ import type { UsageRecord } from "./usageRecord.js";
 // https://developers.openai.com/api/docs/pricing, read on the date below.
 const PRICES_AS_OF = "2026-10-05";
 
+// New model rules reviewed against the same official sources on 2026-11-24.
+// Keep the original models' baseline rates and provenance intact.
+const MODEL_PRICES_AS_OF = Object.fromEntries([
+  "gpt-6.2-sol", "gpt-6.2-astra", "claude-fable-5-2", "claude-haiku-5-5"
+].map(model => [model, "2026-11-24"]));
+
 const BUILT_IN_PRICES: Record<string, AgentModelPrice> = {
+  "claude-fable-5-2": { input: 8, cachedInput: 0.2, cacheWrite: 10, cacheWrite1h: 16, output: 40 },
+  "claude-haiku-5-5": { input: 0.1, cachedInput: 0.01, cacheWrite: 0.125, cacheWrite1h: 0.2, output: 0.5 },
+  "gpt-6.2-sol": { input: 2, cachedInput: 0.1, cacheWrite: 2.5, output: 10 },
+  "gpt-6.2-astra": { input: 8, cachedInput: 0.4, cacheWrite: 10, output: 40 },
   "claude-fable-5-1": { input: 10, cachedInput: 0.25, cacheWrite: 12.5, cacheWrite1h: 20, output: 50 },
   "claude-opus-5-5": { input: 4, cachedInput: 0.2, cacheWrite: 5, cacheWrite1h: 8, output: 20 },
   "claude-opus-5": { input: 5, cachedInput: 0.5, cacheWrite: 6.25, cacheWrite1h: 10, output: 25 },
@@ -33,6 +43,8 @@ const BUILT_IN_PRICES: Record<string, AgentModelPrice> = {
 // OpenAI reprices a whole request above this many input tokens.
 const LONG_CONTEXT_INPUT_TOKENS = 272_000;
 const LONG_CONTEXT_PRICES: Record<string, AgentModelPrice> = {
+  "gpt-6.2-sol": { input: 4, cachedInput: 0.2, cacheWrite: 5, output: 15 },
+  "gpt-6.2-astra": { input: 16, cachedInput: 0.8, cacheWrite: 20, output: 60 },
   "gpt-6.1-sol": { input: 4, cachedInput: 0.2, cacheWrite: 5, output: 15 },
   "gpt-6-astra": { input: 20, cachedInput: 2, cacheWrite: 25, output: 75 },
   "gpt-5.6-sol": { input: 8, cachedInput: 0.8, cacheWrite: 10, output: 30 },
@@ -42,7 +54,7 @@ const LONG_CONTEXT_PRICES: Record<string, AgentModelPrice> = {
 };
 // Claude fast mode doubles input and output prices on these models; cache
 // multipliers apply on top.
-const FAST_MODE_MULTIPLIER: Record<string, number> = { "claude-opus-5-5": 2, "claude-opus-5": 2 };
+const FAST_MODE_MULTIPLIER: Record<string, number> = { "claude-fable-5-2": 2, "claude-opus-5-5": 2, "claude-opus-5": 2 };
 // US-only inference costs 1.1x on Claude 4.6 and later models.
 const US_INFERENCE_MULTIPLIER = 1.1;
 const WEB_SEARCH_USD = 10 / 1000;
@@ -60,7 +72,7 @@ export class AgentPricing {
   }
 
   async state(): Promise<AgentPricingState> {
-    return { asOf: PRICES_AS_OF, builtIn: BUILT_IN_PRICES, overrides: await this.overrides() };
+    return { asOf: PRICES_AS_OF, builtIn: BUILT_IN_PRICES, modelAsOf: MODEL_PRICES_AS_OF, overrides: await this.overrides() };
   }
 
   async updateOverrides(overrides: unknown): Promise<AgentPricingState> {
@@ -75,10 +87,14 @@ export class AgentPricing {
       const key = priceKey(record.model);
       const override = overrides[key];
       const totalInput = record.input + record.cachedInput + record.cacheWrite + record.cacheWrite1h;
-      const longContext = !override && totalInput > LONG_CONTEXT_INPUT_TOKENS ? LONG_CONTEXT_PRICES[key] : undefined;
+      const longContext = key === "claude-haiku-5-5" && totalInput > 100_000
+        ? { input: 0.5, cachedInput: 0.05, cacheWrite: 0.625, cacheWrite1h: 1, output: 2.5 }
+        : totalInput > LONG_CONTEXT_INPUT_TOKENS ? LONG_CONTEXT_PRICES[key] : undefined;
       const price = override ?? longContext ?? BUILT_IN_PRICES[key];
       if (!price) return undefined;
-      const speed = record.fast ? FAST_MODE_MULTIPLIER[key] ?? 1 : 1;
+      const speed = (key === "gpt-6.2-sol" || key === "gpt-6.2-astra") ? codexSpeedMultiplier(record)
+        : record.fast ? FAST_MODE_MULTIPLIER[key] ?? 1 : 1;
+      if (speed === undefined) return undefined;
       const geo = record.usInference ? US_INFERENCE_MULTIPLIER : 1;
       const tokens = (record.input * price.input + record.cachedInput * price.cachedInput +
         record.cacheWrite * price.cacheWrite + record.cacheWrite1h * (price.cacheWrite1h ?? price.cacheWrite) +
@@ -101,4 +117,17 @@ function parseOverrides(value: unknown): Record<string, AgentModelPrice> {
     overrides[priceKey(model)] = price;
   }
   return overrides;
+}
+
+// Codex persists the requested service tier in thread_settings_applied. This
+// estimates that tier; rollouts do not establish negotiated billing, regional
+// routing, or a separate 12-hour cache-write token count.
+function codexSpeedMultiplier(record: UsageRecord): number | undefined {
+  if (record.serviceTierUncertain) return undefined;
+  switch (record.serviceTier) {
+    case undefined: case "default": case "standard": return 1;
+    case "priority": case "fast": return 2;
+    case "ultrafast": return record.at < Date.parse("2027-03-01T08:00:00Z") ? 3 : 6;
+    default: return undefined;
+  }
 }

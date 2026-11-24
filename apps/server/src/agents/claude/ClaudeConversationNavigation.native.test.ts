@@ -2,19 +2,20 @@ import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import type { ClaudeLaunchMode } from "@cloudx/shared";
 import { materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
 import { ClaudeConversationPolicies } from "./ClaudeConversationPolicies.js";
 import { claudeAccountLaunch, runAgentCli } from "../agentCli.js";
 
 const claude = process.env.CLOUDX_NATIVE_CLAUDE;
+const expectedNativeVersion = process.env.CLOUDX_NATIVE_CLAUDE_VERSION ?? "2.1.331";
 const native = it.skipIf(!claude);
 const SESSION = "a5570c58-978a-4694-84f9-c67756be3acd";
 const EXECUTION = "c5570c58-978a-4694-84f9-c67756be3acd";
 
-native("native 2.1.316 blocks conflicting resumed conversations before model work and keeps historical Native project history unverified", async () => {
-  expect((await runAgentCli(claude!, ["--version"])).stdout.trim()).toBe("2.1.316 (Claude Code)");
+native("native reviewed version blocks conflicting resumed conversations before model work and keeps historical Native project history unverified", async () => {
+  expect((await runAgentCli(claude!, ["--version"])).stdout.trim()).toBe(`${expectedNativeVersion} (Claude Code)`);
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-navigation-native-"));
   const dataDir = path.join(root, "data"), providerHome = path.join(root, "personal"), accountHome = path.join(root, "account"), cwd = path.join(root, "project");
   let modelRequests = 0;
@@ -35,13 +36,16 @@ native("native 2.1.316 blocks conflicting resumed conversations before model wor
       const configDir = path.join(dataDir, "claude-launches", tabId);
       const account = claudeAccountLaunch(baseEnv, configDir, { ANTHROPIC_API_KEY: "fake-local-navigation-key" });
       const overlay = await materializeClaudeHomeOverlay({ dataDir, tabId, executionId: EXECUTION, accountHome, providerHome, cwd,
-        nativeVersion: "2.1.316", launchMode: mode, launchEnv: account.env, accountPolicy: account.policy, trustProject: true,
+        nativeVersion: expectedNativeVersion, launchMode: mode, launchEnv: account.env, accountPolicy: account.policy, trustProject: true,
         conversationPolicy: { accountId, ...(resume ? { sessionId: SESSION } : {}) } });
       const before = modelRequests;
       const result = await runAgentCli(claude!, ["--settings", overlay.settingsPath, ...overlay.configurationArgs, "--append-system-prompt-file", overlay.instructionsPath,
         resume ? "--resume" : "--session-id", SESSION, "--print", "--output-format", "json", "--model", "claude-sonnet-4-6", "--permission-mode", "dontAsk", "--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--", "Only run the local navigation fixture."],
       { cwd, env: account.env, timeoutMs: 20_000 });
       const navigation = JSON.parse(await fs.readFile(path.join(configDir, ".cloudx-conversation-navigation.json"), "utf8"));
+      if (modelRequests > before) await vi.waitFor(async () => {
+        expect(JSON.parse(await fs.readFile(path.join(configDir, ".cloudx-turn.json"), "utf8"))).toMatchObject({ sessionId: SESSION, status: "completed" });
+      }, { timeout: 10_000 });
       return { result, navigation, calls: modelRequests - before, configDir };
     };
     const store = new ClaudeConversationPolicies(dataDir);

@@ -125,8 +125,8 @@ docker run --rm \
 
 ## Native Codex contract
 
-The required native CI matrix runs the installer-pinned Codex 0.157.1,
-Codex 0.156.1 and Codex 0.166.0 through the production tab launcher, generated overlay,
+The required native CI matrix runs the installer-pinned Codex 0.172.0,
+Codex 0.156.1, Codex 0.166.0 and Codex 0.172.0 through the production tab launcher, generated overlay,
 bridge and PTY. Its `installer` lane reads the installer's `CODEX_CLI_VERSION`,
 installs that exact npm release and checks the executable against the same
 version. The tests
@@ -134,9 +134,15 @@ use an isolated home and a synthetic local provider; they do not use
 personal credentials or an external model service.
 
 Build the server with `npm run typecheck`, then run
-`CLOUDX_NATIVE_CODEX=/absolute/path/to/codex CLOUDX_NATIVE_CODEX_VERSION=0.166.0 npm run test:codex-recovery`.
+`CLOUDX_NATIVE_CODEX=/absolute/path/to/codex CLOUDX_NATIVE_CODEX_VERSION=0.172.0 npm run test:codex-recovery`.
 The runner records the installed version in CI logs and rejects missing binaries,
 unsupported or mismatched versions, failures and skipped native cases.
+For 0.166.0 and 0.172.0, it also requires native option save, reload, unset
+and CLI inventory coverage. The 0.172.0 model cases inspect its bundled
+6.2 model metadata and run isolated interactive, resume and Forge turns
+with explicit effort and priority-tier choices. Set
+`CLOUDX_PREVIOUS_NATIVE_CODEX=/absolute/path/to/previous/codex` to run
+selection and shared-state verification across two actual native versions.
 
 Codex 0.166.0 reports TUI lifecycle state through
 [OSC 7501](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/tui/src/terminal_program_status.rs).
@@ -177,6 +183,10 @@ skills directory to the resolved response, and the TUI adopts those
 roots for its next turn. See the versioned native implementations for
 [0.156.1](https://github.com/openai/codex/blob/rust-v0.156.1/codex-rs/tui/src/app_server_session.rs)
 and [0.157.1](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/tui/src/app_server_session.rs).
+The [0.172.0 remote TUI](https://github.com/openai/codex/blob/rust-v0.172.0/codex-rs/tui/src/app_server_session.rs)
+leaves turn settings with the server and omits roots. The bridge retains
+the selected thread's backend-resolved roots and supplies them on
+`turn/start`, including the CloudX skills directory.
 
 Codex update acceptance runs the same startup and synthetic-turn probe
 before reporting either an updated or current installation. The required

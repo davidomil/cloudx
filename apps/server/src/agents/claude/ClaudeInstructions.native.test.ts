@@ -10,13 +10,14 @@ import { expect, it } from "vitest";
 import { materializeClaudeHomeOverlay } from "./ClaudeHomeOverlay.js";
 
 const claude = process.env.CLOUDX_NATIVE_CLAUDE;
+const expectedNativeVersion = process.env.CLOUDX_NATIVE_CLAUDE_VERSION ?? "2.1.331";
 const native = it.skipIf(!claude);
 const run = promisify(execFile);
 
 type NativeRequest = { messages: unknown[]; system?: unknown; stream?: boolean };
 
 async function instructionFixture() {
-  expect((await run(claude!, ["--version"], { timeout: 10_000 })).stdout.trim()).toBe("2.1.316 (Claude Code)");
+  expect((await run(claude!, ["--version"], { timeout: 10_000 })).stdout.trim()).toBe(`${expectedNativeVersion} (Claude Code)`);
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-claude-instructions-"));
   const providerHome = path.join(root, "personal home", ".claude");
   const cwd = path.join(root, "project");

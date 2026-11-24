@@ -32,6 +32,8 @@ export async function assertClaudeAccountCompatibility(policy: ClaudeAccountPoli
   }
   if (merged.forceLoginOrgUUID) fail("forceLoginOrgUUID", "requires an organization that CloudX cannot establish from the selected account record");
   if (merged.forceLoginGatewayUrl) fail("forceLoginGatewayUrl", "requires native gateway authentication outside the selected account contract");
+  if (merged.enforceAnthropicSignIn === true && (policy.env.ANTHROPIC_API_KEY || policy.provider !== "anthropic"))
+    fail("enforceAnthropicSignIn", "requires an Anthropic sign-in instead of the selected API-key or service-provider authentication");
   if (merged.allowedProviders !== undefined) {
     const allowed = Array.isArray(merged.allowedProviders) ? merged.allowedProviders : [];
     const custom = policy.provider === "anthropic" && policy.env.ANTHROPIC_BASE_URL && new URL(policy.env.ANTHROPIC_BASE_URL).hostname !== "api.anthropic.com";

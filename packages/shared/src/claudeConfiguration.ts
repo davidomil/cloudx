@@ -1,5 +1,8 @@
 import inventory from "./claudeConfigurationInventory.json" with { type: "json" };
+import nativeReview from "./claudeNativeVersions.json" with { type: "json" };
 import { CLAUDE_BOOLEAN_SETTINGS } from "./claudeSettings.js";
+
+export const CLAUDE_NATIVE_REVIEW = nativeReview;
 
 export type ClaudeConfigurationFamily = "settings" | "environment" | "cli";
 export type ClaudeConfigurationDisposition = "editable" | "launch-policy" | "managed" | "account" | "native-only" | "session-only" | "unsupported" | "legacy";
@@ -22,8 +25,9 @@ export interface ClaudeConfigurationEntry {
 
 export const CLAUDE_CONFIGURATION_REFERENCE = inventory;
 export const CLAUDE_SETTINGS_NATIVE_REVIEW = {
-  version: "2.1.316",
-  reviewedAt: "2026-11-01",
+  version: nativeReview.installerVersion,
+  versions: nativeReview.reviewedVersions,
+  reviewedAt: nativeReview.reviewedAt,
   settings: [...CLAUDE_BOOLEAN_SETTINGS, "modelSettings", "language", "autoUpdatesChannel"],
   scope: "Saved user values, native source merging, launch precedence and unset; no model work or full runtime-default certification",
 } as const;
@@ -74,7 +78,7 @@ export function claudeConfigurationAvailability(entry: ClaudeConfigurationEntry,
   const version = installedVersion?.match(/\b\d+\.\d+\.\d+\b/u)?.[0];
   if (!version) return "Native version/effective behavior unverified";
   if (entry.minimumVersion && compareVersions(version, entry.minimumVersion) < 0) return `Requires native ${entry.minimumVersion}+; selected ${version} is older`;
-  if (version === CLAUDE_SETTINGS_NATIVE_REVIEW.version && entry.family === "settings"
+  if (CLAUDE_SETTINGS_NATIVE_REVIEW.versions.includes(version) && entry.family === "settings"
     && CLAUDE_SETTINGS_NATIVE_REVIEW.settings.some(name => name === entry.name))
     return `Saved user value, source merging and unset verified with native ${version}; running-session behavior remains setting-dependent`;
   return entry.minimumVersion ? `Documented since ${entry.minimumVersion}; selected ${version} runtime unverified` : `Minimum version not established; selected ${version} runtime unverified`;

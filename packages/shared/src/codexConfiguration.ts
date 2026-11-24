@@ -1,6 +1,7 @@
 import schema01600 from "./codexConfigurationSchema-0.160.0.json" with { type: "json" };
 import schema01621 from "./codexConfigurationSchema-0.162.1.json" with { type: "json" };
 import schema01660 from "./codexConfigurationSchema-0.166.0.json" with { type: "json" };
+import schema01720 from "./codexConfigurationSchema-0.172.0.json" with { type: "json" };
 import mapping from "./codexConfigurationMapping.json" with { type: "json" };
 import versions from "./codexConfigurationVersions.json" with { type: "json" };
 import featureDefaults from "./codexConfigurationFeatures.json" with { type: "json" };
@@ -9,7 +10,7 @@ import cliOptions from "./codexConfigurationCliOptions.json" with { type: "json"
 import cliMapping from "./codexConfigurationCliMapping.json" with { type: "json" };
 import type { CodexConfigurationValue } from "./codexSettings.js";
 
-export type CodexConfigurationVersion = "0.160.0" | "0.162.1" | "0.166.0";
+export type CodexConfigurationVersion = "0.160.0" | "0.162.1" | "0.166.0" | "0.172.0";
 export type CodexConfigurationStatus = "stable" | "experimental" | "deprecated";
 export type CodexConfigurationPlatform = "all" | "linux" | "macos" | "windows";
 export type CodexConfigurationScope = "user" | "user/project" | "profile" | "secret";
@@ -61,13 +62,14 @@ export interface CodexConfigurationSchema {
   oneOf?: (CodexConfigurationSchema | boolean)[];
 }
 
-export const CODEX_CONFIGURATION_BASELINE_VERSION: CodexConfigurationVersion = "0.166.0";
+export const CODEX_CONFIGURATION_BASELINE_VERSION: CodexConfigurationVersion = "0.172.0";
 export const CODEX_CONFIGURATION_VERSIONS = versions;
 export const CODEX_CONFIGURATION_CLI_OPTIONS = cliOptions;
 export const CODEX_CONFIGURATION_SCHEMAS: Record<CodexConfigurationVersion, CodexConfigurationSchema> = {
   "0.160.0": schema01600 as unknown as CodexConfigurationSchema,
   "0.162.1": schema01621 as unknown as CodexConfigurationSchema,
   "0.166.0": schema01660 as unknown as CodexConfigurationSchema,
+  "0.172.0": schema01720 as unknown as CodexConfigurationSchema,
 };
 
 export function codexConfigurationVersionReviewed(version: string): version is CodexConfigurationVersion {

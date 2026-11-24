@@ -20,6 +20,18 @@ async function fixture() {
 }
 
 describe("Claude personal configuration inheritance", () => {
+  it("gives native plugin initialization a real shared target so recovery retains its link", async () => {
+    const input = await fixture();
+    const overlay = await materializeClaudeHomeOverlay(input);
+    const target = path.join(input.providerHome, "plugins");
+    expect((await fs.lstat(target)).isDirectory()).toBe(true);
+    expect(await fs.readlink(path.join(overlay.configDir, "plugins"))).toBe(target);
+    await fs.mkdir(path.join(overlay.configDir, "plugins", "cache"));
+    await fs.writeFile(path.join(overlay.configDir, "plugins", "cache", "native.json"), '{"retained":true}');
+    await materializeClaudeHomeOverlay(input);
+    expect(await fs.readlink(path.join(overlay.configDir, "plugins"))).toBe(target);
+    expect(await fs.readFile(path.join(target, "cache", "native.json"), "utf8")).toBe('{"retained":true}');
+  });
   it("rejects unsupported root exclusions before generating or changing an overlay", async () => {
     const input = await fixture();
     const personal = path.join(input.providerHome, "CLAUDE.md");
@@ -57,12 +69,29 @@ describe("Claude personal configuration inheritance", () => {
     const overlay = await materializeClaudeHomeOverlay({ ...input, cwd });
     const statePath = path.join(overlay.configDir, ".claude.json");
     const state = JSON.parse(await fs.readFile(statePath, "utf8"));
-    expect(state.projects).toEqual({ [cwd]: project });
+    expect(state.projects).toEqual({ [cwd]: project, [await fs.realpath(overlay.rulesSkillsRoot)]: { hasTrustDialogAccepted: true } });
     state.projects[cwd].hasClaudeMdExternalIncludesApproved = !approved;
     await fs.writeFile(statePath, JSON.stringify(state));
     await materializeClaudeHomeOverlay({ ...input, cwd });
     expect(JSON.parse(await fs.readFile(statePath, "utf8")).projects[cwd].hasClaudeMdExternalIncludesApproved).toBe(!approved);
     expect(JSON.parse(await fs.readFile(input.userStatePath, "utf8"))).toEqual(personal);
+  });
+
+  it.each([false, true])("trusts only the exact supplied catalog when workspace trust is authorized (%s)", async trustProject => {
+    const input = await fixture();
+    const cwd = path.join(input.root, "project");
+    await fs.mkdir(cwd);
+    const personal = { projects: { "/unrelated": { hasTrustDialogAccepted: true } } };
+    await fs.writeFile(input.userStatePath, JSON.stringify(personal));
+    const overlay = await materializeClaudeHomeOverlay({ ...input, cwd, trustProject });
+    const state = JSON.parse(await fs.readFile(path.join(overlay.configDir, ".claude.json"), "utf8"));
+    expect(state.projects).toEqual(trustProject ? {
+      [cwd]: { hasTrustDialogAccepted: true },
+      [await fs.realpath(overlay.rulesSkillsRoot)]: { hasTrustDialogAccepted: true }
+    } : undefined);
+    expect(state.projects?.[input.dataDir]).toBeUndefined();
+    expect(state.projects?.[input.root]).toBeUndefined();
+    expect(await fs.readFile(input.userStatePath, "utf8")).toBe(JSON.stringify(personal));
   });
 
   it("inherits only the supported personal preferences while isolating account and tab state", async () => {

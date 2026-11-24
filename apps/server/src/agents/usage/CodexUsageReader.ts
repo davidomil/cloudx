@@ -11,6 +11,11 @@ import { count, isUsageRecord, type UsageRecord, type UsageSnapshot } from "./us
 interface CodexParseState {
   ownThread?: string;
   model: string;
+  serviceTier?: string;
+  activeTurn?: string;
+  tierSnapshotTurn?: string;
+  tierSnapshotPending?: boolean;
+  tierUncertain?: boolean;
 }
 
 interface CodexUsage {
@@ -32,8 +37,16 @@ export class CodexUsageReader {
   constructor(private readonly codexHome: () => string, options: JsonlCacheOptions<CodexParseState, CodexUsage> = {}) {
     this.cache = new JsonlCache(() => ({ model: "unknown" }), parseCodexLine, {
       ...options,
+      // A parser revision must replay historical transcripts, not reuse records
+      // indexed before requested service tiers were retained.
+      directory: options.directory ? path.join(options.directory, "service-tiers-v3") : undefined,
       validateState: value => isRecord(value) && typeof value.model === "string" &&
-        (value.ownThread === undefined || typeof value.ownThread === "string"),
+        (value.ownThread === undefined || typeof value.ownThread === "string") &&
+        (value.serviceTier === undefined || typeof value.serviceTier === "string") &&
+        (value.activeTurn === undefined || typeof value.activeTurn === "string") &&
+        (value.tierSnapshotTurn === undefined || typeof value.tierSnapshotTurn === "string") &&
+        (value.tierSnapshotPending === undefined || typeof value.tierSnapshotPending === "boolean") &&
+        (value.tierUncertain === undefined || typeof value.tierUncertain === "boolean"),
       validateResult: value => isRecord(value) && typeof value.rootSession === "string" && isUsageRecord(value.record)
     });
   }
@@ -127,12 +140,41 @@ export class CodexUsageReader {
 function parseCodexLine(line: unknown, state: CodexParseState): CodexUsage | undefined {
   if (!isRecord(line) || !isRecord(line.payload)) return undefined;
   const payload = line.payload;
+  const initialTierSnapshot = state.tierSnapshotPending === true;
+  state.tierSnapshotPending = false;
   if (line.type === "session_meta") {
     if (!state.ownThread && typeof payload.id === "string") state.ownThread = payload.id;
     return undefined;
   }
+  if (line.type === "event_msg" && ["task_started", "turn_started"].includes(String(payload.type)) && typeof payload.turn_id === "string") {
+    state.activeTurn = payload.turn_id;
+    state.tierUncertain = false;
+    return undefined;
+  }
+  if (line.type === "event_msg" && ["task_complete", "turn_complete"].includes(String(payload.type)) && payload.turn_id === state.activeTurn) {
+    state.activeTurn = undefined;
+    state.tierUncertain = false;
+    return undefined;
+  }
+  if (line.type === "event_msg" && payload.type === "thread_settings_applied" && isRecord(payload.thread_settings) &&
+      (payload.thread_id === undefined || payload.thread_id === state.ownThread)) {
+    const tier = typeof payload.thread_settings.service_tier === "string" ? payload.thread_settings.service_tier : undefined;
+    // Native checkpoints pair a new turn_context with its initial thread
+    // snapshot. Later thread edits cannot identify an in-flight step's tier.
+    if (initialTierSnapshot && state.activeTurn) state.tierSnapshotTurn = state.activeTurn;
+    else if (state.activeTurn && tier !== state.serviceTier) state.tierUncertain = true;
+    state.serviceTier = tier;
+    return undefined;
+  }
   if (line.type === "turn_context") {
     if (typeof payload.model === "string" && payload.model) state.model = payload.model;
+    if (typeof payload.turn_id === "string") {
+      if (payload.turn_id !== state.activeTurn) {
+        state.activeTurn = payload.turn_id;
+        state.tierUncertain = false;
+      }
+      state.tierSnapshotPending = state.tierSnapshotTurn !== payload.turn_id;
+    }
     return undefined;
   }
   if (line.type !== "token_usage_record" || payload.thread_id !== state.ownThread || !isRecord(payload.usage) ||
@@ -156,7 +198,9 @@ function parseCodexLine(line: unknown, state: CodexParseState): CodexUsage | und
       reasoning: count(usage.reasoning_output_tokens),
       webSearches: 0,
       fast: false,
-      usInference: false
+      usInference: false,
+      ...(state.serviceTier !== undefined ? { serviceTier: state.serviceTier } : {}),
+      ...(state.tierUncertain ? { serviceTierUncertain: true } : {})
     }
   };
 }

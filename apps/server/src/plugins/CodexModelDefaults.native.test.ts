@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -97,6 +98,42 @@ it.skipIf(!codex)("keeps a native model-access denial visible without substituti
     expect(fixture.session!.hasExited!()).toBe(false);
   } finally { await fixture.dispose(); }
 }, 30_000);
+
+// Keep this exact-version acceptance separate from older binaries in the recovery matrix.
+if (codex && execFileSync(codex, ["--version"], { encoding: "utf8", timeout: 10_000 }).trim() === "codex-cli 0.172.0") {
+  it.each(["gpt-6.2-sol", "gpt-6.2-astra"])("uses %s native capabilities for interactive and Forge turns without changing saved choices", async model => {
+    const fixture = await NativeModelSession.create({ preferences: [`model = "${model}"`, 'model_reasoning_effort = "high"', 'service_tier = "priority"'] });
+    try {
+      const bundled = JSON.parse(execFileSync(codex, ["debug", "models", "--bundled"], {
+        encoding: "utf8", env: { PATH: process.env.PATH, HOME: fixture.home, CODEX_HOME: fixture.home }, timeout: 10_000, maxBuffer: 2_097_152
+      }));
+      const capability = bundled.models.find((value: { slug: string }) => value.slug === model);
+      expect(capability).toMatchObject({ default_reasoning_level: "low", supported_in_api: true });
+      expect(capability.supported_reasoning_levels.map((value: { effort: string }) => value.effort)).toEqual(["low", "medium", "high", "xhigh", "max", "ultra"]);
+      expect(capability.service_tiers.map((value: { id: string }) => value.id)).toContain("priority");
+      const original = await fs.readFile(path.join(fixture.home, "config.toml"), "utf8");
+      await fixture.launch();
+      const first = await fixture.completeTurn();
+      const saved = fixture.session!.restoreInput!()!;
+      await fixture.launch(saved);
+      const resumed = await fixture.completeTurn();
+      expect(resumed.threadId).toBe(first.threadId);
+      await fixture.launch({ model, reasoningEffort: "max" }, true);
+      const worker = await fixture.completeTurn();
+      const events = await readVerificationTranscript(fixture.recovery.read()?.transcriptPath);
+      expect(events.some(event => event.type === "event_msg" && event.payload?.type === "thread_settings_applied"
+        && (event.payload.thread_settings as Record<string, unknown> | undefined)?.service_tier === "priority")).toBe(true);
+      expect(fixture.requests).toHaveLength(3);
+      for (const request of fixture.requests.slice(0, 2)) expect(request).toMatchObject({ model, reasoning: { effort: "high" }, service_tier: "priority" });
+      expect(fixture.requests[2]).toMatchObject({ model, reasoning: { effort: "max" }, service_tier: "priority" });
+      await expect.poll(async () => JSON.parse(await fs.readFile(fixture.receiptPath, "utf8")), { timeout: 5_000 })
+        .toMatchObject({ status: "completed", threadId: worker.threadId, turnId: worker.turnId });
+      await fixture.session!.handleAction("finish", { threadId: worker.threadId, turnId: worker.turnId });
+      expect(fixture.session!.snapshot().status).toBe("completed");
+      expect(await fs.readFile(path.join(fixture.home, "config.toml"), "utf8")).toBe(original);
+    } finally { await fixture.dispose(); }
+  }, 40_000);
+}
 
 interface ModelRequest {
   model: string;

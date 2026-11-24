@@ -150,6 +150,7 @@ export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOpt
   await replaceLink(projectsDir, path.join(configDir, "projects"));
   await replaceLink(path.join(options.accountHome, ".credentials.json"), path.join(configDir, ".credentials.json"));
   await ensureClaudeSettingsFile(options.providerHome);
+  if (mode === "native-project") await fsp.mkdir(path.join(options.providerHome, "plugins"), { recursive: true, mode: 0o700 });
   for (const name of SHARED_ENTRIES) {
     if (mode === "cloudx-managed" && name === "plugins") await blockPluginDirectory(configDir);
     else if (mode === "cloudx-managed" && name === "settings.json") {
@@ -160,7 +161,8 @@ export async function materializeClaudeHomeOverlay(options: ClaudeHomeOverlayOpt
   }
   const projectTrust = options.cwd && options.userStatePath ? await userProjectTrust(options.userStatePath, options.cwd) : {};
   const trusted = options.trustProject === true || projectTrust.hasTrustDialogAccepted === true;
-  await new ClaudeGlobalPreferences(options.dataDir).seed(configDir, options.userStatePath, state => seedClaudeState(state, options.cwd, trusted, projectTrust), options.trackPreferences);
+  const trustedCatalog = trusted ? await fsp.realpath(rulesSkillsRoot) : undefined;
+  await new ClaudeGlobalPreferences(options.dataDir).seed(configDir, options.userStatePath, state => seedClaudeState(state, options.cwd, trusted, projectTrust, trustedCatalog), options.trackPreferences);
 
   await materializeSkills(configDir, snapshots);
   await replaceLink(path.join(options.providerHome, "CLAUDE.md"), path.join(configDir, "CLAUDE.md"));
@@ -207,12 +209,17 @@ function hookSettings(configDir: string, tabId: string, executionId: string): Re
 // The launch environment's value for every account variable, or empty, which
 // Claude Code treats as unset. Sent with --settings, it outranks the env block
 // of every user, project and local settings file.
-function seedClaudeState(state: Record<string, unknown>, cwd: string | undefined, trustProject: boolean, projectTrust: ProjectTrust): void {
+function seedClaudeState(state: Record<string, unknown>, cwd: string | undefined, trustProject: boolean, projectTrust: ProjectTrust, trustedCatalog?: string): void {
   state.hasCompletedOnboarding = true;
   if (cwd && (trustProject || Object.keys(projectTrust).length)) {
     const projects = state.projects && typeof state.projects === "object" && !Array.isArray(state.projects) ? state.projects as Record<string, unknown> : {};
     const current = projects[cwd] && typeof projects[cwd] === "object" ? projects[cwd] as Record<string, unknown> : {};
     projects[cwd] = { ...projectTrust, ...current, ...(trustProject ? { hasTrustDialogAccepted: true } : {}) };
+    state.projects = projects;
+  }
+  if (trustedCatalog) {
+    const projects = isRecord(state.projects) ? state.projects : {};
+    projects[trustedCatalog] = { ...(isRecord(projects[trustedCatalog]) ? projects[trustedCatalog] : {}), hasTrustDialogAccepted: true };
     state.projects = projects;
   }
 }

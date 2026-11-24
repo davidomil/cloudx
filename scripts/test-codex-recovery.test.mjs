@@ -31,8 +31,8 @@ it("rejects a selected executable that cannot report its version", () => {
 });
 
 it.each([
-  ["0.153.4", undefined, "Expected supported Codex 0.156.1 or 0.157.1 or 0.166.0; found 0.153.4"],
-  ["0.155.1", undefined, "Expected supported Codex 0.156.1 or 0.157.1 or 0.166.0; found 0.155.1"],
+  ["0.153.4", undefined, "Expected supported Codex 0.156.1 or 0.157.1 or 0.166.0 or 0.172.0; found 0.153.4"],
+  ["0.155.1", undefined, "Expected supported Codex 0.156.1 or 0.157.1 or 0.166.0 or 0.172.0; found 0.155.1"],
   ["0.156.1", "0.157.1", "Expected supported Codex 0.157.1; found 0.156.1"]
 ])("rejects unsupported or mismatched native version %s", async (version, expected, diagnostic) => {
   const fixture = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-version-"));
@@ -45,10 +45,10 @@ it.each([
   expect(result.stdout).not.toContain("RUN");
 });
 
-it.each(["installer", "0.156.1", "0.166.0"])("CI installs and validates the exact %s native version", async release => {
+it.each(["installer", "0.156.1", "0.166.0", "0.172.0"])("CI installs and validates the exact %s native version", async release => {
   const workflow = parse(await fs.readFile(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"));
   const job = workflow.jobs["codex-native"];
-  expect(job.strategy.matrix.codex).toEqual(["installer", "0.156.1", "0.166.0"]);
+  expect(job.strategy.matrix.codex).toEqual(["installer", "0.156.1", "0.166.0", "0.172.0"]);
   const install = job.steps.find(step => step.id === "codex");
   expect(install.env.CODEX_RELEASE).toBe("${{ matrix.codex }}");
   expect(job.steps.find(step => step.env?.CLOUDX_NATIVE_CODEX_VERSION).env.CLOUDX_NATIVE_CODEX_VERSION)
@@ -123,7 +123,7 @@ syncBuiltinESMExports();
   return { ...result, commands };
 }
 
-it.each(["0.156.1", "0.157.1", "0.166.0"])("runs the complete serial native suite and built verifier for supported %s", async version => {
+it.each(["0.156.1", "0.157.1", "0.166.0", "0.172.0"])("runs the complete serial native suite and built verifier for supported %s", async version => {
   const result = await runNativeValidation({ version, durationMs: 180_000 });
   expect(result.status, result.stderr).toBe(0);
   const suiteArgs = result.commands[1].args;
@@ -138,7 +138,11 @@ it.each(["0.156.1", "0.157.1", "0.166.0"])("runs the complete serial native suit
     "apps/server/src/plugins/CodexVersionSelection.native.test.ts",
     "apps/server/src/plugins/CodexFirstSelection.native.test.ts",
     "apps/server/src/plugins/CodexHistoryMaintenance.native.test.ts",
-    "scripts/codex-updater.native.test.mjs"
+    "scripts/codex-updater.native.test.mjs",
+    ...(["0.166.0", "0.172.0"].includes(version) ? [
+      "packages/shared/src/codexConfiguration.native.test.ts",
+      "apps/server/src/plugins/CodexConfiguration.native.test.ts"
+    ] : [])
   ]);
   expect(result.commands[1].args).toContain("--maxWorkers=1");
   expect(result.commands[1].timeout).toBeLessThanOrEqual(300_000);

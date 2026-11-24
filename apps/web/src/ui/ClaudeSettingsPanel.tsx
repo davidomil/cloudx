@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Download, RefreshCw, Save, Settings2 } from "lucide-react";
 import {
   CLAUDE_EFFORT_LEVELS,
+  CLAUDE_NATIVE_REVIEW,
   CLAUDE_BOOLEAN_SETTINGS,
   CLAUDE_SETTINGS_HOOKS,
   CLAUDE_MODEL_ID_PATTERN,
@@ -23,7 +24,7 @@ import type { UiContributionRenderContext } from "./uiContributions.js";
 
 type CallHook = NonNullable<UiContributionRenderContext["callHook"]>;
 
-const MODEL_SUGGESTIONS = ["opus", "sonnet", "haiku", "claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-4-5-20251001"];
+const MODEL_SUGGESTIONS = ["default", "best", "fable", "opus", "sonnet", "haiku", "opusplan", "claude-fable-5-2", "claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-4-5-20251001"];
 const PERMISSION_MODES: { value: ClaudeLaunchPermissionMode; label: string; description: string }[] = [
   { value: "bypassPermissions", label: "Bypass permissions (YOLO)", description: "Runs tools without asking, like Codex YOLO mode." },
   { value: "acceptEdits", label: "Accept edits", description: "Allows file edits and common filesystem commands; other actions follow permission rules." },
@@ -129,6 +130,8 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
     ? Boolean(draft?.effortModel.startsWith("claude-") && CLAUDE_MODEL_ID_PATTERN.test(draft.effortModel))
     : Boolean(effortCapability?.levels.includes(pending.effortLevel)));
   const unsupportedChannel = settings?.autoUpdatesChannel && !CLAUDE_UPDATE_CHANNELS.some(channel => channel === settings.autoUpdatesChannel);
+  const nativeVersion = cli?.version?.match(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?: \(Claude Code\))?$/u)?.[0].replace(" (Claude Code)", "");
+  const reviewedVersion = Boolean(nativeVersion && CLAUDE_NATIVE_REVIEW.reviewedVersions.some(version => version === nativeVersion));
   const canSave = busy === null && validModel && validEffort && validText(draft?.outputStyle) && validText(draft?.language) && Object.keys(pending).length > 0;
 
   return <section className="codex-settings-panel" aria-label="Claude settings" aria-busy={busy !== null}>
@@ -153,8 +156,9 @@ export function ClaudeSettingsPanel({ callHook }: { callHook: CallHook }) {
           setNotice("Claude Code update finished. Running Claude tabs keep their current version.");
         })}><Download size={16} aria-hidden="true" /> {busy === "updating" ? "Updating…" : "Update Claude Code"}</ControlButton>
       </div>
-      <small>Runs <code>claude update</code> on the release channel selected below.</small>
-      <small>Help follows the official reference reviewed 1 November 2026. Native capabilities and effective values are not verified by reading this panel. No provider is installed or updated automatically.</small>
+      <small>Checks the selected channel before running <code>claude update</code> and verifies the resulting executable. Reviewed channels: stable {CLAUDE_NATIVE_REVIEW.channels.stable}, latest {CLAUDE_NATIVE_REVIEW.channels.latest}. CloudX disables background native updates during CloudX launches. Saved channel and model choices remain unchanged.</small>
+      {cli?.installed ? <small role="status">{reviewedVersion ? "The selected native version has a CloudX launch-policy review." : "The selected native version is unreviewed. New CloudX launches require an exact reviewed version."} Reviewed versions: {CLAUDE_NATIVE_REVIEW.reviewedVersions.join(", ")}.</small> : null}
+      <small>Help follows the official reference reviewed 24 November 2026. Native capabilities and effective values are not verified by reading this panel. No provider is installed or updated automatically.</small>
     </section>
 
     {error ? <p className="codex-settings-notice" role="alert">{error}</p> : null}

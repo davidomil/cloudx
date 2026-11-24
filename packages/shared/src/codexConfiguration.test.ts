@@ -10,7 +10,7 @@ import {
 } from "./codexConfiguration.js";
 
 describe("reviewed native Codex configuration", () => {
-  it.each(["0.160.0", "0.162.1", "0.166.0"] as CodexConfigurationVersion[])("covers every recursive schema path for %s without hiding an unmapped option", version => {
+  it.each(["0.160.0", "0.162.1", "0.166.0", "0.172.0"] as CodexConfigurationVersion[])("covers every recursive schema path for %s without hiding an unmapped option", version => {
     const catalog = codexConfigurationCatalog(version);
     expect(codexConfigurationCoverage(CODEX_CONFIGURATION_SCHEMAS[version], catalog)).toEqual([]);
     expect(codexConfigurationCoverage(codexConfigurationValidationSchema(version), catalog)).toEqual([]);
@@ -28,10 +28,31 @@ describe("reviewed native Codex configuration", () => {
   });
 
   it("pins the reviewed families and refuses unreviewed CLI versions", () => {
-    expect(CODEX_CONFIGURATION_BASELINE_VERSION).toBe("0.166.0");
-    expect(codexConfigurationCatalog().filter(entry => entry.path === entry.family)).toHaveLength(103);
+    expect(CODEX_CONFIGURATION_BASELINE_VERSION).toBe("0.172.0");
+    expect(codexConfigurationCatalog().filter(entry => entry.path === entry.family)).toHaveLength(106);
     expect(() => codexConfigurationCatalog("0.163.0")).toThrow("no reviewed configuration catalog");
     expect(() => codexConfigurationCliCatalog("0.163.0")).toThrow("no reviewed configuration catalog");
+  });
+
+  it("reviews 0.172 heartbeat, notifications, native feature changes and credential boundaries", () => {
+    const catalog = codexConfigurationCatalog("0.172.0");
+    expect(catalog.find(entry => entry.path === "code_mode.heartbeat_interval_s")).toMatchObject({ default: 0, defaultSource: "native-source", editable: true });
+    expect(catalog.find(entry => entry.path === "tui.notification_method")!.enum).toContain("osc777");
+    expect(catalog.find(entry => entry.path === "features.code_mode_host_grpc")).toMatchObject({ status: "deprecated", editable: false });
+    expect(catalog.find(entry => entry.path === "features.mcp_lazy_stdio_startup")).toMatchObject({ default: true, defaultSource: "native-feature" });
+    expect(catalog.find(entry => entry.path === "tui.keymap.agents.next_group")).toMatchObject({ default: ["Shift+Down", "Shift+J"] });
+    expect(catalog.find(entry => entry.path === "tui.keymap.global.focus_pane_left")!.defaultDescription).toContain("workspace mode");
+    for (const path of [["model_providers", "gateway", "gateway_oauth", "credential_export", "command"], ["model_providers", "gateway", "gateway_oauth", "credential_export", "args", "0"]])
+      expect(isCodexProtectedPath(path)).toBe(true);
+    expect(isCodexReadOnlyPath(["tui", "default_hosts", "project", "host"], "0.172.0")).toBe(true);
+    const validate = new Ajv({ strict: false, validateFormats: false }).compile(codexConfigurationValidationSchema("0.172.0"));
+    expect(validate({ code_mode: { heartbeat_interval_s: 15 }, tui: { notification_method: "osc777" } })).toBe(true);
+    expect(validate({ code_mode: { heartbeat_interval_s: -1 } })).toBe(false);
+    expect(validate({ permissions: { work: { credentials: { token: "secret" } } } })).toBe(false);
+    expect(codexConfigurationCatalog("0.166.0").some(entry => entry.path === "code_mode.heartbeat_interval_s")).toBe(false);
+    for (const command of ["codex exec", "codex exec resume", "codex exec fork", "codex exec review"])
+      for (const flag of ["remote", "remote-auth-token-env", "trust"])
+        expect(codexConfigurationCliCatalog("0.172.0").some(entry => entry.path === `${command} --${flag}`)).toBe(true);
   });
 
   it("detects new nested, map, array and alternative paths instead of inheriting blanket coverage", () => {
@@ -86,7 +107,7 @@ describe("reviewed native Codex configuration", () => {
     expect(() => isCodexKnownPath(["model"], "0.163.0")).toThrow("no reviewed");
   });
 
-  it.each(["0.160.0", "0.162.1", "0.166.0"] as CodexConfigurationVersion[])("recognizes arbitrary hook JSON descendants without opening typed tables for %s", version => {
+  it.each(["0.160.0", "0.162.1", "0.166.0", "0.172.0"] as CodexConfigurationVersion[])("recognizes arbitrary hook JSON descendants without opening typed tables for %s", version => {
     const input = ["hooks", "SessionStart", "0", "hooks", "0", "input"];
     for (const suffix of [["details", "name"], ["tags", "0"], ["records", "0", "nested", "0", "name"]])
       expect(isCodexKnownPath([...input, ...suffix], version), suffix.join(".")).toBe(true);
@@ -101,7 +122,7 @@ describe("reviewed native Codex configuration", () => {
     expect(isCodexProtectedPath(["mcp_servers", "company", "env", "API_KEY", "nested"])).toBe(true);
   });
 
-  it.each(["0.160.0", "0.162.1", "0.166.0"] as CodexConfigurationVersion[])("retains ignored leaf deprecation independently of its feature stage for %s", version => {
+  it.each(["0.160.0", "0.162.1", "0.166.0", "0.172.0"] as CodexConfigurationVersion[])("retains ignored leaf deprecation independently of its feature stage for %s", version => {
     const catalog = codexConfigurationCatalog(version);
     expect(catalog.find(entry => entry.path === "features.multi_agent_v2")).toMatchObject({ status: "stable", editable: true });
     const ignored = catalog.find(entry => entry.path === "features.multi_agent_v2.usage_hint_enabled")!;
@@ -111,7 +132,7 @@ describe("reviewed native Codex configuration", () => {
     expect(catalog.find(entry => entry.path === "profiles.*.features.multi_agent_v2.usage_hint_enabled")).toMatchObject({ status: "deprecated", editable: false });
   });
 
-  it.each(["0.160.0", "0.162.1", "0.166.0"] as CodexConfigurationVersion[])("labels each computer-use operating-system subtree for %s", version => {
+  it.each(["0.160.0", "0.162.1", "0.166.0", "0.172.0"] as CodexConfigurationVersion[])("labels each computer-use operating-system subtree for %s", version => {
     const catalog = codexConfigurationCatalog(version);
     for (const platform of ["macos", "windows"]) {
       const entries = catalog.filter(entry => entry.path === `computer_use.${platform}` || entry.path.startsWith(`computer_use.${platform}.`));
@@ -145,7 +166,7 @@ describe("reviewed native Codex configuration", () => {
     expect(catalog.find(entry => entry.path === "web_search")!.enum).toEqual(expect.arrayContaining(["disabled", "cached", "live"]));
   });
 
-  it.each(["0.160.0", "0.162.1", "0.166.0"])("uses pinned loader and keymap defaults for %s without substituting another version", version => {
+  it.each(["0.160.0", "0.162.1", "0.166.0", "0.172.0"])("uses pinned loader and keymap defaults for %s without substituting another version", version => {
     const catalog = codexConfigurationCatalog(version);
     for (const [path, value] of [
       ["file_opener", "vscode"], ["web_search", "cached"],
@@ -158,7 +179,7 @@ describe("reviewed native Codex configuration", () => {
       expect(entry.defaultDescription).toContain(version);
     }
     expect(catalog.find(entry => entry.path === "tui.keymap.editor.insert_newline")!.default).toEqual(["Ctrl+J", "Ctrl+M", "Enter", "Shift+Enter", "Alt+Enter"]);
-    expect(catalog.find(entry => entry.path === "tui.keymap.chat.toggle_voice_mute")!.default).toEqual(version === "0.166.0" ? ["F9"] : ["Ctrl+X"]);
+    expect(catalog.find(entry => entry.path === "tui.keymap.chat.toggle_voice_mute")!.default).toEqual(["0.166.0", "0.172.0"].includes(version) ? ["F9"] : ["Ctrl+X"]);
   });
 
   it("keeps saved context bindings and explicit unbinding above reusable global and inherited defaults", () => {
@@ -187,7 +208,7 @@ describe("reviewed native Codex configuration", () => {
     expect(validate({ model_providers: { gcp: { credential_file: "/private/adc.json" } } })).toBe(true);
   });
 
-  it.each(["0.160.0", "0.162.1", "0.166.0"] as CodexConfigurationVersion[])("validates native flattened permission maps and nested alternatives for %s", version => {
+  it.each(["0.160.0", "0.162.1", "0.166.0", "0.172.0"] as CodexConfigurationVersion[])("validates native flattened permission maps and nested alternatives for %s", version => {
     const raw = codexConfigurationSchema(version);
     expect(raw.definitions!.PermissionsToml!.additionalProperties).toBeUndefined();
     const schema = codexConfigurationValidationSchema(version);
@@ -207,7 +228,7 @@ describe("reviewed native Codex configuration", () => {
     expect(validate({ model_post_turn_compact_threshold_percent: 100 })).toBe(true);
   });
 
-  it.each(["0.160.0", "0.162.1", "0.166.0"] as CodexConfigurationVersion[])("classifies every pinned applicable launch flag for %s separately from persistent defaults", version => {
+  it.each(["0.160.0", "0.162.1", "0.166.0", "0.172.0"] as CodexConfigurationVersion[])("classifies every pinned applicable launch flag for %s separately from persistent defaults", version => {
     const catalog = codexConfigurationCliCatalog(version);
     for (const [command, options] of Object.entries(CODEX_CONFIGURATION_CLI_OPTIONS[version])) {
       const help = options.map(option => `    --${option}`).join("\n");

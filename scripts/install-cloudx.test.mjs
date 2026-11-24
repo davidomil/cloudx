@@ -81,7 +81,7 @@ function expectRuntimeSchemaWrites(runner, root) {
 
 describe("install-cloudx helpers", () => {
   it("pins the supported Codex CLI release literally", () => {
-    expect(CODEX_CLI_VERSION).toBe("0.157.1");
+    expect(CODEX_CLI_VERSION).toBe("0.172.0");
   });
 
   it.each([
@@ -1082,7 +1082,7 @@ describe("runInstaller dry-run", () => {
           "-g",
           "--prefix",
           TEST_CODEX_PREFIX,
-          "@openai/codex@0.157.1",
+          "@openai/codex@0.172.0",
         ],
         [TEST_CODEX_BIN, "--version"],
         ["npm", "ci"],
@@ -1770,7 +1770,7 @@ describe("runInstaller dry-run", () => {
           "+refs/heads/main:refs/remotes/origin/main",
         ],
         ["git", "merge", "--ff-only", "--no-edit", "refs/remotes/origin/main"],
-        ["npm", "i", "-g", "--prefix", codexPrefix, "@openai/codex@0.157.1"],
+        ["npm", "i", "-g", "--prefix", codexPrefix, "@openai/codex@0.172.0"],
         [codexBin, "--version"],
         ["npm", "ci"],
         ["python3", "-m", "venv", path.join(home, ".local/share/cloudx/uv")],
@@ -1918,7 +1918,7 @@ describe("Claude Code environment", () => {
 
 
 it("installs the exact Claude version reviewed by the account, receipt and managed-source contracts", () => {
-  expect(CLAUDE_CODE_VERSION).toBe("2.1.316");
+  expect(CLAUDE_CODE_VERSION).toBe("2.1.331");
   expect(CLAUDE_CODE_VERSION).toBe(CLAUDE_ACCOUNT_POLICY_REVIEW.nativeVersion);
   expect(CLAUDE_CODE_VERSION).toBe(CLAUDE_MANAGED_VERSION);
 });

@@ -25,6 +25,9 @@ const recorded: ClaudeResolvedLaunchPolicy = {
 };
 
 describe("recorded Claude launch policy", () => {
+  it.each(["2.1.316", "2.1.325", "2.1.331"])("restores the exact reviewed %s source policy", nativeVersion => {
+    expect(parseClaudeResolvedLaunchPolicy({ ...recorded, nativeVersion }).nativeVersion).toBe(nativeVersion);
+  });
   it("returns a detached validated source snapshot rather than mutable caller state", () => {
     const result = parseClaudeResolvedLaunchPolicy(recorded);
     expect(result).toEqual(recorded);
@@ -38,6 +41,7 @@ describe("recorded Claude launch policy", () => {
     null, [], {}, { ...recorded, token: "private" }, { ...recorded, mode: "restricted" }, { ...recorded, contractVersion: 2 },
     { ...recorded, exclusiveSkills: false }, { ...recorded, activation: "live" }, { ...recorded, nativeVersion: "unknown" },
     { ...recorded, nativeVersion: "2.1.315" },
+    { ...recorded, nativeVersion: "2.1.332" },
     { ...recorded, nativeVersion: "unobserved" },
     { ...recorded, mode: "native-project", exclusiveSkills: false },
     { ...recorded, settingSources: ["user", "managed"] }, { ...recorded, settingSources: ["user", "user"] },

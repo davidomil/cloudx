@@ -1,11 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { CLAUDE_NATIVE_REVIEW as nativeReview } from "@cloudx/shared";
 
 import { isRecord, type ClaudeLaunchMode } from "@cloudx/shared";
 import { defaultManagedFiles, managedSettingsFiles, readPolicy } from "./ClaudeHookPolicy.js";
 import { claudeLoadedSettingsFiles, worktreeLocalSettings } from "./ClaudeSettingsSources.js";
 
-export const CLAUDE_MANAGED_VERSION = "2.1.316";
+export const CLAUDE_MANAGED_VERSION = nativeReview.installerVersion;
+export const CLAUDE_MANAGED_VERSIONS = nativeReview.reviewedVersions;
 export const CLAUDE_MANAGED_SETTING_SOURCES = ["user"];
 const PLUGIN_KEYS = ["extraKnownMarketplaces", "prependPlugins", "appendPlugins"];
 export const CLAUDE_MANAGED_SOURCE_ENV_KEYS = [
@@ -39,8 +41,8 @@ export async function assertClaudeCatalogOwnership(providerHome: string, names: 
 export async function assertClaudeManagedCompatibility(input: {
   providerHome: string; cwd?: string; nativeVersion?: string; env?: NodeJS.ProcessEnv; skillNames: string[]; userSettings?: Record<string, unknown>;
 }, managedFiles = defaultManagedFiles()): Promise<void> {
-  if (input.nativeVersion?.replace(/ \(Claude Code\)$/u, "") !== CLAUDE_MANAGED_VERSION)
-    throw new Error(`CloudX-managed Claude launches are verified only with Claude Code ${CLAUDE_MANAGED_VERSION}. Install that version or choose Native project; no session has started.`);
+  if (!CLAUDE_MANAGED_VERSIONS.includes(input.nativeVersion?.replace(/ \(Claude Code\)$/u, "") ?? ""))
+    throw new Error(`CloudX-managed Claude launches are verified only with Claude Code ${CLAUDE_MANAGED_VERSIONS.join(", ")}. Install a reviewed version or choose Native project; no session has started.`);
   if (process.platform !== "linux")
     throw new Error("CloudX-managed Claude policy is verified on Linux only. Choose Native project on this platform; saved preferences are unchanged.");
   assertNoInjectedSources(input.env ?? {}, "launch environment");

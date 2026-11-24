@@ -19,8 +19,20 @@ effort chosen for a Forge run remains distinct from global defaults.
 ## Claude Code CLI
 
 The section shows the installed Claude Code version and path. **Update
-Claude Code** runs `claude update`, which follows the **Update channel**
-setting below. Running Claude tabs keep the version they started with.
+Claude Code** checks Anthropic's native release pointer for the saved **Update
+channel**, then runs `claude --settings '{"autoUpdatesChannel":"<channel>"}' update`
+only if that pointer names an explicitly reviewed version. Unset follows latest.
+CloudX verifies the selected executable again after the updater finishes. A network
+failure or unreviewed target stops before the updater starts. Native updates use
+a moving channel, so the final version check also detects a channel change during
+the update. Running Claude tabs keep the version they started with.
+
+The 24 November 2026 review supports stable **2.1.325** and latest **2.1.331**.
+The existing **2.1.316** review remains supported. These are exact versions;
+later versions need their own policy and native acceptance review. CloudX pins
+`DISABLE_AUTOUPDATER=1` in each account launch to prevent a background update from
+replacing the reviewed executable. Saved native update-channel choices remain
+unchanged, including when Claude runs outside CloudX.
 
 ## Model and behavior
 
@@ -54,7 +66,10 @@ the CloudX data directory.
   bypass permissions.
 - **Automatically trust workspace.** Trusts the tab's working directory
   so Claude Code does not ask on start. Folders you already trusted in
-  Claude Code stay trusted either way.
+  Claude Code stay trusted either way. When workspace trust is authorized,
+  the isolated tab state also trusts the exact CloudX skill catalog supplied
+  with `--add-dir`. It does not trust the catalog's parent or change personal
+  Claude trust records. Without workspace trust, native prompts remain active.
 
 If your Claude settings set `permissions.disableBypassPermissionsMode`,
 the page says so; bypass tabs and Forge workers on Claude cannot start
@@ -68,7 +83,7 @@ are additions, not an exclusive native allowlist: an unchecked project/nested or
 later-discovered native skill is not guaranteed unavailable. Existing CloudX
 bundled-skill, plugin-sync and auto-memory defaults remain visible and separate.
 
-**CloudX-managed** is opt-in. The supported Linux/Claude Code 2.1.316 configuration
+**CloudX-managed** is opt-in. The reviewed Linux/Claude Code 2.1.316, 2.1.325 and 2.1.331 configurations
 uses only native `user` setting sources, selected external skill snapshots and
 CloudX system/template skill snapshots. It omits shared project settings, project
 `CLAUDE.md` and project rules. It also excludes local settings and
@@ -110,6 +125,22 @@ Credential and endpoint variables, such as `ANTHROPIC_API_KEY` or
 `ANTHROPIC_BASE_URL`, set in the `env` block of any settings file (yours
 or the project's) are replaced with the selected account's value, or
 cleared. An endpoint the CloudX service itself runs with is kept.
+
+The reviewed service routes are Anthropic, Bedrock, Mantle, Claude Platform on
+AWS, Google's Agent Platform and Microsoft Foundry. Claude Models on Google
+Cloud (Anthropic managed) is a separate native provider. CloudX rejects that
+unreviewed service selector before launch and clears it from user/project and
+shell overrides. It does not silently route that provider through an Anthropic
+account. Missing credentials, managed sign-in requirements, and native model
+restrictions remain separate from the native version review.
+
+Native interactive API-key confirmation still applies. CloudX does not accept
+the native prompt or transfer approval from another tab. An unattended Forge
+execution that reaches this prompt stops before submitting its worker prompt
+and reports the credential-confirmation requirement separately from hook
+tracking failures. Synthetic native acceptance uses an explicitly acknowledged
+key in each isolated test execution; it does not establish first-use account
+onboarding or account-specific model access.
 
 ## Bypass permissions warning
 

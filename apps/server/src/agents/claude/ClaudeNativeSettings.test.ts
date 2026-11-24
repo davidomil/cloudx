@@ -73,7 +73,8 @@ it("bounds and validates isolated settings readback and sends no model input", a
 });
 
 const claude = process.env.CLOUDX_NATIVE_CLAUDE;
-it.skipIf(!claude)("native 2.1.316 auth readback preserves selected routing against user/project sources without executing hooks", async () => {
+const expectedNativeVersion = process.env.CLOUDX_NATIVE_CLAUDE_VERSION ?? "2.1.331";
+it.skipIf(!claude)("native reviewed version auth readback preserves selected routing against user/project sources without executing hooks", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-account-readback-")); roots.push(root);
   const configDir = path.join(root, "config"); await fs.mkdir(configDir);
   const marker = path.join(root, "hook-ran");
@@ -88,7 +89,7 @@ it.skipIf(!claude)("native 2.1.316 auth readback preserves selected routing agai
   expect(JSON.parse(await fs.readFile(path.join(configDir, "settings.json"), "utf8"))).toEqual(user);
 });
 
-it.skipIf(!claude)("native 2.1.316 settings readback observes disabled hooks and source identity without a model request", async () => {
+it.skipIf(!claude)("native reviewed version settings readback observes disabled hooks and source identity without a model request", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-hook-readback-")); roots.push(root);
   const settingsPath = path.join(root, "launch.json");
   const marker = path.join(root, "hook-ran");
@@ -96,7 +97,7 @@ it.skipIf(!claude)("native 2.1.316 settings readback observes disabled hooks and
   const env = { PATH: process.env.PATH, HOME: root, CLAUDE_CONFIG_DIR: path.join(root, "config"), ANTHROPIC_API_KEY: "fake-no-model", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1" };
   await fs.writeFile(settingsPath, JSON.stringify({ disableAllHooks: true, hooks }));
   const disabled = await inspectClaudeNativeSettings({ command: claude!, settingsPath, cwd: root, env });
-  expect(disabled.version).toBe("2.1.316");
+  expect(disabled.version).toBe(expectedNativeVersion);
   expect(disabled.effective.disableAllHooks).toBe(true);
   expect(disabled.hooks.policy).toMatchObject({ allDisabled: true });
   await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
@@ -110,7 +111,7 @@ it.skipIf(!claude)("native 2.1.316 settings readback observes disabled hooks and
 it.skipIf(!claude).each([
   ["CLAUDE_CODE_USE_BEDROCK", "bedrock"], ["CLAUDE_CODE_USE_MANTLE", "mantle"],
   ["CLAUDE_CODE_USE_ANTHROPIC_AWS", "anthropicAws"], ["CLAUDE_CODE_USE_VERTEX", "vertex"], ["CLAUDE_CODE_USE_FOUNDRY", "foundry"]
-])("native 2.1.316 reports the explicit %s route without a model request", async selector => {
+])("native reviewed version reports the explicit %s route without a model request", async selector => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-service-readback-")); roots.push(root);
   const selected = resolveClaudeAccountPolicy({ [selector]: "1" }, path.join(root, "config"), {});
   const settingsPath = path.join(root, "launch.json"); await fs.writeFile(settingsPath, JSON.stringify(selected.settings));
@@ -121,7 +122,7 @@ it.skipIf(!claude).each([
   [{ allowManagedHooksOnly: true }, { managedOnly: true }],
   // The SDK gate suppresses non-managed commands without the file-tier allDisabled flag.
   [{ disableAllHooks: true }, { allDisabled: false }],
-])("native 2.1.316 honors host-managed hook policy %j without running non-managed receipt commands", async (managed, expected) => {
+])("native reviewed version honors host-managed hook policy %j without running non-managed receipt commands", async (managed, expected) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-managed-hook-readback-")); roots.push(root);
   const marker = path.join(root, "hook-ran");
   const settingsPath = path.join(root, "launch.json");
@@ -136,7 +137,7 @@ it.skipIf(!claude).each([
   await expect(fs.stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
 }, 30_000);
 
-it.skipIf(!claude)("native 2.1.316 respects a user disableAllHooks setting over generated receipt commands", async () => {
+it.skipIf(!claude)("native reviewed version respects a user disableAllHooks setting over generated receipt commands", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-user-hook-policy-")); roots.push(root);
   const configDir = path.join(root, "config"); await fs.mkdir(configDir);
   const original = JSON.stringify({ disableAllHooks: true });

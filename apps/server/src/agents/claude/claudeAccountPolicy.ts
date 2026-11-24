@@ -1,15 +1,15 @@
 import path from "node:path";
+import { CLAUDE_NATIVE_REVIEW as nativeReview } from "@cloudx/shared";
 
-// Official environment/settings/WIF references reviewed 2026-11-01.
-// Empty helper overrides were verified with native 2.1.316 auth status (no model).
+// Exact native releases require the no-model and synthetic-provider boundary fixtures.
 export const CLAUDE_ACCOUNT_POLICY_REVIEW = {
-  nativeVersion: "2.1.316", reviewedAt: "2026-11-01",
-  sources: ["https://code.claude.com/docs/en/env-vars", "https://code.claude.com/docs/en/settings-reference", "https://platform.claude.com/docs/en/manage-claude/wif-reference"],
+  nativeVersion: nativeReview.installerVersion, reviewedAt: nativeReview.reviewedAt,
+  sources: ["https://code.claude.com/docs/en/env-vars", "https://code.claude.com/docs/en/settings-reference", "https://code.claude.com/docs/en/authentication", "https://platform.claude.com/docs/en/manage-claude/wif-reference"],
 } as const;
 
 // A version bump requires review of the native provider/env/settings registry
 // and the no-model plus synthetic-provider boundary fixtures.
-export const CLAUDE_ACCOUNT_POLICY_VERSIONS = [CLAUDE_ACCOUNT_POLICY_REVIEW.nativeVersion] as const;
+export const CLAUDE_ACCOUNT_POLICY_VERSIONS = nativeReview.reviewedVersions;
 
 export function assertClaudeAccountPolicyVersion(version: string): void {
   const selected = version.trim().match(/^(\d+\.\d+\.\d+)(?: \(Claude Code\))?$/u)?.[1];
@@ -21,6 +21,7 @@ export const CLAUDE_ACCOUNT_CREDENTIAL_KEYS = [
   "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
   "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES",
   "ANTHROPIC_AWS_API_KEY", "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+  "ANTHROPIC_GOOGLE_CLOUD_AUTH",
   "ANTHROPIC_PROFILE", "ANTHROPIC_ORGANIZATION_ID", "ANTHROPIC_SERVICE_ACCOUNT_ID",
   "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_WORKSPACE_ID", "ANTHROPIC_IDENTITY_TOKEN", "ANTHROPIC_IDENTITY_TOKEN_FILE",
 ] as const;
@@ -30,8 +31,10 @@ export const CLAUDE_SERVICE_ROUTING_KEYS = [
   "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
   "ANTHROPIC_VERTEX_BASE_URL", "ANTHROPIC_VERTEX_PROJECT_ID",
   "ANTHROPIC_FOUNDRY_BASE_URL", "ANTHROPIC_FOUNDRY_RESOURCE", "ANTHROPIC_CUSTOM_HEADERS",
+  "ANTHROPIC_GOOGLE_CLOUD_BASE_URL", "ANTHROPIC_GOOGLE_CLOUD_LOCATION", "ANTHROPIC_GOOGLE_CLOUD_PROJECT", "ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID",
   "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_MANTLE",
   "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+  "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD", "CLAUDE_CODE_SKIP_ANTHROPIC_GOOGLE_CLOUD_AUTH", "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
   "CLAUDE_CODE_SKIP_BEDROCK_AUTH", "CLAUDE_CODE_SKIP_MANTLE_AUTH",
   "CLAUDE_CODE_SKIP_VERTEX_AUTH", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
   "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
@@ -47,7 +50,7 @@ const AWS_KEYS = [
 const GOOGLE_KEYS = ["GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "CLOUDSDK_CONFIG", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "CLOUD_ML_REGION"] as const;
 const AZURE_KEYS = ["AZURE_CLIENT_ID", "AZURE_TENANT_ID", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_FEDERATED_TOKEN_FILE", "AZURE_AUTHORITY_HOST", "AZURE_CONFIG_DIR", "AZURE_TOKEN_CREDENTIALS"] as const;
 export const CLAUDE_AUTH_HELPER_KEYS = ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh"] as const;
-export const CLAUDE_ACCOUNT_ENV_KEYS = [...CLAUDE_ACCOUNT_CREDENTIAL_KEYS, ...CLAUDE_SERVICE_ROUTING_KEYS, ...AWS_KEYS, ...GOOGLE_KEYS, ...AZURE_KEYS, "ANTHROPIC_CONFIG_DIR", "CLAUDE_CONFIG_DIR"] as const;
+export const CLAUDE_ACCOUNT_ENV_KEYS = [...CLAUDE_ACCOUNT_CREDENTIAL_KEYS, ...CLAUDE_SERVICE_ROUTING_KEYS, ...AWS_KEYS, ...GOOGLE_KEYS, ...AZURE_KEYS, "ANTHROPIC_CONFIG_DIR", "CLAUDE_CONFIG_DIR", "DISABLE_AUTOUPDATER"] as const;
 
 export interface ClaudeAccountPolicy {
   provider: "anthropic" | "bedrock" | "mantle" | "anthropicAws" | "vertex" | "foundry";
@@ -65,6 +68,8 @@ const providerSelectors = {
 /** The service chooses routing; the selected account chooses direct Anthropic credentials. */
 export function resolveClaudeAccountPolicy(serviceEnv: NodeJS.ProcessEnv, configDir: string, accountEnv: Record<string, string>): ClaudeAccountPolicy {
   if (!path.isAbsolute(configDir)) throw new Error("Claude account configuration directory must be absolute.");
+  if (serviceEnv.CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD && !/^(?:0|false|no|off)$/iu.test(serviceEnv.CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD))
+    throw new Error("Claude Models on Google Cloud (Anthropic managed) service routing is not reviewed by CloudX. Select a reviewed service provider before launching; no account, settings or native installation has changed.");
   if (Object.keys(accountEnv).some(key => key !== "ANTHROPIC_API_KEY")) throw new Error("Unsupported selected Claude account credential source. Use a CloudX API key or native subscription login.");
   for (const key of Object.keys(providerSelectors)) if (serviceEnv[key] && !/^(?:1|true|yes|on|0|false|no|off)$/iu.test(serviceEnv[key]!)) throw new Error(`Claude service provider selector ${key} has an unsupported value. Configure one documented provider selection before launching.`);
   for (const key of CLAUDE_SERVICE_ROUTING_KEYS.filter(key => key.endsWith("BASE_URL"))) if (serviceEnv[key]) {
@@ -88,7 +93,7 @@ export function resolveClaudeAccountPolicy(serviceEnv: NodeJS.ProcessEnv, config
   retain([...AWS_KEYS, ...GOOGLE_KEYS, ...AZURE_KEYS]);
   if (provider === "anthropicAws") retain(["ANTHROPIC_AWS_API_KEY"]);
   if (provider === "foundry") retain(["ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_AUTH_TOKEN"]);
-  Object.assign(env, accountEnv, { CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_CONFIG_DIR: path.join(configDir, "anthropic-auth") });
+  Object.assign(env, accountEnv, { CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_CONFIG_DIR: path.join(configDir, "anthropic-auth"), DISABLE_AUTOUPDATER: "1" });
   return {
     provider, credentialSource: provider === "anthropic" && !headerAuth ? "selected-account" : "service-provider", env,
     settings: { ...Object.fromEntries(CLAUDE_AUTH_HELPER_KEYS.map(key => [key, ""])), env: Object.fromEntries(CLAUDE_ACCOUNT_ENV_KEYS.map(key => [key, env[key] ?? ""])) },

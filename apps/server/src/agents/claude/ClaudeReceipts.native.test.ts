@@ -17,6 +17,7 @@ import { pinClaudeExecutable } from "./ClaudeManagedExecutable.js";
 import { verifyClaudeNativeAccount } from "./ClaudeNativeSettings.js";
 
 const claude = process.env.CLOUDX_NATIVE_CLAUDE;
+const expectedNativeVersion = process.env.CLOUDX_NATIVE_CLAUDE_VERSION ?? "2.1.331";
 const native = it.skipIf(!claude);
 const SESSION = "e3120393-7cc9-48da-9a34-dde342cfd13a";
 const EXECUTION = "a9a10b24-0b8c-44fb-ad66-b9155346559f";
@@ -29,7 +30,7 @@ native.each((["native-project", "cloudx-managed"] as const).flatMap(mode => [
   { mode, scenario: "success" as const, managed: {} },
   { mode, scenario: "continued" as const, managed: { allowManagedHooksOnly: false } },
   { mode, scenario: "failure" as const, managed: { disableAllHooks: false } }
-]))("native 2.1.316 delivers $scenario Forge receipts in $mode with compatible managed policy", async ({ scenario, managed, mode }) => {
+]))("native reviewed version delivers $scenario Forge receipts in $mode with compatible managed policy", async ({ scenario, managed, mode }) => {
   const fixture = await receiptFixture(scenario, managed, mode);
   try {
     await fixture.execute();
@@ -54,7 +55,7 @@ native.each((["native-project", "cloudx-managed"] as const).flatMap(mode => [
 }, 60_000);
 
 async function receiptFixture(scenario: Scenario, managed: Settings, mode: ClaudeLaunchMode) {
-  expect((await runAgentCli(claude!, ["--version"])).stdout.trim()).toBe("2.1.316 (Claude Code)");
+  expect((await runAgentCli(claude!, ["--version"])).stdout.trim()).toBe(`${expectedNativeVersion} (Claude Code)`);
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-receipts-"));
   const dataDir = path.join(root, "data");
   const providerHome = path.join(root, "personal");
@@ -80,6 +81,7 @@ async function receiptFixture(scenario: Scenario, managed: Settings, mode: Claud
   const conflictingEnv = {
     CLAUDE_CODE_USE_ANTHROPIC_AWS: "1", CLAUDE_CODE_USE_MANTLE: "1", CLAUDE_CODE_USE_BEDROCK: "1",
     CLAUDE_CODE_USE_VERTEX: "1", CLAUDE_CODE_USE_FOUNDRY: "1", ANTHROPIC_AWS_API_KEY: "fake-unrelated-aws",
+    CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD: "1", ANTHROPIC_GOOGLE_CLOUD_BASE_URL: "http://127.0.0.1:1/unrelated-google", ANTHROPIC_GOOGLE_CLOUD_WORKSPACE_ID: "fake-unrelated-google",
     ANTHROPIC_API_KEY: "fake-unrelated-key", ANTHROPIC_AUTH_TOKEN: "fake-unrelated-bearer",
     ANTHROPIC_BASE_URL: "http://127.0.0.1:1/unrelated", CLAUDE_CONFIG_DIR: path.join(root, "unrelated"),
     ANTHROPIC_CONFIG_DIR: path.join(root, "unrelated-auth")
@@ -146,7 +148,7 @@ async function receiptFixture(scenario: Scenario, managed: Settings, mode: Claud
       const command = resolveClaudeCommand(account.env);
       expect(command).toBe(await fs.realpath(claude!));
       const overlay = await materializeClaudeHomeOverlay({ dataDir, tabId: TAB, accountHome, providerHome, executionId: EXECUTION,
-        cwd, trustProject: true, launchEnv: account.env, accountPolicy: account.policy, launchMode: mode, nativeVersion: "2.1.316" });
+        cwd, trustProject: true, launchEnv: account.env, accountPolicy: account.policy, launchMode: mode, nativeVersion: expectedNativeVersion });
       await verifyClaudeNativeAccount({ command, settingsPath: overlay.settingsPath, cwd, env: account.env, configurationArgs: overlay.configurationArgs }, account.policy);
       expect(requestObservations).toEqual([]);
       expect(conversation()).toBeUndefined();

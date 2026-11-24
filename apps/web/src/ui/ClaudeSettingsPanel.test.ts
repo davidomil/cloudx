@@ -34,10 +34,10 @@ const saved: ClaudeGlobalSettings = {
   ]
 };
 
-function hooks(settings = saved) {
+function hooks(settings = saved, version = "2.1.289 (Claude Code)") {
   let current = settings;
   return vi.fn(async (hookId: string, input?: Record<string, unknown>) => {
-    if (hookId === "claude-settings.read") return { settings: current, cli: { installed: true, command: "/usr/bin/claude", version: "2.1.289 (Claude Code)" }, bypassWarning: "Claude Code will not ask for approval." };
+    if (hookId === "claude-settings.read") return { settings: current, cli: { installed: true, command: "/usr/bin/claude", version }, bypassWarning: "Claude Code will not ask for approval." };
     if (hookId === "claude-settings.update") {
       current = { ...current, ...Object.fromEntries(Object.entries(input!).filter(([key]) => key !== "expectedRevision")), revision: "b".repeat(64) } as ClaudeGlobalSettings;
       return { settings: current };
@@ -95,6 +95,16 @@ describe("ClaudeSettingsPanel", () => {
       expectedRevision: "a".repeat(64), model: "claude-sonnet-5-5", effortModel: "claude-sonnet-5-5", effortLevel: "high", fastMode: null, permissionMode: "acceptEdits"
     });
     expect(container.textContent).toContain("Claude settings saved.");
+  });
+
+  it.each(["2.1.325 (Claude Code)", "2.1.331 (Claude Code)", "2.1.332 (Claude Code)", "2.1.325-beta.1 (Claude Code)"])("reports the selected executable's exact review status for %s", async version => {
+    const callHook = hooks(saved, version);
+    const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
+    expect(container.textContent).toContain(version === "2.1.325 (Claude Code)" || version === "2.1.331 (Claude Code)"
+      ? "selected native version has a CloudX launch-policy review"
+      : "selected native version is unreviewed");
+    expect(container.textContent).toContain("stable 2.1.325, latest 2.1.331");
+    expect(callHook).not.toHaveBeenCalledWith("claude-settings.update", expect.anything());
   });
 
   it("records bypass acceptance only after the warning is reviewed and confirmed", async () => {
@@ -216,9 +226,9 @@ describe("ClaudeSettingsPanel", () => {
   it("searches the complete reference by family and exposes only reviewed typed persistent editors", async () => {
     const callHook = hooks({ ...saved, nativeOptions: { autoScrollEnabled: true } });
     const container = await render(createElement(ClaudeSettingsPanel, { callHook: callHook as never }));
-    expect(container.textContent).toContain("247 settings rows, 384 environment rows, 121 CLI rows");
+    expect(container.textContent).toContain("250 settings rows, 422 environment rows, 123 CLI rows");
     expect(container.textContent).toContain("complete reference inventory is separate from native runtime certification");
-    expect(container.textContent).toContain("Native 2.1.316 review");
+    expect(container.textContent).toContain("Native 2.1.316, 2.1.325, 2.1.331 review");
     await change(control(container, "Search Claude configuration"), "autoScrollEnabled");
     expect(container.textContent).toContain("Native reference default: true");
     expect(container.textContent).toContain("Saved user value: true");

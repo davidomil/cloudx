@@ -156,7 +156,7 @@ def build_inventory(sources):
             unique[key]["referenceRows"] += 1
         else:
             unique[key] = {**entry, "referenceRows": 1}
-    return {"schemaVersion": 1, "reviewedAt": "2026-11-01", "referenceSnapshotDate": "2026-10-30",
+    return {"schemaVersion": 1, "reviewedAt": "2026-11-24", "referenceSnapshotDate": "2026-11-24",
             "verifiedNativeVersions": [], "sources": evidence,
             "entries": sorted(unique.values(), key=lambda entry: (entry["family"], entry["name"]))}
 

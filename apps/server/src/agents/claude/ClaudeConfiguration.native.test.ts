@@ -7,8 +7,9 @@ import { ClaudeSettingsService } from "./ClaudeSettingsService.js";
 import { inspectClaudeNativeSettings } from "./ClaudeNativeSettings.js";
 
 const command = process.env.CLOUDX_NATIVE_CLAUDE;
+const expectedNativeVersion = process.env.CLOUDX_NATIVE_CLAUDE_VERSION ?? "2.1.331";
 
-it.skipIf(!command)("native 2.1.316 merges typed persistent user controls, preserves other model values and observes unset", async () => {
+it.skipIf(!command)("native reviewed version merges typed persistent user controls, preserves other model values and observes unset", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-settings-native-"));
   try {
     const home = path.join(root, "home");
@@ -30,13 +31,16 @@ it.skipIf(!command)("native 2.1.316 merges typed persistent user controls, prese
       const nativeOptions = Object.fromEntries(CLAUDE_BOOLEAN_SETTINGS.map(key => [key, value]));
       await service.update({ expectedRevision: current.revision, nativeOptions, language: "French", autoUpdatesChannel: "stable" });
       const observed = await inspect();
-      expect(observed.version).toBe("2.1.316");
+      expect(observed.version).toBe(expectedNativeVersion);
       expect(observed.effective).toMatchObject({ ...nativeOptions, language: "French", autoUpdatesChannel: "stable", ...preserved });
       expect(observed.sources.some(source => source.settings.autoUpdatesChannel === "stable")).toBe(true);
     }
     const saved = await service.read();
     await service.update({ expectedRevision: saved.revision, effortModel: "claude-opus-5-5", effortLevel: "xhigh" });
     expect((await inspect()).effective).toMatchObject({ modelSettings: { "claude-opus-5-5": { effortLevel: "xhigh" }, ...preserved.modelSettings } });
+    await service.update({ expectedRevision: (await service.read()).revision, effortModel: "claude-fable-5-2", effortLevel: "high" });
+    expect((await inspect()).effective).toMatchObject({ modelSettings: { "claude-fable-5-2": { effortLevel: "high" }, ...preserved.modelSettings } });
+    await service.update({ expectedRevision: (await service.read()).revision, effortModel: "claude-fable-5-2", effortLevel: null });
     const withEffort = await service.read();
     await service.update({ expectedRevision: withEffort.revision, effortModel: "claude-opus-5-5", effortLevel: null, nativeOptions: Object.fromEntries(CLAUDE_BOOLEAN_SETTINGS.map(key => [key, null])), language: null, autoUpdatesChannel: null });
     const unset = await inspect();
@@ -46,7 +50,7 @@ it.skipIf(!command)("native 2.1.316 merges typed persistent user controls, prese
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
-it.skipIf(!command)("native 2.1.316 identifies launch overrides separately from project and user settings without model work", async () => {
+it.skipIf(!command)("native reviewed version identifies launch overrides separately from project and user settings without model work", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-claude-layers-native-"));
   try {
     const home = path.join(root, "home");
@@ -61,7 +65,7 @@ it.skipIf(!command)("native 2.1.316 identifies launch overrides separately from 
     const env = { PATH: process.env.PATH, HOME: home, CLAUDE_CONFIG_DIR: providerHome, ANTHROPIC_API_KEY: "synthetic-no-model-key",
       ANTHROPIC_BASE_URL: "http://127.0.0.1:1", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1", DISABLE_AUTOUPDATER: "1" };
     const observed = await inspectClaudeNativeSettings({ command: command!, cwd: project, env, settingsPath });
-    expect(observed.version).toBe("2.1.316");
+    expect(observed.version).toBe(expectedNativeVersion);
     expect(observed.effective).toMatchObject({ language: "Spanish", outputStyle: "concise" });
     const languages = observed.sources.map(source => source.settings.language).filter(Boolean);
     expect(languages).toEqual(expect.arrayContaining(["French", "German", "Spanish"]));

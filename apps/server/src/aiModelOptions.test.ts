@@ -11,6 +11,8 @@ import { DocumentationPlugin } from "./plugins/DocumentationPlugin.js";
 describe("Settings model choices", () => {
   it("offers only the currently supported Codex models", () => {
     expect(CODEX_MODEL_OPTIONS.map((option) => option.value)).toEqual([
+      "gpt-6.2-sol",
+      "gpt-6.2-astra",
       "gpt-6.1-sol",
       "gpt-6-astra",
       "gpt-5.6-sol",
@@ -18,6 +20,17 @@ describe("Settings model choices", () => {
       "gpt-5.6-luna",
       "gpt-5.5"
     ]);
+  });
+
+  it("declares reviewed native requirements without replacing explicit defaults", () => {
+    for (const value of ["gpt-6.2-sol", "gpt-6.2-astra"]) expect(CODEX_MODEL_OPTIONS.find(option => option.value === value)?.nativeRequirement)
+      .toEqual({ providerId: "codex", minimumVersion: "0.166.0" });
+    expect(CLAUDE_EXEC_MODEL_OPTIONS.find(option => option.value === "claude-fable-5-2")?.nativeRequirement)
+      .toEqual({ providerId: "claude", minimumVersion: "2.1.321" });
+    expect(CLAUDE_EXEC_MODEL_OPTIONS.find(option => option.value === "claude-haiku-5-5")?.nativeRequirement)
+      .toEqual({ providerId: "claude", minimumVersion: "2.1.293" });
+    expect(GLOBAL_CONFIG_FIELDS.find(field => field.key === "voiceModel")?.defaultValue).toBe("gpt-5.6-luna");
+    expect(forgeConfigFields().find(field => field.key === "workerModel")?.defaultValue).toBe("gpt-6.1-sol");
   });
 
   it("offers identical Codex and Claude choices in every Voice, Forge, and documentation model dropdown", () => {
@@ -40,7 +53,7 @@ describe("Settings model choices", () => {
 
   it("offers only concrete Claude model ids for one-shot requests", () => {
     expect(CLAUDE_EXEC_MODEL_OPTIONS.map((option) => option.value)).toEqual([
-      "claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-4-5-20251001"
+      "claude-fable-5-2", "claude-haiku-5-5", "claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-haiku-4-5-20251001"
     ]);
   });
 });

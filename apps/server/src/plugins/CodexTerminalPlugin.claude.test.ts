@@ -23,13 +23,14 @@ vi.mock("../agents/claude/ClaudeNativeSettings.js", () => ({ verifyClaudeNativeA
 const SESSION = "a5570c58-978a-4694-84f9-c67756be3acd";
 
 class FakeTerminalProcess implements TerminalProcess {
+  startupOutput = "Claude native composer ready\r\n";
   written = "";
   terminated = false;
   exitAtStartup = false;
   acknowledgePrompt = true;
   forgeBinding?: { workerId: string; attemptId: string; receiptPath: string };
   private exitListener: ((event: TerminalExit) => void) | undefined;
-  onData(listener: (data: string) => void) { queueMicrotask(() => listener("Claude native composer ready\r\n")); return () => undefined; }
+  onData(listener: (data: string) => void) { queueMicrotask(() => listener(this.startupOutput)); return () => undefined; }
   onExit(listener: (event: TerminalExit) => void) { this.exitListener = listener; if (this.exitAtStartup) queueMicrotask(() => listener({ exitCode: 1 })); return () => { this.exitListener = undefined; }; }
   write(data: string) {
     this.written += data;
@@ -46,12 +47,14 @@ class FakeTerminalProcess implements TerminalProcess {
 }
 
 class CapturingFactory implements TerminalProcessFactory {
+  startupOutput = "Claude native composer ready\r\n";
   deliverReceipt = true;
   acknowledgePrompt = true;
   exitWithoutReceipt = true;
   launches: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv; process: FakeTerminalProcess }> = [];
   async spawn(command: string, args: string[], options: { env: NodeJS.ProcessEnv }) {
     const process = new FakeTerminalProcess();
+    process.startupOutput = this.startupOutput;
     process.exitAtStartup = !this.deliverReceipt && this.exitWithoutReceipt;
     process.acknowledgePrompt = this.acknowledgePrompt;
     this.launches.push({ command, args, env: options.env, process });
@@ -152,6 +155,21 @@ describe("CodexTerminalPlugin on Claude", () => {
       initialInput: { agent: { providerId: "claude" }, prompt: "Never submit this work" }
     })).rejects.toThrow("No worker prompt was submitted");
     expect(factory.lastCommandLine).not.toContain("Never submit this work");
+    expect(factory.last.process.written).toBe("");
+    expect(factory.last.process.terminated).toBe(true);
+  });
+
+  it("reports native API-key confirmation separately from missing hook tracking without exposing the key or submitting Forge work", async () => {
+    const { plugin, factory, tab, cwd, controls, dataDir, claudeSettings } = await setup();
+    await claudeSettings.acceptBypass();
+    factory.deliverReceipt = false;
+    factory.startupOutput = "ANTHROPIC_API_KEY: sk-ant-never-print-key\r\nDo\u001b[5Gyou\u001b[9Gwant to use this API key?\r\n";
+    const launch = plugin.createSession({ tab: { ...tab, ownerPluginId: "forge" }, cwd, controls,
+      agentTurn: { workerId: "issue-1", attemptId: "attempt-1", receiptPath: path.join(dataDir, "attempt-1.json") },
+      initialInput: { agent: { providerId: "claude" }, prompt: "Never submit this work" }
+    });
+    await expect(launch).rejects.toThrow("requires API-key confirmation before unattended Forge work");
+    await expect(launch).rejects.not.toThrow("never-print");
     expect(factory.last.process.written).toBe("");
     expect(factory.last.process.terminated).toBe(true);
   });

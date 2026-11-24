@@ -15,6 +15,7 @@ import { completedVerificationTurn } from "./CodexVerificationTranscript.js";
 import { verifyCodexRuntime } from "./CodexRuntimeVerification.js";
 
 const nativeBinary = process.env.CLOUDX_NATIVE_CODEX;
+const previousNativeBinary = process.env.CLOUDX_PREVIOUS_NATIVE_CODEX || nativeBinary;
 
 it.skipIf(!nativeBinary)("new tabs and Forge workers use the selected installation while existing native sessions finish on their original installation", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "cloudx-native-version-selection-"));
@@ -57,9 +58,11 @@ it.skipIf(!nativeBinary)("new tabs and Forge workers use the selected installati
       `base_url = "http://127.0.0.1:${port}/v1"`, 'wire_api = "responses"', 'requires_openai_auth = false',
       `[projects.${JSON.stringify(root)}]`, 'trust_level = "trusted"', ''
     ].join("\n"));
-    const version = execFileSync(nativeBinary!, ["--version"], { encoding: "utf8" }).trim().replace(/^codex-cli /u, "");
     const releases: Array<{ version: string; assistantBin: string }> = [];
     for (const label of ["original", "selected"]) {
+      const executable = label === "original" ? previousNativeBinary! : nativeBinary!;
+      expect(path.isAbsolute(executable)).toBe(true);
+      const version = execFileSync(executable, ["--version"], { encoding: "utf8" }).trim().replace(/^codex-cli /u, "");
       const installation = path.join(prefix, ".cloudx-codex", label);
       const packageDir = path.join(installation, "lib/node_modules/@openai/codex");
       const assistantBin = path.join(installation, "bin/codex");
@@ -69,7 +72,7 @@ it.skipIf(!nativeBinary)("new tabs and Forge workers use the selected installati
       await fs.writeFile(path.join(packageDir, "bin/codex.js"), [
         "#!/bin/sh",
         `printf '%s\\t%s\\t%s\\n' ${shellQuote(label)} "$CODEX_HOME" "$*" >> ${shellQuote(commandLog)}`,
-        `exec ${shellQuote(nativeBinary!)} "$@"`, ""
+        `exec ${shellQuote(executable)} "$@"`, ""
       ].join("\n"), { mode: 0o700 });
       await fs.symlink(path.join(packageDir, "bin/codex.js"), assistantBin);
       releases.push({ version, assistantBin });

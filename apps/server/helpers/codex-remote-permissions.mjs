@@ -12,6 +12,7 @@ export class CodexRemotePermissions {
     this.permissions = permissions;
     this.launchPolicyActive = permissions.yoloMode;
     this.selectedThreadId = undefined;
+    this.selectedWorkspaceRoots = undefined;
     this.selectedProfile = undefined;
     this.pending = new Map();
   }
@@ -20,6 +21,13 @@ export class CodexRemotePermissions {
     if (message.method === "turn/start") {
       const params = message.params;
       const profile = this.selectedProfile;
+      if (params?.threadId === this.selectedThreadId && this.permissions.additionalWritableRoots.length) {
+        // Server-owned TUI settings omit roots on turn/start. Forward the roots
+        // resolved for this selection so the backend receives CloudX additions.
+        if (params.runtimeWorkspaceRoots != null) params.runtimeWorkspaceRoots = this.withAdditionalRoots(params.runtimeWorkspaceRoots);
+        else if (this.selectedWorkspaceRoots) params.runtimeWorkspaceRoots = [...this.selectedWorkspaceRoots];
+        if (this.selectedWorkspaceRoots) this.track(message, { method: message.method, workspaceRootsSeed: this.selectedWorkspaceRoots });
+      }
       // Native resume restores profile identity, not legacy sandbox projections.
       // Apply it after the server has resolved roots so configured roots survive.
       if (params?.threadId === this.selectedThreadId && profile && params.permissions == null && params.sandboxPolicy == null) {
@@ -43,9 +51,9 @@ export class CodexRemotePermissions {
       params.runtimeWorkspaceRoots = this.withAdditionalRoots(params.runtimeWorkspaceRoots);
     }
     const resolveRoots = additionalWritableRoots.length > 0 && params.runtimeWorkspaceRoots == null;
-    if (this.launchPolicyActive || resolveRoots || this.selectedProfile) {
+    if (this.launchPolicyActive || additionalWritableRoots.length || this.selectedProfile) {
       const profile = message.method === "thread/start" ? this.profileForNewThread(params) : undefined;
-      this.track(message, { method: message.method, resolveRoots, profile });
+      this.track(message, { method: message.method, resolveRoots, profile, workspaceRoots: params.runtimeWorkspaceRoots });
     }
     if (this.launchPolicyActive && message.method === "thread/start") {
       params.approvalPolicy = "never";
@@ -65,14 +73,21 @@ export class CodexRemotePermissions {
     if (!request) return;
     this.pending.delete(message.id);
     if (message.error) return;
-    // Remote clients delegate root selection to the backend. Extend its resolved
-    // roots for the TUI, which submits them on turn/start before any model work.
+    if (request.method === "turn/start") {
+      // Roots become sticky server state after admission. Later native turns may
+      // narrow roots or change cwd; do not restore the launch-time snapshot.
+      if (this.selectedWorkspaceRoots === request.workspaceRootsSeed) this.selectedWorkspaceRoots = undefined;
+      return;
+    }
+    // Remote clients delegate root selection to the backend. Retain its resolved
+    // roots for turn/start, including clients whose settings remain server-owned.
     if (request.resolveRoots)
       message.result.runtimeWorkspaceRoots = this.withAdditionalRoots(message.result?.runtimeWorkspaceRoots);
     if (request.method !== "thread/settings/update") {
       const threadId = message.result?.thread?.id;
       if (typeof threadId !== "string" || !threadId) throw new Error("Native permission selection returned no thread identity.");
       this.selectedThreadId = threadId;
+      this.selectedWorkspaceRoots = request.resolveRoots ? message.result.runtimeWorkspaceRoots : request.workspaceRoots;
       const id = message.result.activePermissionProfile?.id;
       this.selectedProfile = typeof id === "string" && id
         ? { id, sandbox: message.result.sandbox?.type } : request.profile;

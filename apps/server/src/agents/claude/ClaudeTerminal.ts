@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { stripVTControlCharacters } from "node:util";
 
 import { PluginSessionNotStartedError, type CreatePluginSessionInput, type PluginSession, type PluginSessionLaunchOptions, type PluginTabControls } from "@cloudx/plugin-api";
 import { isForgeTurnCompletion, readAgentSelection, type ClaudeLaunchMode, type AgentSelection, type TabIndicatorUpdate } from "@cloudx/shared";
@@ -207,7 +208,7 @@ export class ClaudeTerminal {
     });
     if (input.agentTurn) {
       try {
-        const sessionId = await waitForClaudeReceipt(conversation, input.tab.id, executionId, input.cwd, () => session.hasExited(), newSessionId ?? codexResumeInput(launchInput)?.sessionId);
+        const sessionId = await waitForClaudeReceipt(conversation, input.tab.id, executionId, input.cwd, () => session.hasExited(), () => session.snapshot().recentOutput ?? "", newSessionId ?? codexResumeInput(launchInput)?.sessionId);
         await this.conversationPolicies.bind(sessionId, { accountId: account.id, cwd: input.cwd, policy: overlay.launchPolicy, historical: mode.historical });
         await session.handleAction("wait_until_ready", { timeoutMs: 30_000 });
         const prompt = launchInput?.prompt;
@@ -343,7 +344,7 @@ class ClaudeTrackingStatus {
   }
 }
 
-async function waitForClaudeReceipt(conversation: CodexConversationRecovery, tabId: string, executionId: string, cwd: string, exited: () => boolean, expectedSessionId?: string): Promise<string> {
+async function waitForClaudeReceipt(conversation: CodexConversationRecovery, tabId: string, executionId: string, cwd: string, exited: () => boolean, output: () => string, expectedSessionId?: string): Promise<string> {
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     const receipt = conversation.readForExecution(tabId, executionId);
@@ -354,6 +355,9 @@ async function waitForClaudeReceipt(conversation: CodexConversationRecovery, tab
     if (exited()) break;
     await new Promise(resolve => setTimeout(resolve, 50));
   }
+  const visible = stripVTControlCharacters(output()).replace(/\s+/gu, "");
+  if (visible.includes("ANTHROPIC_API_KEY") && visible.includes("DoyouwanttousethisAPIkey?"))
+    throw new Error("This native Claude execution requires API-key confirmation before unattended Forge work. CloudX has not accepted that native prompt or transferred approval from another tab. No worker prompt was submitted or replayed.");
   throw new Error("Claude did not deliver its required SessionStart receipt. Native hook policy or a hook failure prevents CloudX tracking. Ask the policy owner to permit CloudX SessionStart, UserPromptSubmit, Stop and StopFailure hooks before starting Forge work. No worker prompt was submitted.");
 }
 

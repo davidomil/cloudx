@@ -31,6 +31,17 @@ it("rejects unsupported versions and existing local inputs before materializing 
   }
 });
 
+it.each(["2.1.316", "2.1.325", "2.1.331"])("accepts explicitly reviewed native %s without changing the source boundary", async nativeVersion => {
+  const { options } = await fixture();
+  await expect(assertClaudeManagedCompatibility({ ...options, nativeVersion, skillNames: [] }, [])).resolves.toBeUndefined();
+});
+
+it.each(["2.1.326", "2.1.332"])("refuses unreviewed native %s before source materialization", async nativeVersion => {
+  const { options } = await fixture();
+  await expect(materializeClaudeHomeOverlay({ ...options, nativeVersion })).rejects.toThrow("verified only");
+  await expect(fs.stat(path.join(options.dataDir, "claude-launches"))).rejects.toMatchObject({ code: "ENOENT" });
+});
+
 it.each([
   { strictPluginOnlyCustomization: ["skills"] }, { policyHelper: { path: "unobserved" } },
   { enabledPlugins: { "unexpected@market": true } }, { extraKnownMarketplaces: { unexpected: {} } },

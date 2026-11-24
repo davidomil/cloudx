@@ -83,6 +83,48 @@ it("finishes resolving pending roots even after a saved-thread selection replace
   expect(response.result.runtimeWorkspaceRoots).toEqual(["/new", "/cloudx-skills"]);
 });
 
+it.each(["thread/start", "thread/resume", "thread/fork"])("forwards resolved roots when the server owns turn settings after %s", method => {
+  const permissions = new CodexRemotePermissions({ yoloMode: false, additionalWritableRoots: ["/cloudx-skills"] });
+  permissions.fromClient({ id: 1, method, params: { threadId: "saved" } });
+  permissions.fromServer({ id: 1, result: { thread: { id: "selected" }, runtimeWorkspaceRoots: ["/saved-cwd", "/saved-extra"] } });
+  const turn = { id: 2, method: "turn/start", params: { threadId: "selected" } };
+  permissions.fromClient(turn);
+  expect(turn.params).toEqual({ threadId: "selected", runtimeWorkspaceRoots: ["/saved-cwd", "/saved-extra", "/cloudx-skills"] });
+  const auxiliary = { id: 3, method: "turn/start", params: { threadId: "auxiliary" } };
+  permissions.fromClient(auxiliary);
+  expect(auxiliary.params).toEqual({ threadId: "auxiliary" });
+});
+
+it("leaves roots with the server after admission so later native narrowing remains sticky", () => {
+  const permissions = launchedPermissions();
+  const first = { id: 2, method: "turn/start", params: { threadId: "selected" } };
+  permissions.fromClient(first);
+  expect(first.params).toMatchObject({ runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] });
+  permissions.fromServer({ id: 2, result: { turn: { id: "first" } } });
+  const narrowed = { id: 3, method: "turn/start", params: { threadId: "selected", runtimeWorkspaceRoots: ["/narrow"] } };
+  permissions.fromClient(narrowed);
+  expect(narrowed.params.runtimeWorkspaceRoots).toEqual(["/narrow", "/cloudx-skills"]);
+  permissions.fromServer({ id: 3, result: { turn: { id: "narrowed" } } });
+  const next = { id: 4, method: "turn/start", params: { threadId: "selected" } };
+  permissions.fromClient(next);
+  expect(next.params).not.toHaveProperty("runtimeWorkspaceRoots");
+});
+
+it("retains bootstrap roots after rejected admission and preserves a newer selection during a late turn reply", () => {
+  const permissions = launchedPermissions();
+  permissions.fromClient({ id: 2, method: "turn/start", params: { threadId: "selected" } });
+  permissions.fromServer({ id: 2, error: { message: "Turn rejected" } });
+  const next = { id: 3, method: "turn/start", params: { threadId: "selected" } };
+  permissions.fromClient(next);
+  expect(next.params).toMatchObject({ runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] });
+  permissions.fromClient({ id: 4, method: "thread/resume", params: { threadId: "selected" } });
+  permissions.fromServer({ id: 4, result: { thread: { id: "selected" }, runtimeWorkspaceRoots: ["/new-selection"] } });
+  permissions.fromServer({ id: 3, result: { turn: { id: "late" } } });
+  const resumed = { id: 5, method: "turn/start", params: { threadId: "selected" } };
+  permissions.fromClient(resumed);
+  expect(resumed.params).toMatchObject({ runtimeWorkspaceRoots: ["/new-selection", "/cloudx-skills"] });
+});
+
 it.each([undefined, null, "invalid", ["relative"]])("rejects malformed server-resolved roots %j", roots => {
   const permissions = new CodexRemotePermissions({ yoloMode: false, additionalWritableRoots: ["/cloudx-skills"] });
   permissions.fromClient({ id: 1, method: "thread/start", params: {} });
@@ -105,11 +147,11 @@ it.each(["thread/resume", "thread/fork"])("preserves native permissions on new t
   permissions.fromClient({ method: "initialize", params: {} });
   permissions.fromClient({ id: 1, method, params: { runtimeWorkspaceRoots: ["/project"] } });
   permissions.fromServer({ id: 1, result: { thread: { id: "saved" } } });
-  for (const policy of [
+  for (const [index, policy] of [
     { approvalPolicy: "on-request", sandbox: "workspace-write", permissions: null },
     { approvalPolicy: "on-request", sandbox: null, permissions: ":workspace" }
-  ]) {
-    const next = { method: "thread/start", params: { ...policy, runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] } };
+  ].entries()) {
+    const next = { id: index + 2, method: "thread/start", params: { ...policy, runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] } };
     permissions.fromClient(next);
     expect(next.params).toEqual({ ...policy, runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] });
   }
@@ -161,7 +203,7 @@ it.each([
   const permissions = launchedPermissions();
   const turn = { id: 2, method: "turn/start", params: structuredClone(params) };
   permissions.fromClient(turn);
-  expect(turn.params).toEqual(params);
+  expect(turn.params).toEqual({ ...params, ...(params.threadId === "selected" ? { runtimeWorkspaceRoots: ["/project", "/cloudx-skills"] } : {}) });
 });
 
 it.each([
