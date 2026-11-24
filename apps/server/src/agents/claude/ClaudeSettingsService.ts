@@ -28,6 +28,7 @@ import { agentCommand, claudeLaunchEnv, readAgentProviderStatus, runAgentCli } f
 import { discoverClaudeUserSkills, type ClaudeUserSkill } from "./claudeSkillPolicy.js";
 import { AgentLaunchRecords } from "../AgentLaunchRecords.js";
 import { assertClaudeAccountPolicyVersion } from "./claudeAccountPolicy.js";
+import { verifyClaudeAccountPolicyVersion } from "./ClaudeNativeSettings.js";
 
 const MAX_SETTINGS_BYTES = 1024 * 1024;
 const UPDATE_TIMEOUT_MS = 5 * 60_000;
@@ -121,9 +122,12 @@ export class ClaudeSettingsService {
     if (channel !== null && !CLAUDE_UPDATE_CHANNELS.some(value => value === channel))
       throw new Error(`Saved Claude update channel ${JSON.stringify(channel)} is unsupported. Select latest, stable, or unset it in Settings → Claude before updating.`);
     const selectedChannel = channel ?? "latest";
+    const command = agentCommand("claude", this.env);
+    const options = { env: claudeLaunchEnv(this.env, this.providerHome(), {}), cwd: process.cwd(), signal };
+    const settingsArgs = ["--settings", JSON.stringify({ autoUpdatesChannel: selectedChannel })];
+    await verifyClaudeUpdateChannel(command, settingsArgs, selectedChannel, options);
     const target = await reviewedClaudeUpdateVersion(selectedChannel, signal);
-    const env = claudeLaunchEnv(this.env, this.providerHome(), {});
-    const result = await runAgentCli(agentCommand("claude", this.env), ["--settings", JSON.stringify({ autoUpdatesChannel: selectedChannel }), "update"], { env, timeoutMs: UPDATE_TIMEOUT_MS, signal, maxOutputBytes: 256 * 1024 });
+    const result = await runAgentCli(command, [...settingsArgs, "update"], { ...options, timeoutMs: UPDATE_TIMEOUT_MS, maxOutputBytes: 256 * 1024 });
     const output = `${result.stdout}\n${result.stderr}`.replace(/\u001b\[[0-9;?]*[A-Za-z]/gu, "").trim().slice(-4_000);
     if (result.code !== 0) throw new Error(`Claude Code update failed${output ? `: ${output}` : "."}`);
     const status = await this.cliStatus();
@@ -218,6 +222,30 @@ export class ClaudeSettingsService {
     else delete native.modelSettings;
     return true;
   }
+}
+
+async function verifyClaudeUpdateChannel(command: string, settingsArgs: string[], channel: string, options: { env: NodeJS.ProcessEnv; cwd: string; signal?: AbortSignal }): Promise<void> {
+  const unverified = "Cannot verify the effective Claude update policy. Ask the policy owner to verify the selected installation and its managed update channel; no updater has started and saved choices are unchanged.";
+  let diagnostic: string;
+  try {
+    await verifyClaudeAccountPolicyVersion(command, options.env, runAgentCli, options.signal);
+    const result = await runAgentCli(command, [...settingsArgs, "doctor"], { ...options, timeoutMs: 30_000, maxOutputBytes: 256 * 1024 });
+    if (result.code !== 0) throw new Error();
+    diagnostic = result.stdout.replace(/\u001b\[[0-9;?]*[A-Za-z]/gu, "").replace(/\r\n/gu, "\n");
+  } catch { throw new Error(unverified); }
+  const channels = [...diagnostic.matchAll(/^Auto-update channel: (.*)$/gmu)];
+  if (channels.length !== 1 || !CLAUDE_UPDATE_CHANNELS.some(value => value === channels[0]![1])) throw new Error(unverified);
+  if (channels[0]![1] !== channel)
+    throw new Error(`Claude managed update channel conflicts with the saved ${channel} choice. Ask the policy owner to align the channels before updating; no updater has started and saved choices are unchanged.`);
+  // Doctor captures the channel before awaiting remote settings. A fetched or
+  // pending remote policy cannot establish the snapshot used by the next command.
+  const remote = [...diagnostic.matchAll(/^Managed settings \(remote\): (.*)$/gmu)];
+  const inactive = [
+    "no usable credentials for the settings fetch", "requires an Enterprise or Team subscription",
+    "not available with a custom ANTHROPIC_BASE_URL", "not available on Bedrock/Vertex/third-party providers"
+  ];
+  if (remote.length !== 1 || !inactive.some(reason => remote[0]![1] === `not fetched — ${reason}`)
+    || /^Managed settings \((?:fetched|cached)\):/mu.test(diagnostic)) throw new Error(unverified);
 }
 
 async function reviewedClaudeUpdateVersion(channel: string, signal?: AbortSignal): Promise<string> {
